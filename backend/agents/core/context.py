@@ -1,0 +1,298 @@
+"""Unified business context — one model passed equally to every agent.
+
+Replaces the three divergent shapes (routes.schemas.BusinessContext,
+audit.AuditBusinessContext, content's brand stanza) and the three copies of
+``format_business_context``. Each agent uses the sections relevant to it; the
+shared formatter renders only the fields that are populated, so an audit run and
+a paid-ads insights run produce a clean, comparable ``<business_context>`` block.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from agents.core.prompts import xml_block
+
+
+class BusinessContext(BaseModel):
+    """Superset of the business context any agent needs.
+
+    ``extra="ignore"`` tolerates legacy/per-agent fields during migration so the
+    same payload can be handed to every agent without validation errors.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # --- Identity / shared across all agents ---
+    business_name: str = ""
+    business_description: str = ""
+    industry: str = ""
+    business_model: str = ""
+    positioning_statement: str = ""
+    brand_voice: str = ""
+    growth_stage: str = ""
+    competitors: list[str] = Field(default_factory=list)
+    target_keywords: list[str] = Field(default_factory=list)
+    audience_segment: str = ""
+    business_goals: str = ""
+    period_changes: str = ""
+    notes: str = ""
+
+    # --- Paid-ads section (insights, mode="paid_ads") ---
+    monthly_budget: float = 0.0
+    target_cpa: float = 0.0
+    target_roas: float = 0.0
+    primary_conversion_action: str = ""
+    target_payback_days: float = 0.0
+    gross_margin_percent: float = 0.0
+    qualified_lead_value: float = 0.0
+
+    # --- Organic section (insights, mode="organic_growth") ---
+    primary_organic_kpi: str = ""
+    monthly_organic_traffic_target: float = 0.0
+    primary_content_type: str = ""
+
+    @classmethod
+    def coerce(cls, data: "BusinessContext | dict | None") -> "BusinessContext":
+        """Build from this model, a plain dict, or None (→ empty)."""
+        if data is None:
+            return cls()
+        if isinstance(data, BusinessContext):
+            return data
+        if isinstance(data, BaseModel):
+            return cls.model_validate(data.model_dump())
+        return cls.model_validate(data)
+
+
+# Field → human label, grouped. Only populated fields render.
+_SHARED_LABELS: list[tuple[str, str]] = [
+    ("business_name", "Business"),
+    ("business_description", "Description"),
+    ("industry", "Industry"),
+    ("business_model", "Business model"),
+    ("positioning_statement", "Positioning"),
+    ("audience_segment", "Audience"),
+    ("brand_voice", "Brand voice"),
+    ("growth_stage", "Growth stage"),
+    ("primary_content_type", "Primary content type"),
+    ("business_goals", "Goals"),
+    ("period_changes", "Recent changes"),
+    ("notes", "Notes"),
+]
+_PAID_LABELS: list[tuple[str, str]] = [
+    ("monthly_budget", "Monthly budget"),
+    ("target_cpa", "Target CPA"),
+    ("target_roas", "Target ROAS"),
+    ("primary_conversion_action", "Primary conversion"),
+    ("target_payback_days", "Target payback (days)"),
+    ("gross_margin_percent", "Gross margin %"),
+    ("qualified_lead_value", "Qualified lead value"),
+]
+_ORGANIC_LABELS: list[tuple[str, str]] = [
+    ("primary_organic_kpi", "Primary organic KPI"),
+    ("monthly_organic_traffic_target", "Monthly organic traffic target"),
+]
+_LIST_LABELS: list[tuple[str, str]] = [
+    ("competitors", "Competitors"),
+    ("target_keywords", "Target keywords"),
+]
+
+
+def _lines(ctx: BusinessContext, labels: list[tuple[str, str]]) -> list[str]:
+    out: list[str] = []
+    for field, label in labels:
+        value = getattr(ctx, field, "")
+        if isinstance(value, (int, float)) and not value:
+            continue
+        if not value:
+            continue
+        out.append(f"{label}: {value}")
+    return out
+
+
+def format_business_context(
+    data: BusinessContext | dict | None,
+    *,
+    include_paid: bool = True,
+    include_organic: bool = True,
+) -> str:
+    """Render populated business-context fields as a standard ``<business_context>``
+    block. Returns '' when nothing is populated (so prompts stay clean for
+    first-run / no-context cases). ``include_paid`` / ``include_organic`` let an
+    agent suppress sections irrelevant to its mode.
+    """
+    ctx = BusinessContext.coerce(data)
+    lines = _lines(ctx, _SHARED_LABELS)
+    for field, label in _LIST_LABELS:
+        items = getattr(ctx, field, []) or []
+        if items:
+            lines.append(f"{label}: {', '.join(str(i) for i in items)}")
+    if include_paid:
+        lines += _lines(ctx, _PAID_LABELS)
+    if include_organic:
+        lines += _lines(ctx, _ORGANIC_LABELS)
+    return xml_block("business_context", "\n".join(lines))
+
+
+class UserContext(BaseModel):
+    """The human operator a synthesis is for — used to personalise tone/depth.
+
+    Separate from BusinessContext (which describes the company). The formatter
+    renders only the fields that are set, so an account that never opened the
+    profile page contributes no block at all.
+
+    Per-user data is rendered in the USER message, never the system prompt, so
+    the cached system prefix stays byte-identical across users. That is not a
+    style rule: ``build_insights_system_prompt`` is deliberately cache-stable,
+    and one per-customer string in it would give every account its own prefix
+    and lose the cache hit on every call of every run.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = ""
+    role: str = ""
+    seniority: str = ""
+    #: How this operator wants to be written to, and in which language. Both
+    #: come from their saved profile (``service/profile.py``); an empty
+    #: language means "match the language they wrote in", which is why it is
+    #: rendered as an instruction only when it is set.
+    voice: str = ""
+    language: str = ""
+    #: Their IANA timezone, rendered only when they set one. An agent that
+    #: reads "last week" has to pick seven days, and it cannot pick the right
+    #: seven without knowing whose week it is.
+    timezone: str = ""
+    #: Their own words about how they want to be worked with. Last in the
+    #: block on purpose: it outranks the preset above it when the two
+    #: disagree, and a model reading in order should meet the override last.
+    notes: str = ""
+
+    @classmethod
+    def coerce(cls, data: "UserContext | dict | None") -> "UserContext":
+        """Build from this model, a plain dict, or None (→ empty)."""
+        if data is None:
+            return cls()
+        if isinstance(data, UserContext):
+            return data
+        if isinstance(data, BaseModel):
+            return cls.model_validate(data.model_dump())
+        return cls.model_validate(data)
+
+
+_USER_LABELS: list[tuple[str, str]] = [
+    ("name", "Name"),
+    ("role", "Role"),
+    ("seniority", "Seniority"),
+    ("voice", "Write for them"),
+    ("language", "Write in"),
+    ("timezone", "Their timezone — resolve relative dates like \"last week\" in it"),
+    ("notes", "Their own instructions, which win over the line above"),
+]
+
+
+def format_user_context(data: UserContext | dict | None) -> str:
+    """Render populated user fields as a standard ``<user_context>`` block.
+
+    Returns '' when nothing is populated, so prompts stay clean when no user
+    context is supplied. Like business context, this belongs in the user
+    message — never the system prompt.
+    """
+    ctx = UserContext.coerce(data)
+    return xml_block("user_context", "\n".join(_lines(ctx, _USER_LABELS)))
+
+
+def format_prior_artifacts(rows) -> str:
+    """Render prior-artifact summaries (models.artifact.Artifact rows, newest
+    first) as a ``<prior_reports>`` block for agent context.
+
+    One line of metadata plus the stored AI summary per artifact — never the
+    full report (token budget). Returns '' when there are no rows. Per-project
+    data: belongs in the user message, never the system prompt.
+    """
+    lines: list[str] = []
+    for row in rows or []:
+        created = row.created_at.strftime("%Y-%m-%d") if row.created_at else ""
+        head = f"[{row.id} · {created} · {row.title or row.kind} v{row.version}]"
+        summary = (row.summary or "").strip()
+        lines.append(f"{head} {summary}" if summary else f"{head} (no summary yet)")
+    if not lines:
+        return ""
+    return xml_block(
+        "prior_reports",
+        "Earlier reports for this project — cite or compare against them when "
+        "relevant (fetch one in full with GetArtifact):\n" + "\n".join(lines),
+    )
+
+
+def format_agent_context(data: dict | None) -> str:
+    """Render a stored per-(project, agent) context blob (agent_contexts table)
+    as an ``<agent_context>`` block. Returns '' when empty."""
+    if not data:
+        return ""
+    import json as _json
+
+    try:
+        body = _json.dumps(data, indent=2, default=str)
+    except (TypeError, ValueError):
+        body = str(data)
+    return xml_block(
+        "agent_context",
+        "Stored working context for this project (maintained across sessions):\n" + body,
+    )
+
+
+def competitor_names(competition: dict | None) -> list[str]:
+    """Competitor names off the project's competition blob: strings, or
+    dicts with a name (and maybe a URL), as onboarding writes them."""
+    names: list[str] = []
+    for item in (competition or {}).get("competitors") or []:
+        if isinstance(item, str) and item.strip():
+            names.append(item.strip())
+        elif isinstance(item, dict):
+            name = str(item.get("name") or item.get("url") or "").strip()
+            if name:
+                names.append(name)
+    return names
+
+
+def business_context_from_project(project: Any) -> BusinessContext:
+    """The ``BusinessContext`` a stored project row implies.
+
+    The browser sends one with every interactive request, built from the same
+    fields; a run with no browser (the scheduled brief, the Analytics tab's
+    report, the content plan) has only the row. One mapping, so the agent
+    reads the same project whichever door it came through — the content
+    runner carried its own copy until this existed.
+    """
+    targets = project.targets if isinstance(getattr(project, "targets", None), dict) else {}
+    competition = project.competition if isinstance(getattr(project, "competition", None), dict) else {}
+    audience = project.audience if isinstance(getattr(project, "audience", None), dict) else {}
+    goals = [
+        str(targets[k]).strip()
+        for k in ("north_star_metric", "north_star_goal_window", "primary_kpi")
+        if targets.get(k)
+    ]
+    return BusinessContext.coerce({
+        "business_name": project.company_name or project.name or "",
+        "business_description": project.pitch or project.description or "",
+        "industry": project.industry or "",
+        "business_model": project.business_model or "",
+        "positioning_statement": str(competition.get("positioning_statement") or competition.get("compare_against") or ""),
+        "audience_segment": str(audience.get("primary_segment") or ""),
+        "business_goals": "; ".join(goals),
+        "competitors": competitor_names(competition),
+        "primary_organic_kpi": str(targets.get("primary_kpi") or ""),
+        "monthly_budget": _number(targets.get("monthly_budget")),
+        "target_cpa": _number(targets.get("target_cpa")),
+        "target_roas": _number(targets.get("target_roas")),
+    })
+
+
+def _number(value: Any) -> float:
+    try:
+        return float(value) if value not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return 0.0

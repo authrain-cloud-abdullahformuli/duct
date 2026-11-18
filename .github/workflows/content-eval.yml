@@ -1,0 +1,97 @@
+name: Content Agent Eval
+
+# Runs the REAL content agent (V1, deepagents) end to end, once per provider:
+# it plans a month (enrichment, research sub-agents, WebSearch), drafts a post,
+# generates a slide image via Gemini, and has a Gemini judge (vision) score the
+# post against the rubric. It costs money, so it is not wired to the normal
+# PR/push CI. Trigger it manually from the Actions tab to check the content
+# agent for output degradation.
+#
+# Postgres runs as an ephemeral service container, so no external DB is needed.
+# Required repository secrets:
+#   GEMINI_API_KEY     — the Gemini leg, slide images, WebSearch and the judge.
+#   ANTHROPIC_API_KEY  — the Claude leg (V1 needs a real key; a subscription
+#                        token is rejected by the Messages API). Missing → that
+#                        leg skips.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new run supersedes an in-flight one on the same ref (no two paid evals at once).
+concurrency:
+  group: content-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  content-eval:
+    name: content e2e + judge (${{ matrix.provider }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [anthropic, google_genai]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: duct
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # psycopg3 scheme up front: alembic uses DATABASE_URL verbatim, and
+      # db.session leaves an explicit +psycopg URL untouched.
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/duct
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Install backend dependencies
+        run: poetry install --with dev
+
+      - name: Run database migrations
+        run: poetry run python scripts/migrations.py upgrade head
+
+      - name: Run content agent eval
+        env:
+          DUCT_EVAL_PROVIDER: ${{ matrix.provider }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DUCT_EVAL_OUTPUT: eval-scorecard.json
+        # -rs surfaces skip reasons; -s prints the rendered scorecard. The test
+        # also appends the scorecard to the GitHub step summary.
+        run: poetry run pytest -m live tests/test_content_post_e2e.py -s -v -rs
+
+      - name: Upload scorecard
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: content-eval-scorecard-${{ matrix.provider }}
+          path: backend/eval-scorecard.json
+          if-no-files-found: ignore

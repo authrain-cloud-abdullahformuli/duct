@@ -1,0 +1,1181 @@
+# Duct App — agent instructions
+
+Next.js App Router report viewer and agent interface.
+
+## Stack
+
+- **Framework:** Next.js 16 App Router, React 19, TypeScript 6, Node 22 (pinned in `app/.nvmrc` — the OpenNext/wrangler toolchain requires ≥22; dev runs on port 3003)
+- **UI:** shadcn/ui + Radix UI primitives, Tailwind CSS 4, lucide-react, next-themes (light/dark)
+- **Charts:** Nivo (heatmaps, complex) + Recharts (general) — both intentionally present
+- **State:** React Context (`InsightContext.js`) + component-level state only. No Redux/Zustand.
+- **HTTP:** Native `fetch` wrapped in `lib/api.js`. No type-safe client or OpenAPI generation.
+- **Auth:** Custom API key (`NEXT_PUBLIC_DUCT_API_KEY`) sent to backend + Google Sign-In (`GoogleSignInButton.jsx`). No next-auth/Clerk/Supabase.
+- **Observability:** PostHog behind a swappable seam (`lib/analytics/`; `NEXT_PUBLIC_ANALYTICS_PROVIDER` picks, unset runs every provider whose variable is set: `NEXT_PUBLIC_POSTHOG_KEY`), gated on consent. No tag manager in this code: Cloudflare's Google tag gateway adds Google Tag Manager and GA4 at the edge, outside this seam and outside consent ([`site/AGENTS.md`](../site/AGENTS.md)); Cloudflare Turnstile bot protection. Nothing outside `lib/analytics/` names a vendor.
+  PostHog runs in two modes on one client (`lib/analytics/posthog.js`). **Errors** starts for every browser session from `instrumentation-client.ts`: early `error`/`unhandledrejection` listeners at once, the library on idle, in-memory persistence, so it stores nothing and needs no banner; error boundaries call `reportError`. **Full** starts on consent: cookie across `.getduct.ai`, page views, autocapture, heatmaps, replay. In the desktop shell the Preferences switch (`lib/telemetry.js`) replaces both the banner and the errors-before-consent rule: off sends nothing at all, on runs full mode in memory and never records a replay. Three rules a change here must keep: the `no-external` build only (the shell's IPC trusts every script on this origin, and it keeps `script-src` at `'self'`); `lib/analytics/scrub.js` on every event (query strings and the `/invite/` and `/open/audit/` path tokens go); and the replay masks all text and blocks images, embeds and canvases, plus `mask_all_text` on clicks, because a human watching a replay of a customer's GA4 numbers breaks Google's Limited Use rule. Server render errors go through `instrumentation.ts` → `lib/analytics/server.js` (posthog-node). Events reach PostHog through the same-origin `/ingest` rewrite in `next.config.mjs`, which the marketing site uses too.
+- **Overrides:** `package.json` forces `lodash-es` to ^4.18.1. `mermaid` 12.0.0 depends on `chevrotain` 11.1.2, which pins `lodash-es` 4.17.23 exactly, and that version carries a high advisory (code injection via `_.template`) and a moderate one (prototype pollution in `_.unset`/`_.omit`). Delete the override once `mermaid` moves to `chevrotain` 12 or later, which no longer uses lodash.
+
+## Deployment
+
+- **Host:** Cloudflare Workers via `@opennextjs/cloudflare` adapter + wrangler CLI.
+- `npm run deploy:cf` → OpenNext build + `wrangler deploy` (do not run directly — all deploys go through CI/CD on merge to main).
+- **CI/CD:** GitHub Actions (`app.yml`) — lint, typecheck, `next build` on every PR; on push to `main` the `deploy` job runs `opennextjs-cloudflare build` + `wrangler deploy`. (Replaced the Cloudflare "Workers Builds" git integration, which failed on its Node 20 builder — wrangler@4.99 needs ≥22.)
+- **Security headers** are `SECURITY_HEADERS` in `next.config.mjs`, applied by OpenNext's routing layer to every response the worker renders. `/_next/static` and `public/` never reach the worker, so their `nosniff` is in `public/_headers`. The CSP's `script-src` is `SCRIPT_SOURCES` there: this origin (the edge's Google tag is served from it, so it passes) and the sign-in bot check, plus `'unsafe-eval'` in dev. A script from any other host is refused, so loading one means adding its host there. It keeps `'unsafe-inline'` with no nonce, and not because a nonce would make pages dynamic (every route already is: the root layout reads the locale cookie) but because an `about:srcdoc` frame inherits its parent's policy, and the brief and artifact frames run model-authored inline `<script>` that no nonce can reach. Every `srcDoc` iframe (briefs, the audit report, slides) inherits the policy, so a directive added there also governs model-authored HTML. Dev allows same-origin framing only because `/preview` frames `/preview/frame`.
+
+## Route structure
+
+Four route groups under `app/` (the fourth, `(public)/lead/seo-audit`, is the token-gated lead-magnet audit with its own chrome and no auth):
+
+- `(start)/start` — onboarding: the audit *is* the onboarding. One field
+  (URL — the root page read back in a second, crawl continuing in the
+  background via `/api/audit/prefetch`) → a model (an API key verified by
+  spending it, or on desktop "Continue with ChatGPT", or skipped) → the
+  session at `/audit/seo/[sessionId]` with `crawl_id` and `draft_project`
+  set. The "Found it" card also offers documents
+  (`components/onboarding/DocumentPicker.jsx`): files read on upload by
+  `/api/audit/documents`, their ids sent as `document_ids`. It lives on that
+  card and not beside the URL field because the landing page's hand-off
+  skips the field, and it blocks "continue" only while a file is being read.
+  Submitting the URL mints a **guest** (`lib/guest.js`): a real account
+  with a synthetic email, so everything the audit makes has an owner before
+  anyone signs in; Google sign-in later links or merges it. No `AuthGuard`
+  and none of the app shell. Layout is the threshold split: the `salve`
+  mosaic and the aqueduct strip (`components/onboarding/Aqueduct.jsx`) on
+  the left, the step on the right. The aqueduct is the progress indicator —
+  water reaches an arch when that step's data does; blue is water and
+  nothing else on the page is blue; the six-stone palette lives as
+  `--tessera-*` tokens in `styles/onboarding.css` and the one celebration
+  (`TesseraBurst`) is made of them. Provider choice is a radio-card list
+  (`ProviderStep.jsx`), OpenAI first. Design and phases:
+  `docs/engineering/2026-09-08-smart-onboarding-plan.md`.
+  Nothing is **written** until the user confirms the site card: for someone
+  already signed in, the crawl's draft would otherwise land in whichever
+  project happened to be active and overwrite it. The card says which
+  project this becomes, offers a separate one, and asks when two projects
+  share the site. The audit that follows says so again from the workspace,
+  because that write happens while the user is reading the report.
+- `(auth)/` — the front door, and it is a landing page before it is a login
+  page: the wide half (`components/onboarding/FrontDoor.jsx`) is the free
+  audit — one URL field that hands off to `/start` — and the narrow dark half
+  is sign-in for someone who already has an account. It passes a guest's link
+  code to the authorize URL so the account keeps their work.
+  When `lib/signInSources.js` has armed the onboarding bundle it also passes
+  `sources=onboarding` (Search Console + Analytics read scopes in the same
+  consent) and says so under the button. Only the connector prompt on the
+  onboarding audit arms it, and the arming expires; the Share dialog, an
+  invitation and a plain visit here stay identity-only.
+  Two things the offer half deliberately does **not** show, both of which read
+  as a demand rather than an offer to someone who has not decided yet: the
+  connector list as pills under the field (it survives as one sentence below
+  the fold, with a "when you're ready" clause), and `/start`'s aqueduct strip
+  rendered dry, which is three chores shown before the first click. **The
+  `FONS` mosaic is in the sign-in half, not this one**, and putting it back
+  beside the copy is a regression however well it reads at 1440: a 280px panel
+  only fits there above 1280px, and the rule that hid it below that blanked it
+  across the whole band the desktop window occupies (1200px default, 900px
+  minimum), so the desktop app never once showed it. The field and its button
+  are **one row**, not a stack — a single-field form over a full-width button
+  reads as two steps — and they stack again below 30rem.
+  **The sign-in half is one heading, one button and one line of legal, and
+  each thing missing from it was removed on purpose:** the "Already using
+  Duct?" kicker and the "Continue with your Google account" sub-line (three
+  lines introducing a button that says what it does on its face — the sub-line
+  is back only for an expired session, which carries something the button
+  cannot); and four of the five notices that could
+  stack under the button, now one slot filled by `signInNotice()`. The
+  "Keep me signed in for 30 days" checkbox was removed on the same argument
+  and **put back on request** — it is a deliberate keep, not an oversight, so
+  leave it. Turnstile
+  renders `appearance: "interaction-only"`, so the box exists only for a
+  visitor actually challenged, and the button is never disabled waiting for a
+  token — `awaitTurnstileToken` holds the click, because a disabled sign-in
+  button on first paint is indistinguishable from a broken one. Its ink is
+  semantic tokens only — the ground is `--start-ground`, which flips with the
+  theme, and the fixed `--navy` brand hexes it used to paint with measured
+  1.05:1 on it in dark.
+- `(app)/` — authenticated app shell:
+  - `insights/organic-growth/` + `[slug]/` + `generate/` — the Desk, stored
+    insights, generate entry; `insights/session/` — the insights agent
+    workspace
+  - `audit/seo/` + `audit/seo/[sessionId]/` — SEO audit hub and live workspace
+  - `content/` — Content Studio hub; `content/plan/` the planner board on
+    its own full-bleed route;
+    `content/posts/[postId]`, `posts/new`, `sessions/new` — the content agent
+    workspace over a post or a plan. The hub's Plans tab (`?tab=plans`; the
+    old `?tab=plan` still lands there) is the board: list, Kanban and
+    calendar, titled by the plan picker (`components/content/PlanPicker.jsx`),
+    a menu of every plan as a rich row (state, dates, progress, channels),
+    current first, then upcoming, then ended (`orderPlans`). A plan session's
+    pane shows the plan being made with no day actions; drafting from a day
+    is the board's. A proposal that changes some days (`only_days`) shows
+    those days alone, before and after (`PlanChanges.jsx`, `planChanges`). A plan session is the plan manager for
+    one period: `?plan=<id>` revises that plan, `?start=<day>&days=<n>` plans
+    that period, and neither manages the plan covering today (or makes one
+    for the month in progress). The board's Revise plan is the first;
+    New plan and Plan ahead ask how far ahead (`PlanPeriodPicker.jsx`: the
+    month, 1 or 2 weeks, 30 days) and are the second. **From your work** is
+    the third way in (#561): `FeedPlanDialog.jsx` asks what to read, how far
+    back, how many days it may change and how much of a private repository it
+    may talk about, and opens `?source=work&…`. Linear and Notion appear as
+    sources only when connected (`offeredSources`, from the MCP server rows'
+    `preset`), and Notion needs the one database to read (`feedBlocker`)
+    (`lib/contentFeed.js` holds the
+    values only; its words are `contentFeedLabels.js`, because `contentApi.js`
+    imports the values under plain Node). That run is always fresh, never a
+    resume of the covering plan's conversation. Its read step's payload is
+    `FeedSummary.jsx`, above the plan or, when nothing was worth a post, the
+    whole pane; a reopened thread reads it back from the stored `feed` row. A
+    day it planned carries `sources`, drawn by `SourceChips.jsx` on the agenda
+    row, the Kanban card and the changed-day view. The dates come from
+    `lib/contentSchedule.js`, which mirrors `agents/content/plan_period.py`
+    and must keep agreeing with it. The hub's Posts tab opens on its Waiting
+    chip while any draft is unanswered: that view is the drafts queue (#266,
+    `components/content/DraftsQueue.jsx`), read from `status=draft` rather
+    than a route of its own. Approve opens `PublishModal` on the channel's
+    best slot (`suggestedAt`), Skip takes a `SkipReason` the content agent's
+    next draft reads as a feedback memory. Its one notice a day is
+    `components/content/DailyDraftsReminder.jsx`, mounted once in the app
+    layout inside `AuthGuard`; its time and switch are per device
+    (`lib/dailyReminder.js`). The Brand tab's Writing samples and Voice rules
+    (#271, `WritingSamples.jsx`, `VoiceRulesFields.jsx`, caps in
+    `lib/voiceRules.js`) save into `content_brand`; the rules are stored only
+    once changed, so an untouched project keeps following Duct's defaults
+  - `execute/` — change-set review queue: diffs, approve, apply, roll back
+  - `scheduled/` — runs nobody starts by hand (#562), for the active project:
+    `components/schedules/ScheduleCard.jsx` per schedule (what and when, the
+    host, the state, the last run with its cost and a link into the
+    conversation it left, Run now, Pause/Resume, Delete, and the history with
+    every skip's reason), over `lib/schedulesApi.js` and the codes in
+    `lib/schedules.js`. No local mirror: only the server knows whether a run is
+    going, and the page polls only while one is. A schedule is made from the
+    plan board's From your work sheet (Repeat: every Monday at 09:00 in the
+    reader's zone, or on each GitHub release, #563); `/content?tab=plans&from=work` opens that sheet, and the
+    empty page's button lands there. The card leads with a calendar leaf for
+    the next run and a strip of the last eight runs as stones (the list
+    route's `recent`), each with a glyph beside its colour; an on-release
+    schedule's leaf is a release tag, checked hourly. A proposal still
+    unanswered is the server's `waiting`, and it is the sidebar's one count
+    in brand ink (`hooks/useScheduledWaiting.js`, asked on focus, a project
+    switch and a route change, never polled). This page and the
+    feed surfaces share `styles/feed.css`: a source is a stone in its kind's
+    mosaic colour (`FeedKind.jsx`), a read is a sieve of kept against
+    left-out stones, and the setup sheet's window is a ribbon of days with
+    blue as the stream under them, the mosaic rule that blue is water
+  - `connections/` — the **Toolbox**: one searchable catalogue of native
+    connectors and MCP servers
+    (`components/connections/ConnectorBrowser.jsx` over
+    `lib/connectorCatalog.js`). A new native connector needs a category in
+    `NATIVE_CATEGORY`, a new MCP preset one in `MCP_CATEGORY`; without it the
+    source is filed under Other. A search also asks the MCP Registry, whose
+    results are a section of their own under the catalogue's
+    (`useMcpConnectors`' `registry`, through `ConnectorBrowser`'s
+    `moreResults`), never entries in it: they are not ours to file or rank.
+    A search runs out in that order, then to adding by address. While browsing
+    the whole list, `BringAnyTool` is that way in, beside the starters: the same
+    offer as the last tile in the list went unseen.
+    RSS and Atom feeds are a native card (#564): one multiline field of feed
+    URLs, saved as one row, read by the From your work sheet's "Your feeds"
+    source and by FetchData (`rss_items`).
+    A connected server that needs attention says why on its tile, from the
+    `problem` the server recorded (`lib/mcpServers.js`, `PROBLEM_SHORT`).
+    It was called Connections until November 2026; the route kept the old
+    name because every OAuth callback and the desktop shell's deep link land
+    on `/connections`, and a rename would break connects already in flight
+  - `artifacts/` + `[artifactId]/`, `activity/`, `usage/`, `memory/` — the
+    library, the cross-agent feed, usage, and memory. An agent's
+    edit to the project (MCP `update_project`, #512) carries Undo in the
+    feed: that button is what the consent page's "every edit can be undone
+    in Duct" stands on, so it stays wherever that promise is made
+  - `settings/models/` + `settings/profile/` — tiers, providers, usage; profile
+  - `settings/agents/` — Connect your AI agent. The why comes first: a
+    drawing of repo → agent → Duct project, what that profile feeds, and
+    the can / can never lists from `settings/AgentAbilities.jsx`, which the
+    consent page renders too, so the two cannot promise different things
+    (change it when the MCP server gains a tool). Every setup line is global,
+    because the page says one setup works in every repo. Then pick the agent
+    by its logo (`AGENT_LOGOS` in `connections/logos.jsx`) and three tracked
+    steps — the line to paste into Claude Code, Codex or OpenCode, or a one-click
+    install link for Cursor and VS Code (hidden in the desktop shell, which
+    opens only http(s) links outside itself); the browser sign-in, which the
+    page watches for by polling the agent list while visible, from the first
+    copy until an agent it did not know about appears (ten minutes at most);
+    the first prompt. No secret in any step. Below: the agents that signed
+    in, and personal tokens for one that cannot
+    (`components/settings/AgentAccess.jsx`, `lib/mcpTokensApi.js`). A new
+    token's plaintext lives in page state only
+  - `generate/` — the retired wizard, now a bare redirect to `/insights/session`
+  - `projects/` — project management
+  - `project/[projectId]/` — **Project context**, the editor for one
+    project: the wizard's five sections, kept, minus creation (a project
+    starts at `/start`). Drafted fields carry a provenance chip ("From your
+    site" / "Duct's guess") with a one-click confirm; typing confirms too.
+    Deep-link a section with `#about` / `#targets` / `#audience` /
+    `#competition` / `#brand`. There is no `/onboarding` route any more —
+    "new project" everywhere means `/start`.
+  - `project/[projectId]/members/` + `project/[projectId]/memory/` — members
+    and invitations (owner/collaborator); memory. Both memory routes are one
+    page (`components/memory/MemoryPage.jsx`) with a Project / Only you tab:
+    the project route opens on the shared tab, `/memory` on the private one
+    with the active project beside it. Kinds are filtered as the groups in
+    `lib/memoryApi.js` (Goals, Facts, Numbers…), never as the backend's
+    eleven-plus-six kinds.
+
+Plus three top-level routes outside every group, because their visitor is
+usually signed out and the app shell's guard would lose where they were going:
+`invite/[token]/` (the invitation landing page), `authorize/` (where an
+agent's browser sign-in asks the person, `components/settings/AgentConsent.jsx`;
+the backend has checked the agent and parked the request, and the page sends
+the browser back to the agent with the answer) and `open/audit/[conversationId]/`
+(the share link for a report — parks the destination, sends through sign-in,
+then resumes the conversation; the backend hands it only to project members).
+`?kickoff=sources` on that link makes the resumed workspace open by asking
+the agent to check what the bundled sign-in connected and bind the property
+(`KICKOFF_MESSAGES` in `AuditWorkspace.jsx`; it rides the session's `client`
+bag and is spent once).
+
+**Every routable segment renders `LocalBackendGate`.** The desktop shell
+bundles its own backend and only learns its loopback port at runtime, so
+`BASE` is repointed once at boot (`lib/localBackend.js`) and the gate holds
+*hydration* until then. It does not hold the HTML: the server renders the
+page, a browser hydrates it at once, and the shell suspends hydration with
+`use()`, which keeps the server's HTML on screen and runs no effect or handler
+below the gate until the backend is named. Two consequences. A gated page's
+first render has to match the server's, so browser state (`localStorage`,
+`isLocalBackendActive()`, `isMac()`) is read in an effect, not during render;
+the front door's Turnstile flag is the worked example. And a member opening
+`/` must not see the front door the server drew for everyone, so
+`lib/sessionHint.js` marks `<html data-session="member">` before paint and the
+page clears it if it stays. Skipping the gate is not a slow path, it is a sign-out: the
+session token is stored under one key but signed by whichever backend minted
+it, so a token from the wrong one comes back 401 "Invalid token" and
+`authFetch.endSession` reads any 401 as a dead session. That is what `/start`
+did — it was ungated and mints a guest, so "Audit a site" from inside the
+desktop app replaced the signed-in session with a token the sidecar would
+never accept, and the next request bounced the user to the front door.
+`scripts/check-backend-gate.mjs` (in `npm run check:parity`) holds the rule;
+its `ALLOWED` list is for subtrees that reach no backend at all, and adding to
+it is a claim about the code, not a way to quiet the check.
+
+## Key utilities
+
+- `lib/api.js` — fetch wrapper for backend calls
+- `lib/signInSources.js` — the onboarding sign-in bundle: `armSignInSources()`
+  (one caller: `ConnectionRequest` on the onboarding audit), `consume…` on the
+  sign-in page, `resumeAuditPath()` for the way back into the conversation
+- `lib/guest.js` — the guest account: `ensureGuest()` mints one on first use,
+  `isGuestToken()` / `isSignedInUser()` read the `guest` claim. A guest is a
+  real user everywhere else in the app; only the sidebar footer and the
+  sign-in page treat it specially.
+- `lib/onboardingApi.js` — prefetch, documents, verify, link code: the calls
+  only `/start` makes. Errors carry the backend's `reason`. The document
+  limits are mirrored here (`localDocumentError`) only so a file that will be
+  refused says so before it uploads; the server checks every one.
+- `lib/chatgpt.js` — "Continue with ChatGPT", desktop only: the shell runs
+  the OAuth and holds the refresh token; this module gets an hour-long access
+  token and account id from it, and `providerKeyHeaders()` sends them as the
+  OpenAI credential when no API key is pasted (`X-Provider-OpenAI` +
+  `X-OpenAI-Account-Id`). Gated on `capabilities.chatgptAuth` from the shell
+  and `chatgpt_auth_enabled` from `/api/providers/status` — both, always.
+- `lib/projectDraft.js` — merges `PROJECT_DRAFT` events into the project
+  with provenance (`user` / `crawl` / `document` / `inferred`, in that rank).
+  Three rules: a user value is never overwritten, a filled field gives way
+  only to an equal or higher rank (the site beats the user's files, which
+  beat a model's guess; an unknown provenance ranks lowest), and **a
+  non-empty field with no recorded provenance counts as the user's** —
+  every project made before drafts existed is in that state, and without
+  that rule the first draft to reach one replaced a human's name, pitch and
+  industry with guesses. Which project a draft lands on is the caller's
+  `projectId`; without one it resolves by the drafted site and creates,
+  never "whatever is active". `/start` and `AuditWorkspace` apply them;
+  nothing else writes drafts. Each draft is merged here for an instant
+  answer and sent as a draft (`pushDraftToBackend`, one at a time per
+  project, in order) to be merged again on the server, which keeps the
+  labels and holds the same rules (`backend/service/project_draft.py`). A
+  save sends the labels too, and the server settles it by them, so **an
+  edit has to mark its field `user`** (`own()` on the project page): an
+  unmarked empty field reads as a copy that never had the value.
+- `lib/projects.js` — `siteKey()` / `projectsForSite()` are how a site
+  address finds its project: lowercase host, no leading `www.`, subdomains
+  kept distinct. `projectsForSite` returns every match, because two is a
+  question for the user and not a thing to guess at.
+- `lib/auditSession.js` — the `sessionStorage` hand-off into
+  `/audit/seo/[sessionId]`. The request goes to the backend verbatim (an
+  unknown field is a 422), so client-only state — the "connect a model"
+  card, a kickoff message, which project this run writes to — is nested
+  under one `client` key rather than stripped by name on arrival.
+- `lib/membersApi.js` — project members + invitations (server-only; no localStorage mirror, unlike `lib/projects.js`)
+- `lib/modelSettings.js` — the tier map and the fallback switch, on the server.
+  `lib/modelTiers.js` still owns the vocabulary and the `localStorage` copy;
+  the two coexist because the local copy paints the page before the network
+  answers and is what a signed-out install runs on, while the server copy is
+  what every run reads — including the scheduled brief, which has no browser.
+  On disagreement the server wins, and every write is a partial so a stale tab
+  cannot put back a control it never saw.
+- `components/models/` — the Models & providers page, in parts, because
+  `/preview` can only document a component it can import. `TierSummary` is
+  what the Tiers tab opens with: the setup you already have, in three lines,
+  with the three-way choice behind Customise — **most people bring one key**,
+  and the page it replaced asked all three questions before answering any.
+  Two rules that page is one careless change away from losing, both of which
+  it had already lost once: **say the credential answer once** (`sourcesAgree`
+  decides whether the summary says it for the page or the cards say it each),
+  and **state the fall-through rule once**, in the drawn chain. `UsagePanel`
+  is the whole Usage view and has two homes — the `/usage` route and this
+  page's third tab — so change it there, never fork it into either caller.
+  `ModelPicker` is the **only `SelectGroup` in the app**, and it must keep
+  `position="popper"`: Radix's default `item-aligned` positions the list by
+  aligning the selected item over the trigger and never resolves one inside a
+  group, so the list opens at the viewport's bottom-left corner and the
+  control reads as dead. `DeskComposer` carries the same prop for the same
+  reason. The **Images row is a picker, not a report**: `image_model` on
+  `user_model_settings` names which model draws, and `resolve_image_run`
+  treats it as a preference — an unknown id, or one whose provider has no
+  spendable key, falls through to `IMAGE_PROVIDER_ORDER` rather than failing
+  the run. `/providers/status` takes the same argument and must keep giving
+  the same answer, because that row is a promise about what the run will do.
+  The **Videos row** under it is the same picker on the same rule
+  (`video_model`, `resolve_video_run`, `VIDEO_PROVIDER_ORDER`), and the two
+  share one divider because neither is a rung of the ladder above.
+  Its `UsageEmpty` is exported for one reason: `/preview` renders fixtures and
+  never the API, and this panel's first paint is a fetch, so without that seam
+  the two states most worth reviewing would be the two nobody could open.
+- `lib/engines.js` — `DEFAULT_ENGINE` and the agent-type list. The engine is
+  no longer a user choice: v3 is gone, every agent runs v1, so the Runtime
+  tab, the `ENGINES` list and the agent↔engine support map went with it.
+  Pass `DEFAULT_ENGINE` where the server wants an engine
+- `lib/insightData.js` — insight fetching and management
+- `lib/localInsights.js` — client-side insight storage
+- `lib/reports.js` — report generation helpers
+- `lib/appVersion.js` — is this tab running the build that is currently
+  deployed. `NEXT_PUBLIC_BUILD_ID` is baked at build time (CI sets it to
+  `github.sha`; see `.github/workflows/app.yml`) and compared against
+  `/api/version`. Everything in it is written to stay quiet on doubt: an
+  unknown deployed build, a failed poll and a build with no baked id all read
+  as "no new version", because a reload prompt nobody needed is what teaches
+  people to ignore the one they do. **Never reload for the user** — this app
+  holds long agent runs and unsent input.
+- `lib/userProfile.js` + `/settings/profile` — who Duct is answering and how
+  they want to be written to: name, role, one writing preset, the language Duct
+  writes *to them* in, and their own instructions. Server-owned, on the
+  `lib/modelSettings.js` pattern (localStorage paints, the server wins, writes
+  are partial), because the scheduled brief has no browser to send a preference
+  from. One preset where the dialog had two grids: `service/profile.py` derives
+  the `communication_style`/`report_depth` pair from it, so no prompt changed.
+  The page's sample is canned on purpose — a live rewrite is a model call per
+  click. **Communication language is not the project's output language (#125)
+  and not interface localisation (#126):** chat follows this, an artifact
+  follows the project's output language when it has one.
+- `lib/userPreferences.js` — what is left after the profile moved to the
+  server: the per-run dials the composer writes (`thinking`, `tier`,
+  `preferred_artifact_format`, `context_compression`), plus the three fields an agent request still carries
+  for signed-out runs, mirrored from the profile rather than edited here
+- `lib/consent.js` — the consent *rule* and the stored decision. Names no vendor.
+- `lib/analytics/` — the seam. `index.js` selects a provider from
+  `NEXT_PUBLIC_ANALYTICS_PROVIDER` (unset → `posthog` when its key is
+  set, else `none`); `posthog.js` is the only file that knows the vendor;
+  `none.js` is a complete implementation, not a stub. Adding a provider is one
+  file plus a line in `PROVIDERS`. **Nothing outside this directory may
+  reference a tag vendor** — that is what lets a self-host build measure nothing
+  without editing our consent logic, and it mirrors
+  `desktop/src-tauri/src/telemetry/` on the Rust side.
+- `ProductAnalytics` owns the flow. The desktop shell is never asked: the
+  Preferences switch in `lib/telemetry.js` stands in for the banner there.
+  Never load a tag manager from this code: the shell's IPC trusts every script
+  on this origin, and a tag container exists to run scripts configured outside
+  this repository. The one the edge adds is a known exception, not a precedent.
+- `lib/format.js` — dates, numbers and labels: `relativeTime`, `relativeDays`,
+  `formatDate`, `formatTime`, `toDate`, `dayKey`, `compactNumber`,
+  `formatNumber`, `formatPercent`, `titleCase`, `formatTitle`, `capitalize`,
+  `initials`.
+  Use these instead of a component-local `fmtDate`/`fmtNum`/`prettify` — the
+  per-component copies had drifted apart before they were consolidated.
+- `lib/analyticsReport.js` + `components/content/AnalyticsReport.jsx` +
+  `components/content/report/GrowthReportView.jsx` — the Analytics tab's
+  growth report. The backend answers one payload (`getAnalyticsReport`); the
+  lib reads it into the one state the tab is in (`reportState`: no sources,
+  empty, generating, failed, fresh, stale), the sources a person may tick
+  (`reconcileSelection` never leaves nothing ticked while something is
+  ready) and the rows a block can draw (`chartRows` coerces the measure and
+  drops rows without one; `drawableBlocks` skips a block type the app does
+  not know rather than crashing the report). `AnalyticsReport` owns the
+  pickers, the states and the wait (polling the read while a run writes,
+  `pollWhileVisible`); `GrowthReportView` draws the blocks and is what the
+  artifact library renders for `GROWTH_REPORT_JSON` too, so the stored copy
+  and the live one cannot diverge. Model text fills clamped slots under
+  translated labels; the only large type is the verdict. Nothing here
+  regenerates on its own: Refresh is the one thing that spends a model run.
+  Every state is a scene in `/preview` over `lib/__fixtures__/growthReport.mjs`.
+- `lib/contentMetrics.js` — a content post's numbers, read the same way on
+  every screen: `metricValue` / `metricsOf` walk `METRIC_ALIASES`, the mirror
+  of `backend/service/content_metrics.py` that a backend test parses and holds
+  equal, order included. Never read `post.perf.view_count` directly.
+  `PostMetricsForm` is the one place numbers are typed in, and sends only what
+  changed (`metricChanges`), because a sent value is marked manual and no sync
+  refreshes it again.
+- `lib/sse.js` — `consumeSseStream` / `parseSseDataFrame`, shared by every
+  streaming endpoint (audit, content, insights)
+- `lib/visibility.js` — `pollWhileVisible(tick, ms)` / `pageHidden()`. Every
+  poller goes through it: the desktop window sits open all day behind other
+  apps, and a tick nobody can see costs battery and wakes the backend. It
+  re-checks on return, so a skipped tick loses nothing.
+- `hooks/useNearViewport.js` — latches true once an element nears the screen.
+  For list items that are expensive to fill (a fetch, a document in a frame);
+  the artifact library is why it exists.
+- `lib/authFetch.js` — the one home for the auth token: `AUTH_TOKEN_KEY`,
+  `authToken`, `hasAuthToken`, `authedHeaders`, `authedRequest`, plus
+  `decodeJwtPayload` / `isTokenValid`. Never hardcode `"duct_auth_token"`.
+  It also owns **what a 401 means**, and that is not a per-page decision. The
+  shared `X-API-Key` fails with 403, so a 401 is always the *user* half of the
+  credential: missing, expired, or well-formed and correctly signed but naming
+  someone the answering backend's database has never seen ("User not found").
+  `AuthGuard` cannot see any of that — it reads `exp` on a token it never
+  verifies — so `throwForStatus` retires the session instead: clears the right
+  key for this shell, parks the current path, and fires `SESSION_EXPIRED_EVENT`
+  for `AuthProvider` to sign out on. New user-scoped clients go through
+  `authedRequest` / `authedFetch`, or call `throwForStatus` /
+  `endSessionIfUnauthorized` if they parse errors themselves; a client that
+  hand-rolls `if (!res.ok) throw` puts the backend's 401 prose on the page and
+  leaves the app believing it is signed in. Opt out with `retireSession: false`
+  only where signing out costs the user something they just did — the connector
+  save does, because its 401 lands on the way back from the provider.
+  It also records **which backend minted the session** (`AUTH_BACKEND_KEY`,
+  written by `setAuthToken`), because the shell addresses two — its sidecar and
+  the hosted API — and a token from the wrong one is well-formed, unexpired and
+  correctly signed, so nothing else on the client can tell it apart.
+  `reconcileStoredSession()` runs once, when `lib/localBackend.js` settles the
+  backend (before anything below the gate renders), and discards a
+  mismatch *quietly*: no event, no parked redirect, no "your session ended".
+  That is the distinction — a mismatch is not an expiry, and treating it as one
+  is what signed people out mid-use. A session with no recorded issuer predates
+  this and is left alone, so upgrading signs nobody out.
+
+## UI conventions
+
+Full reasoning in `docs/engineering/2026-09-01-desktop-adaptive-ui-review.html` (in `duct`).
+
+**[`DESIGN.md`](DESIGN.md) is the design & UX companion to this section** —
+the look/feel/voice layer: design tokens as built, the canonical pattern per
+job (cards, spinners, badges, empty/loading/error states, confirmations),
+layout & density principles, microcopy voice, the anti-generated-UI
+checklist, and a close-on-touch gap list. Read it before building or
+restyling any screen. This section stays the home of the mechanical rules
+below (sizing, units, CSS layout, accessibility).
+
+Its **"Go and look"** section lists the reference builds to open in a browser
+when a screen is off and the reason will not come — shadcn's components,
+blocks, charts and typeset pages, which are the reference implementation of
+the primitives we vendor. Compare a screenshot of the real thing against your
+`/preview` frame; that is usually faster than reasoning from a stylesheet.
+
+**Sizing: ask the container, not the window.** The viewport is the wrong ruler
+here — the sidebar takes 16rem out of it, and the agent panes are user-resizable,
+so `lg:` can be true while the box you are in is 300px. Each layout REGION
+declares a container (`.app-main`, `.app-main-wide`, the full-bleed wrapper, both
+`SplitWorkspace` panes), so components use `@`-variants and are correct wherever
+they are placed.
+
+- Content: `@container` variants on Tailwind's `@`-scale — `@md` 28rem, `@lg` 32rem,
+  `@xl` 36rem, `@2xl` 42rem, `@4xl` 56rem. Roughly 224px per grid column.
+- Viewport (`sm:`/`md:`/…) only for genuine device concerns: the sign-in page,
+  the sidebar's mobile sheet, and `md:text-sm` on chat inputs (which exists to
+  stop iOS zooming a sub-16px field). The pane toggle used to be on this list
+  and was wrong there: `SplitWorkspace` now splits at `@xl/split`, its own
+  width, because `md:` said "split" with the sidebar's 16rem already gone and
+  clipped the right pane on an iPad in portrait and an iPhone in landscape.
+- **Safe areas are applied once, at the edge.** The body pads left and right
+  only (`styles/theme.css`); the top and bottom insets belong to whatever
+  touches that edge — `.app-header`, the composer, the sidebar container,
+  sheets, the corner notices. A full-height layout (`h-svh`, `h-dvh`) never
+  adds them again, and an element that is `fixed` pads itself, because the
+  body's padding does not reach it. Left and right are separate values on
+  purpose: iPhone Duo's are asymmetric.
+- No hand-picked pixel breakpoints. There are currently zero; keep it that way.
+- Before adding `container-type` anywhere new: it implies `contain: layout`, which
+  makes that element the containing block for `position: fixed` descendants.
+  Overlays must be portalled (they are — see below) or they will shrink to it.
+
+**Heavy code loads when it is on screen.** A library that only one kind of
+surface uses — charts (Recharts, Nivo), syntax highlighting, Mermaid, the
+slide rasteriser — is a `lazy()` import behind a placeholder of the same size,
+never a static import in a module that common screens reach. A static one in
+`ArtifactRenderer` put ~110 KB of charts on every screen that drew a markdown
+card. Import a package's single file by path, not from its index: one Prism
+theme from `styles/prism` shipped all ~45. Measure a route the way
+`docs/engineering/2026-10-28-performance-review.md` did before and after.
+
+**Long transcripts stay flat.** The chat pane re-renders on every token and
+every clock tick, so anything it draws per row is `memo`ised and takes props
+that keep their identity (the reducer preserves unchanged rows). A stream that
+re-parses everything so far (a brief, a report) is throttled, never debounced:
+a debounce never fires while chunks keep coming.
+
+**Platform hooks.** The root layout sets `data-platform` (mac, windows, linux,
+other) and `data-shell="desktop"` on `<html>` before first paint;
+`styles/base.css` holds the rules that read them. Use them for platform fit
+(Linux drops backdrop blur, WebKitGTK's slow path), never for features, which
+gate on `getShellInfo()` capabilities.
+
+**Units.** Type, spacing and sticky offsets in `rem` so they follow the reader's
+text size. Device units stay `px`: borders, outlines, shadows, radii, 1px optical
+nudges. Prose gets `max-width: var(--measure)` (68ch) or the `.measure` utility —
+never tables, code, or column layouts.
+
+**Every screen is built from the page frame.** `components/ui/page` gives
+`Page`, `PageHeader`, `Section`, `TileGrid` and `HelpTip`; `ui/card` and
+`ui/textarea` are the card and the multi-line field. A routed screen is
+`<Page><PageHeader title=… status=… actions=… help=… />…</Page>`, nothing
+else draws an `<h1>`, and there is no slot for a paragraph under the title:
+one line of state goes in `status`, how the page works goes in `help`.
+DESIGN.md's "The page frame" has the parts, the spacing table and the type
+ramp. If a screen needs something the frame does not do, change the
+primitive (and its `/preview` entry), never the one screen — that is the
+whole difference between a design system and 139 bordered boxes.
+
+**Generated content fills slots; it never shapes the layout.** Most text on
+an agent screen was written at run time, by a model or by the person (a
+thread's title is its first message, verbatim), so its count, length, mix
+and age are unknown when the screen is built. A page's headline comes from
+its state, lists are ranked and bounded in a pure function, repeated facts
+merge, old ones file away, the person's words are quoted, and the surface
+ships with scenario fixtures across those axes, rendered in `/preview` and
+asserted on in a check. DESIGN.md's "Content awareness" has the rules;
+`arrangeDesk` in `lib/desk.js` with `lib/__fixtures__/deskScenarios.mjs` is
+the worked example. Orange text is `text-brand`, never `text-primary`:
+`--primary` is the fill, and in dark no one orange can be both.
+
+**Four checks hold the design system, and they are not advisory.** The first
+three run in `npm run check:parity`, so CI has them; the fourth is its own CI
+job (`app-layout` in `app.yml`):
+
+- `scripts/check-design-system.mjs` (`npm run check:design`) fails on
+  `text-[Npx]`, a raw Tailwind palette class, a hex in JSX, `window.confirm`,
+  `Loader2`, `text-muted-foreground/NN`, a hand-rolled scrollbar
+  (`::-webkit-scrollbar`, `scrollbar-thin`), a viewport prefix in a
+  container region, an `<h1>` outside `PageHeader`, `.page-toolbar`, a raw
+  `<textarea>`, a capsule-radius field, and a new hand-rolled card (that one
+  is a burn-down `budget` that can only go down). It is a **ratchet**: each rule carries an `allow` map of the files
+  that are genuinely exceptions, each with its reason. Removing a name is
+  permanent. Adding one is a decision you write a sentence for — it is not how
+  you quiet the check, any more than adding a file to
+  `test_harness_boundaries.py`'s allowlist is how you fix a red test.
+- `scripts/check-page-frame.mjs` (in `npm run check:design`) fails any routed
+  screen under `app/(app)` that does not render `PageHeader`. Full-bleed agent
+  workspaces are exempt by `FULL_BLEED_PREFIXES` in the layout, read from
+  that file so the two cannot disagree.
+- `scripts/check-layout.mjs` (`npm run check:layout`, needs the dev server)
+  renders every framed screen at 390, 1100 and 1440px against the fixture
+  backend and fails on a title out of line or off-size, a page wider than
+  the window, a status that wraps, and a row of cards whose footers do not
+  share a baseline. **Run it before calling any UI change done**; a worktree
+  without `site/node_modules` passes `PLAYWRIGHT_FROM=<repo>/site`.
+- `scripts/check-contrast.mjs` (`npm run check:contrast`) does the WCAG maths
+  on the real oklch values in `tokens.css`/`theme.css` and fails when a pair
+  the app paints drops below its threshold. It also asserts that every
+  `--color-*` utility the app writes is actually **mapped** in `@theme inline`
+  — the defect that started all of this was three correct token values that no
+  class could reach, which is invisible to every other kind of review.
+
+Why both exist rather than a paragraph asking nicely: every finding in
+`docs/engineering/2026-09-06-design-system-contrast-review.md` had been fixed
+once before and had come back. `ui/spinner`'s own docblock records consolidating
+twelve hand-rolled rings; seventeen `Loader2`s had arrived since.
+
+**CSS lives in `src/app/styles/`.** `globals.css` is a manifest of imports and
+nothing else; order is load-bearing (see its header). Add a partial for a new
+concern rather than growing an existing one, and put page-specific styling with
+the page.
+
+**Shared UI primitives — use them, don't re-fork.**
+
+- Page frame: `ui/page` (`Page`, `PageHeader`, `Section`, `TileGrid`,
+  `HelpTip`), `ui/card` (`Card`, `CardFooter`, `cardLinkClass`),
+  `ui/textarea`. See "Every screen is built from the page frame" above.
+
+- Overlays: `ui/dialog` (Radix — portal, focus trap, Escape, scroll lock) and
+  `ui/lightbox`. Never hand-roll a `fixed inset-0` backdrop.
+- Busy state: `ui/spinner`. Colour comes from `currentColor`. For content
+  that has a shape, the wait is `ui/skeleton` (`Skeleton`, `SkeletonText`,
+  `SkeletonList`, `SkeletonDocument`) — its shimmer is one CSS rule in
+  `styles/skeleton.css`, and `check:design` rejects a hand-rolled
+  `animate-pulse bg-muted` box.
+- Asking "are you sure?": `ui/confirm-dialog`. `useConfirm()` returns
+  `{ confirm, dialog }` — await `confirm({ title, description, action,
+  destructive })` and render `{dialog}`, which is deliberately close enough to
+  `window.confirm` that moving a call site is one line. `<ConfirmDialog>`
+  directly when the caller already holds what is being confirmed in state.
+- Truncated text (2+ lines): `ui/clamp-text`'s `ClampText` — `line-clamp-N`
+  plus a Radix tooltip carrying the full string, capped separately. Full
+  reasoning (including why a bare `line-clamp` or a native `title` isn't
+  enough) is in `DESIGN.md`'s canon table.
+- Corner notices: `ui/corner-notice`. The bottom-right card that tells you
+  something without interrupting you — `UpdateToast` (desktop build available)
+  and `ReloadToast` (new web build) are both built from it. Extracted at the
+  third copy of the anatomy, not after it. It is **not** a toast system: no
+  queue, no timers, no imperative `notify()`, because every notice here is a
+  persistent condition its owner already tracks in state. `ConnectionBanner`
+  deliberately takes the opposite corner (`sm:left-4`) so the two never fight;
+  below `sm` it is a full-width bar and wins on DOM order, which is correct —
+  a lost backend outranks a pending refresh. **Precedence is one rule: a
+  notice that tells outranks one that asks.** Tellers (every `CornerNotice`,
+  plus `ConnectionBanner` and `CookieConsent` through `useHoldCorner`) hold the
+  corner while mounted; an asker passes `yields`, reads `useCornerTaken()`,
+  never appears while it is held and steps aside when a teller arrives.
+  `StarAsk` (#539) is the only asker: the GitHub star request after a run that
+  made something, on the rules in `lib/starAsk.js` (three good runs, never day
+  one, never mid-run, never over the message box, which is why `ChatInput`
+  carries `data-composer`; two showings ever, 60 days apart, never after a
+  star or a second no). Its permanent home is "Star Duct on GitHub" in the
+  account menu, which is what lets the corner ask stay rare. A new notice
+  that asks for something yields; one that tells does nothing extra.
+- Agent shells: `hooks/useAgentSession` (the session lifecycle),
+  `workspace/AgentChat` (the transcript pane), `workspace/SplitWorkspace`
+  (split + responsive), `PipelineProgress` (the working ladder),
+  `workspace/CodeBlock`. See "Agent workspaces" below before touching any of
+  them.
+- Shortcuts: `lib/shortcuts`' `useShortcut("mod+k", fn)` — platform-neutral, owned
+  by the surface that needs it. An Enter-to-send handler checks
+  `isComposing(e)` first: Enter confirms a Japanese, Chinese or Korean
+  candidate, and without the check it sent half-written messages.
+- Commands: `useRegisterCommands` from `components/commands/CommandRegistry`. A
+  route contributes its own commands and they withdraw on unmount.
+- Navigation: `lib/navigation`'s `NAV_SECTIONS` is the single source of truth for
+  the sidebar and the palette.
+
+**Agent workspaces — one lifecycle, one chat pane, agent-specific slots.**
+
+Three agents (content, audit, insights) share a session protocol: create,
+stream, park on a pause, chat, reconnect, resume. That protocol lives in two
+places and nowhere else:
+
+- `lib/agentSession.js` — the pure reducer over the shared `AgentEvent`
+  vocabulary (`lib/agentEvents.js`) and the `Phase` enum (`lib/agentPhase.js`).
+  No React, no network. Tested by replaying recorded streams from
+  `lib/__fixtures__/*.json` (`npm test`).
+- `hooks/useAgentSession.js` — the effects: session creation with orphan
+  cleanup, transcript hydration before the live stream, the reconnect loop
+  (reattach to the live session, then resume the conversation), pause answers
+  by `interrupt_id`, and the per-tab reload handle (`lib/agentSessionHandle.js`)
+  that lets a reloaded tab reattach instead of re-running the prompt. Leaving
+  the page mid-turn detaches rather than closes: the handle stays, the run is
+  noted in `lib/liveRuns.js` (the sidebar pulses its entry, `hooks/useLiveRuns.js`
+  polls the session until the turn ends), and a return hydrates the rows and
+  reattaches from the segment after the ones it has (`hydratedThroughSegment`),
+  so the backlog is not drawn twice. Only Stop cancels a run. Its
+  `onHydrate` hands a workspace the stored rows verbatim, for a pane the
+  transcript does not cover. No workspace needs it today: insights derives its
+  Data pane from the transcript's own activity rows (`dataSourceRollup` in
+  `lib/toolActivity.js`), so a reload rebuilds it without fetching the thread
+  twice.
+
+A workspace composes `useAgentSession` + `workspace/AgentChat` +
+`workspace/SplitWorkspace` and keeps only what its agent owns: the right pane,
+the events the reducer returns unchanged (a plan payload, an artifact version,
+a slide render request) handled in `onEvent`, and the copy. Read
+`components/content/ContentWorkspace.jsx` as the reference — it is the
+shortest of the three.
+
+To see it run without a backend: `npm run mock:agents` replays the fixtures
+over SSE on :8012 (pausing where the real backend would), and
+`scripts/smoke-agent-workspaces.mjs` drives all three workspaces through a
+headless browser against it — pause, reload-and-reattach, answer, follow-up,
+turn failure — and screenshots each state. Run it after touching the shell.
+The same mock takes `FIXTURES_DIR` (another set of streams with the same
+filenames), `ROUTES_FILE` (canned JSON for the non-agent routes it would
+otherwise answer with `[]`) and `MEDIA_DIR` (a folder served as
+`/uploads/story/*`, so a post can have a cover); `scripts/shots/shoot.mjs` at
+the repo root uses all three to shoot the README's product images from one
+story, `lib/__fixtures__/solo-story.mjs`, whose `shot-*` scenes in
+`/preview` are the component halves of the same week.
+
+The shell borrows deliberately from harnesses built in the open.
+[`docs/engineering/agent-harness-references.md`](../docs/engineering/agent-harness-references.md)
+records which ones, at which revision, and the gaps they expose in ours (a
+status row with elapsed time, typed error codes, queued follow-ups, context
+left). Check it before adding a lifecycle feature — the answer is often
+already pinned to a `file:line` there.
+
+Rules that follow:
+
+- **Do not fork the chat pane or the lifecycle.** A new agent gets a new
+  workspace file of ~150 lines, not a new `*Chat.jsx`. Two forks of the chat
+  had drifted 600 lines apart while rendering the same thing; a third had
+  none of the fixes. That is the failure this structure exists to prevent.
+- **A new pause is one entry in `workspace/PauseCard.jsx`.** The reducer, the
+  hook and the backend route already carry any pause event that arrives with
+  an `interrupt_id`; the card is the only agent-visible part.
+- **A new protocol event goes in the reducer, with a fixture.** Agent-specific
+  payloads stay in the workspace's `onEvent`. The backend holds the other end:
+  `backend/tests/test_app_event_contract.py` parses `lib/agentEvents.js`,
+  `lib/insightsEvents.js` and every fixture here and fails when an event
+  name, error code, step id or memory kind exists on one side only (legacy
+  `LEGACY_*` values excepted, since the app deploys first). Add the member to
+  both enums in the same change, and record only kinds the backend stores.
+- **Phases are the protocol, not a UI mood.** Only the reducer moves `phase`;
+  a workspace that needs a different input policy passes `inputDisabled`
+  rather than inventing a state. The default policy keeps the box open while
+  the agent works or a card waits: a message then is *queued* (the row carries
+  a mark until `user_input_consumed` releases it), not refused and not a new
+  turn.
+- **Failures are typed; copy comes from the code.** `friendlyErrorMessage(raw,
+  code)` and `errorAction(code)` in `lib/agentSession.js` are the only places
+  a failure becomes words or a button. A new failure kind is a new `ErrorCode`
+  (mirrored from the backend) with a row in `ERROR_COPY`, never a regex on the
+  message. The rows are `msg` descriptors — the reducer has no locale — and
+  the state holds a descriptor or, when a provider's own sentence passes
+  through, a string; a component renders either with `errorText(i18n,
+  value)`, never `i18n._` on the value, because a raw sentence with a brace
+  in it is not an ICU message. The literal-string check cannot see a string
+  in an object literal or a `dispatch`, so a sentence in `lib/` or `hooks/`
+  is translated by this rule, not by the check.
+- **The status row says what is happening, with a clock.** While the agent
+  works the header reads `Working · 1m 12s · Collecting source data` — phase,
+  elapsed, and the step in progress (or "Reconnecting to the model (2/4)",
+  "Compacting context"). The context ring sits in the composer beside Send —
+  `workspace/ContextRing` over the reducer's `usage`, empty and labelled "New
+  thread" until the first call reports — the same place and the same ring
+  the insights desk shows. The composer (`workspace/ChatInput`) is the desk
+  composer's card: text on top, a footer with attach and the shell's
+  `composerTools` (`workspace/ComposerDials` for insights: the posture, Ask /
+  Assisted / Auto, folded to the current choice and unfolding on hover,
+  focus or a tap) on the left, and `composerAside` (`TierDial`: the model
+  tier as quiet text, whose popover holds the tier list and thinking as a
+  stepped slider), the ring and Send on the right. The ring carries no
+  label; percent, tokens, cost and the cached share are its tooltip (a dash
+  where the backend has no price for the model), and it is a gauge, not a
+  button — it answers hover and Tab and does nothing on click. Placement
+  follows when a dial binds: the posture applies to the next message, so it
+  is inline;
+  tier and thinking bind at the next session, so they are one tap away; the
+  tier is the one choice people look for by name, so it stands at the
+  corner of the box like every chat app's model name, and thinking is a
+  property of that choice, so it lives under it. That panel is a
+  `ui/popover`, not a menu — a menu swallows Tab and a slider inside one is
+  mouse-only. The brief's shape (`preferred_artifact_format`) has no
+  composer control any more; the preference and the backend's reading of it
+  remain. A retry counts down (`retrying.until`, anchored on this
+  client's clock at receipt), and the tooltip carries cost and the cached
+  share beside the tokens. After a compaction the ring is empty and says so
+  (`usage.last.stale`) until the next call on the thread reports its size.
+- **The right pane is one strip and one document.** `ArtifactPaneHeader`
+  carries everything about the document — the tab, its title, the version
+  picker, and the grid button back to the thread's other documents — so the
+  pane below it is the artifact and nothing else: full bleed, full height,
+  scrolling itself, never a card inside a margin and never a `vh` height,
+  which caps a document inside a pane that already has a size. A markdown
+  brief gets a centred page (`DocumentPage`) because `card` and `background`
+  are the same white in the light theme and something has to say "document"
+  next to the chat; an HTML brief is its own white page already. The strip's
+  two document controls are download and full screen: the download saves the
+  bytes the pane already holds (`briefFile` names the file, `lib/download.js`
+  hands it to the browser — never a second fetch for content that is on
+  screen), and full screen opens `DocumentFocus`, the same `BriefPane` on the
+  app's dialog. Reading mode keeps only what a reader needs — the name, the
+  download, the way out — and never grows tabs or a version picker.
+- **The transcript has a row vocabulary, and every agent gets it for free.**
+  A run is mostly tool calls, and a harness that renders none of them is a
+  text box in front of a black box. `workspace/ActivityRow` draws one row per
+  allowlisted call where it happened — connector logo and name, what it read,
+  the window, the verdict — one line until clicked, with the kind's own detail
+  behind the chevron (row counts, source chips with favicons, the picture, the
+  sub-agent's answer) and, for a failure, the provider's own sentence plus the
+  link that fixes it. It sits beside the other rows of the same register:
+  artifact card, change-set card, memory note, image, notice.
+  - The rows arrive as one event (`TOOL_ACTIVITY`), land through the reducer
+    (`Row.ACTIVITY`, upserted by `activity_id`) and come back on a reopened
+    thread from stored tool traffic (`lib/toolActivity.js`) — **live and replay
+    build the same shape**, and `test_app_event_contract.py` holds the app's
+    allowlist to the backend's.
+  - **A new visible tool is two lines and a scene**: a mapper in
+    `agents/core/activity.py`, an entry in `ACTIVITY_TOOLS` here, and a
+    `/preview` scene. Never a per-agent pane, never a second card component.
+    The backend sends fields, never a sentence: a tool whose card has no
+    sentence of its own (a read of the brand context, a post published) gets
+    its verb from `TOOL_WORDS` in `ActivityRow`, so it is translated with the
+    rest. Twelve kinds now — the seven tool families (a video clip since
+    #284) plus memory, context, artifact, action and a tool on an MCP
+    server the user connected (#345) — and the run's own
+    "Read project context" row (`contextActivity`, from the stored CONTEXT
+    row on replay) says which
+    blocks the opening turn was enriched with. Memory's "Recalled" and
+    "Remembered" rows come back from their stored rows the same way.
+  - **Where a fact belongs**: in the transcript when it is something the agent
+    *did* (there once, in order), in a pane when it is something the thread
+    *has* (the Data tab's roll-up, grouped by connector — built from the same
+    rows, so the two cannot disagree).
+- **The wait and the seams are said in words, never mimed.** Three rows in
+  `workspace/AgentChat`, each a fact the reader could not otherwise learn:
+  - `WorkingIndicator` replaces the bouncing dots. It shows the running
+    step's label when the ladder has one, "Compacting context" or
+    "Reconnecting" when the harness is doing that, and otherwise rotates a
+    few generic verbs — generic on purpose, because a verb naming a step the
+    run is not on is a lie the reader can catch. Still under reduced motion.
+  - `ThinkingBlock` folds the reasoning under "Thought for 6s": measured on
+    this client between the first reasoning token and the first word of prose
+    (`thinkingStartedAt` / `thinkingEndedAt` on the assistant row), never a
+    token count the client would have to estimate. A row from history has no
+    clock and says "Reasoning".
+  - `Notice` dividers (`lib/agentSession.js`): a compaction is a rule across
+    the transcript that learns what it freed from the next thread-scoped
+    `TOKEN_USAGE`; a run starting on a different model draws "Switched to
+    Claude Sonnet 5.5" from the `model_label` every `PIPELINE_STARTED` now
+    carries (`agents/models.run_model_fields`), and replay draws it from the
+    stored CONTEXT rows. The compaction rule folds the summary the backend
+    sent (`summary` on `CONTEXT_COMPACTED`, an `EventKind.COMPACTED` row on
+    replay) behind a chevron, set in italic: it is the model's notes, not
+    something the agent said to the person. Anything true of everything
+    after it is a divider, not a bubble.
+- **Two registers, not two bubbles.** The person's message is the one bubble
+  in the transcript — it came from outside the run and the shape says so;
+  past a screen's worth (`LONG_TEXT_LINES` / `LONG_TEXT_CHARS`) it folds
+  behind Show more with the whole text still in the DOM. The reply is prose
+  on the page, no box. Under either, on hover, `RowMeta`: when it was sent
+  as "5 min ago" with the full date and time in the tooltip (from `at`,
+  stamped by the reducer on this client's clock live and from `created_at`
+  on replay, and drawn only after mount so a server render cannot disagree),
+  plus one action on a reply — copy. Always visible where there is no hover.
+  Do not add reactions, regenerate, or a menu there; the row is not a toolbar.
+- **A file on a message is one tile, both sides.** `workspace/Attachments`
+  draws it in the composer (with remove) and on the user's row (read-only,
+  image opens the lightbox); `lib/attachments.js` is the one parser between
+  them — `contentBlocks` builds what the chat route takes (a plain string
+  when nothing is attached, else text plus an image block, a `file` block for
+  a PDF, or a text block wrapped in `<attachment name= type=>` for anything
+  textual) and `describeContent` reads that same list back for the live row
+  and the reopened thread, so the two cannot show different things. The
+  composer takes files three ways into that one shape: the paperclip, a
+  drop anywhere on the card (`DropHint` while a file is over it), and a
+  paste — an image from the clipboard, or text past `PASTE_ATTACH_LINES` /
+  `PASTE_ATTACH_CHARS`, which becomes a tile named for what it looks like
+  (`sniffPaste`: JSON, HTML, CSV, Markdown, else plain text). What cannot
+  be read — a binary, a file over `ATTACH_MAX_BYTES` — says so under the
+  tiles rather than vanishing.
+- **Stop hands a queued message back.** A user row still marked queued when
+  the run is stopped never reached the model: the reducer takes it out of the
+  transcript and puts its text in `draft`, which `ChatInput` applies once per
+  `draft.key`. Losing a typed message is worse than losing the run.
+- **The box keeps what was typed.** `ChatInput` saves its text per
+  `draftKey` — the shell's `handleKey`, so a reload of this thread finds
+  this thread's draft — through `lib/composerDraft.js`, which the desk
+  composer's Settings round-trip uses too, and clears it on send. The
+  store is `sessionStorage`, per tab, for the reason the session handle
+  gives: the key names a thread, not a user, so anything that outlived the
+  tab would follow a shared browser into the next sign-in. Esc in
+  the box stops a streaming turn (scoped to the box: a window-level Escape
+  would also fire while someone closes a popover); Shift+Enter is a new
+  line; the footer names both while the box has focus.
+- **Notifications come from phase transitions, never from a workspace.** A
+  workspace names itself (`notifyAs`) and `hooks/useAgentNotifications.js`
+  turns done / needs-input / failed into a system notice — only while the
+  window is not focused, never for a stop the user asked for. The transport is
+  `lib/notify.js`: the shell's `notify` command when `getShellInfo()` reports
+  `notifications`, the browser's `Notification` behind the sidebar's permission
+  item otherwise. Do not call `new Notification` from a component. That sidebar
+  item asks `notificationSurface()` rather than testing `"Notification" in
+  window` — no desktop webview has that constructor, so the test hid the row on
+  desktop and left the one surface that always notifies looking like the one
+  that never did. On the shell it reads "System", because the OS owns the
+  switch and there is nothing for the page to request.
+- **A stored failure is a row, not a blank.** `agentHistory.js` maps the
+  `failure` event kind to the same send-error row the live client showed (with
+  its code, so the action under it is the right one), and a `cancelled` one to
+  the "Stopped here" notice. Thread lists read `run_status` off the list route
+  for their badge (`DeskLists`, the audit history); the desk routes `paused`
+  and `failed` threads to "Needs you" (`lib/desk.js`).
+- **Streaming markdown is settled plus a healed tail.** `AssistantMarkdown`
+  with `streaming` splits at the last block boundary (`lib/markdownStream.js`):
+  the settled part is memoised and parsed once per closed block; only the tail
+  re-renders per delta, after `healTail` closes an open fence or emphasis and
+  drops a table's partial row. That is what keeps a table's columns still while
+  it streams. Do not reintroduce a per-token parse of the whole reply.
+
+**Accessibility.** Desktop keyboard and screen-reader basics, not a full audit.
+
+- Every form control needs an accessible name. A `placeholder` is not one — it
+  disappears on focus and is skipped by some readers. Use a visible `<label>`,
+  or `aria-label` where the design has no room for one.
+- Anything clickable is a `<button>`. A `<div onClick>` cannot be tabbed to or
+  triggered with Enter/Space, and the focus ring comes free with the element.
+  For a whole card, put the button on the title and stretch it with an
+  `after:absolute after:inset-0` pseudo-element — one tab stop, one readable
+  name, and the card stays a container.
+- Live regions are rationed. The agent's phase label (`role="status"`) is the
+  one in each chat shell; streaming tokens and the rotating `PipelineProgress`
+  subtitle are deliberately silent, because announcing them talks over the user.
+- `html { scroll-padding-top: 4rem }` in `styles/base.css` keeps a focused
+  element out from under the sticky header (WCAG 2.2 AA 2.4.11).
+- Decorative icons take `aria-hidden`; an icon-only button takes an `aria-label`.
+
+**Look at it before you call it done.** CSS written and never rendered is a
+guess, and guesses compound: three plausible-sounding rules in a row produce a
+layout nobody would have drawn on purpose. If a change touches layout, spacing,
+alignment or colour, render it and check — do not use the person reviewing the
+PR as your renderer.
+
+Two things about *where* to look, both learned on the front door. The desktop
+shell is WKWebView, so a screen judged in the desktop app is verified in
+Playwright's `webkit`, not only `chromium` — `site/node_modules` has both. And
+a long-lived Duct Dev window is not a fresh page load: it takes Turbopack's
+hot updates, and on 2026-09-21 it took the JSX updates for a change but not
+the stylesheet, and sat showing new copy on an old layout while every fresh
+load was correct. Its cache (`~/Library/Caches/ai.getduct.desktop.dev/WebKit/
+NetworkCache`) held a stylesheet from before the edits. After a CSS change,
+reload the dev window before trusting what it shows, and before telling
+anyone the layout is broken — or fixed.
+
+**Use `/preview`.** `src/app/preview/` is a dev-only route (404s in production,
+no auth, no backend) that mounts one component at a time in the real app's CSS.
+Add scenes to `preview/scenes.jsx`; pick a **surface** (in place, dialog, sheet,
+drawer, alert, notification, page, toolbar) and a **device** (phone, iPad either
+way up, desktop-min, desktop, wide), in light, dark, or both at once.
+
+**A new component gets a preview entry in the same change, not a follow-up.**
+This project is open source, so `/preview` is not only a working tool — it is
+the component library's documentation, the one place a contributor or a future
+agent can see what exists and how it is meant to look without reading every
+call site. Ship one of: a `PRIMITIVES` entry in `preview/system.jsx` for a new
+`components/ui/*` part that has a variant to choose between (the narrow
+exception — a single-appearance part like `separator`, folded into the
+specimens that use it instead of standing alone — is explained at the top of
+that file); a canon row in `DESIGN.md` plus its matching example in
+`preview/catalogue.jsx` for a new canonical pattern; or, short of either, a
+`preview/scenes.jsx` entry so the component can at least be seen in isolation.
+A component with none of these is undocumented, whatever comment describes it.
+
+Two modes, because there are two jobs:
+
+- **Working** — the workbench. Seed a component by adding a scene to
+  `preview/scenes.jsx`: `{ id, group, title, state, note, render }`, importing
+  the real component and passing real props. That is the whole API. Ad hoc and
+  skewed to the last thing touched, which is correct for what it is for.
+- **Design system** — the durable catalogue, in three sections:
+  **Foundations** (`preview/system.jsx` — colour/type/shape via `TokenSheet`,
+  spacing, icons), **Primitives** (same file — every `ui/*` part with its
+  variants), and **Patterns** (`preview/catalogue.jsx` — one entry per row of
+  DESIGN.md's canon table). Pattern rules are **parsed from DESIGN.md**
+  (`preview/canon.js`), never retyped, so the screen cannot disagree with the
+  doc. A rule with no example is listed as a **gap** and counted in the header,
+  so coverage is a number rather than an impression.
+
+Adding a canon row to DESIGN.md therefore adds a gap. Close it with an example,
+or leave it visible; do not delete the row to make the count look better.
+
+Frames **mount only when scrolled near** and the catalogue crops them to their
+specimen. Both are load-bearing, not polish: each frame is a whole Next document
+(app bundle, analytics, HMR client), and 27 entries × 2 devices eagerly mounted is
+not slow, it is `ERR_INSUFFICIENT_RESOURCES` and a half-loaded page. Keep the
+lazy mount if you touch `Frame`.
+
+`/preview/frame?scene=…&surface=…&theme=…` renders one scene alone, so any state
+is reachable by URL with nothing to click, and every frame exposes
+`window.__preview` — `measure`, `contrast`, `aligned`, `smallTargets`,
+`unnamed`, `overflowing`, `typeScale`, `tokens`, `overlay`. Prefer those over
+retyping measurement code; they answer the same question the same way twice.
+Full detail in the `component-preview` skill.
+
+**Lenses** are the third axis, after surface and device: a device changes what
+the component is, a lens changes who is looking at it. All are URL parameters.
+
+- `vision=protanopia|deuteranopia|tritanopia|greyscale` — colour-vision
+  simulation. WCAG 1.4.1 says colour is never the only channel, and this is what
+  makes that checkable instead of assumed: under `deuteranopia` the connected
+  green dot and the partial amber one converge, which is why the word stays
+  beside the dot.
+- `text=125|150|200` — the reader's text size, as a percentage. Type and spacing
+  are in `rem` by house rule precisely so they follow it, which is only worth
+  anything if someone moves it. A layout that holds at 100% and collapses at
+  150% has a `px` in it.
+- `inspect=outline|spacing|grid` — debug paint. `grid` is the spacing scale
+  drawn, in `rem`, so it stays in phase with the layout under the text lens.
+
+The **`tokens` scene** is the palette as the app actually resolves it — every
+semantic pair with its live contrast ratio, the colours used as ink on the page,
+the type ladder and the radii. It is read from computed style, so it cannot
+drift from `tokens.css`, and the value shown is the one after the cascade: open
+it in a dark frame to see the dark half. Check a new or changed token here
+before shipping it. It earned that on its first render, catching
+`--destructive-foreground` missing from the `.dark` block — white on the lifted
+coral, 2.89:1, where its three neighbours sat at 7.8–9.9.
+
+The preview chrome is built from `ui/*` like anything else. It shipped once with
+native `<select>`s, and a native `<select>` draws its option list in the OS: it
+ignored every class on the element and rendered a system-font, system-light menu
+over a dark app. A harness for judging our components must not be the one screen
+that does not use them.
+
+Scenes render in **iframes, not resized divs**: media queries read the viewport,
+so a `<div style="width:390px">` answers the container question and silently
+gets `sm:`/`md:`/`dvh` wrong. Each frame also sets `container-type`, so both
+rulers are right at once.
+
+Do **not** rebuild a component's markup in a scratch HTML file next to a copy of
+its stylesheet. That is a replica, and replicas drift: the first one written
+that way was missing Tailwind's preflight, measured every box 34px too wide, and
+sent a correct layout back for a fix it did not need.
+
+- **Render every state, not just the happy one.** Partial, empty, loading,
+  failed, disabled, and a name long enough to wrap are where layouts break, and
+  they are the ones nobody opens by accident. A long account name is what
+  revealed a status row wrapping onto three lines.
+- **Widths are container widths, not devices.** The `@`-scale boundaries the
+  code branches on, and each frame declares `container-type` so the variants
+  respond to the frame rather than the window. Frames drag-resize; sweep the
+  448–720 band rather than sampling it.
+- **Measure, do not squint.** `getBoundingClientRect()` answers alignment
+  exactly, and answers questions eyes are bad at: two glyphs can share a
+  vertical centre and still look wrong because their boxes are 7px and 24px with
+  padding on only one. Assert what the guides make checkable — shared rails,
+  equal slots, the 24×24 target floor, rows that must stay on one line,
+  `getComputedStyle` proving a destructive action is tinted, not filled.
+- **A component that fetches gets an injectable loader** with a real default
+  (`loadEntities` on `ProjectEntitySelect`), so a scene can stub it. One
+  optional prop beats a hand-copied render of the same markup.
+
+**Full-app visual review is a different, heavier job — do it only when asked**,
+or when the change is to a whole screen's composition rather than to a
+component. Opening real screens needs a signed-in session and a live backend,
+and it answers a question isolation cannot: whether the piece fits its
+surroundings. In-place work does not need that question answered, and paying
+for it every time is why "look at it" gets skipped.
+
+## Interface language
+
+The interface is translated (English, Spanish, Brazilian Portuguese, German,
+Japanese, Simplified Chinese) and stays translated mechanically, not by anyone remembering. Copy
+is written in English inline, as before; Lingui derives each message's id
+from that English, `npm run i18n:extract` writes the catalogues, and
+`scripts/i18n/fill.py` fills what is missing with a model, glossary in hand.
+A changed English string invalidates its own translations and gets refilled.
+`check:i18n` fails on an untranslated string, a stale catalogue, or a literal
+the catalogue cannot see — so a half-translated page cannot merge.
+
+**The loop, for any change that touches copy** (`make i18n` at the repo root
+runs it for the app and the site together):
+
+```bash
+npm run i18n:extract                 # catalogues pick up the new/changed strings
+python3 ../scripts/i18n/fill.py      # translates only what is missing (needs a key,
+                                     # or --provider manual to hand the entries to an agent)
+npm run check:i18n                   # stale? missing? literal outside Lingui? → red
+python3 ../scripts/i18n/fill.py --check src/locales/*/messages.po   # a brand name translated? → red
+```
+
+Product and brand names (Duct, Content Studio, every connector and vendor)
+stay in English in every language: they are `keep` in
+`scripts/i18n/glossary.json`, `fill.py` rejects a translation that drops one,
+and the `--check` above fails CI on one already in a catalogue. A new product
+name in the UI goes into `keep` in the same change.
+
+Staleness is `lingui check sync`: it compares each catalogue with what
+extract would write, **byte for byte**, and writes nothing. Two consequences:
+
+- `scripts/i18n/po.py` writes an app catalogue back in Lingui's own layout,
+  so `fill.py` output passes the check. If the check fails straight after a
+  fill run with nothing else changed, that writer has drifted; fix it rather
+  than re-running extract to paper over it.
+- Run it on Node 22, the version in `.nvmrc` and CI. Lingui 6.8 starts every
+  subcommand behind `import.meta.main`, which Node 23 does not have, so there
+  `extract`, `compile` and `check` all exit 0 having done nothing: a green
+  gate that ran no check.
+
+**How to write copy so the catalogue sees it.** One import per file:
+`import { Trans, useLingui } from "@lingui/react/macro";`
+
+| Copy | Write |
+|---|---|
+| JSX text | `<Trans>Restart to update</Trans>` |
+| Text with markup or values | `<Trans>You’re on {version}. <b>Restart</b> to update.</Trans>` — keep the element and the value inside one `<Trans>`; a sentence split across three Trans cannot be reordered by a translator |
+| Attribute, prop, or any string in code | `const { t } = useLingui();` then `` t`Dismiss update notification` `` |
+| Values in a string | `` t`Duct ${version} is available` `` — a plain identifier. Assign `update.version` to `const version` first; a member expression becomes `{0}` in the catalogue and the translator cannot tell what it is |
+| Plurals in JSX | `<Plural value={count} one="# message" other="# messages" />` from `@lingui/react/macro` |
+| Plurals in a string | `plural(count, { one: "# message", other: "# messages" })` from `@lingui/core/macro`, client components only |
+| A label in a module-level list (`lib/*.js` option tables) | `` label: msg`Executive` `` from `@lingui/core/macro`, rendered with `const { i18n } = useLingui(); i18n._(option.label)` — `t` at module level returns one fixed string forever |
+| A message the same word means two things | `` t({ message: "Post", context: "verb" }) `` |
+| Dates and numbers | `formatDate(d, { locale: i18n.locale })` from `lib/format.js`; never pin `"en"` next to translated copy |
+
+Do not translate: enum values, keys, kinds, API fields, class names, routes,
+log lines, anything a test asserts on by string, and the `/preview` scenes and
+`__fixtures__` (fictional data, English by design). The check exempts those
+paths; everything else it flags is copy.
+
+Two modules deliberately carry no words: `lib/desk.js` returns codes and
+facts (`{ code: "waiting" }`, `{ state, needsYou, found }`) that the desk
+components map to `msg` tables, because `scripts/check-desk.mjs` runs it
+under plain Node where no macro exists; `desk/useRelativeTime.js` renders its
+times. Passing `t` into a plain helper is silently NOT transformed — nothing
+is extracted and the helper receives a raw template — so a helper that needs
+words takes `i18n` and a `msg` descriptor, or returns a code.
+
+Tests: vitest has no macro pass, so `vitest.config.mjs` aliases the macro
+entry points to `src/lib/__tests__/stubs/lingui-macro.js`, which returns the
+English. A `lib/*.js` module with a `msg` label therefore imports cleanly in
+a test; assert on the English string as before.
+
+Server components: the root layout calls `activateRequestI18n()` from
+`src/i18n/server.js`, and so must any server page or layout that renders
+translatable text, because a client-side navigation renders the page without
+its parents. `<Trans>` and `useLingui` then work in both worlds.
+
+Where the language comes from: the `duct_lang` cookie, else the browser's
+`Accept-Language`, else English — resolved once per request in the root layout.
+The cookie shadows `interface_language` on the profile (`lib/userProfile.js`
+writes it on every load and save) so a second device follows the first; the
+signed-out selector on `/start` and sign-in writes only the cookie.
+`components/LanguageMenu.jsx` is the one switcher, and `router.refresh()` is
+how a switch takes effect without a reload.
+
+Three language fields, kept apart (#125, #126, #127): `interface_language`
+is this one, a catalogue tag; `communication_language` is what Duct writes
+*to you* in, any language a model speaks; a project's output language is the
+deliverable's. Adding an interface language is one entry in
+`lingui.config.mjs`, one in `src/i18n/locales.js`, one in
+`service/profile.py`'s `INTERFACE_LANGUAGES`, and a fill run.
+
+The SWC macro plugin is a locked pair with Next: `@lingui/swc-plugin` is
+pinned exact because its `swc_core` must fall in the range Next's runtime
+accepts, and a semver bump broke the build with "failed to run Wasm plugin"
+(6.7.0 against Next 16.3.5). Next 16.4 moved the other way and failed the
+same way against 6.6.0, so the pair is now Next 16.4 with 6.7.1 (#336).
+Bumping Next means re-testing the plugin.
+`.github/dependabot.yml` ignores version updates for it so the bump is not
+re-proposed weekly — a security advisory still opens its own PR. Lifting the
+pin is a deliberate act that travels with a Next bump, and the gate is
+`npm --prefix app run build` completing, not CI going green on the install.
+
+To see a screen in another language: `/preview` has a locale switch, and the
+`pseudo` locale (dev only) stretches every string so clipping shows without a
+German speaker. The preview is English by default whatever the browser's
+Accept-Language or the app's cookie say — its frame takes `?lang=` and
+nothing else, so a scene's language is in its URL like every other lens.
+
+## What's not here
+
+- No dedicated auth library (next-auth, Clerk, Supabase)
+- No form library (React Hook Form, Formik)
+- No global state library (Redux, Zustand, Jotai)
+- **Vitest** (`npm test`) covers the pure-logic layer only:
+  `src/lib/__tests__/*.test.js`. No jsdom, no component tests, no E2E — the
+  config pins `environment: "node"` deliberately ("the hook and the
+  components are checked by `next build` and by looking at them"), and E2E
+  tests live in `site/`, not `app/`. A module that touches `window` or
+  `document` is still testable this way if it's plain functions, not
+  components: stub the pieces it reads (`localStorage`, `document.cookie`,
+  `fetch`) on `globalThis` in a `beforeEach` — see `authFetch.test.js` and
+  `consent.test.js` for the pattern. A module whose surface *is* a React
+  component (`AuthProvider`, `AuthGuard`) needs `@testing-library/react` and a
+  `jsdom` environment, neither of which is set up yet — that's a real
+  infrastructure step, not just another test file, so treat adding it as its
+  own change. This rules out *committed* browser tests; it does not rule out
+  driving a browser to look at what you just built. See "Look at it before you
+  call it done" above — read as a blanket ban, this line is why UI arrives
+  unrendered. `src/app/preview/` is not a test suite either: it is a route
+  that renders components, with no runner, no assertions and no dependency.
+- No Supabase anywhere in this project
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+## This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->

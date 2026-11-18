@@ -1,0 +1,313 @@
+"""The harness boundary gate.
+
+Duct rents an agent harness; it does not marry one (see
+``agents/core/ports/__init__.py``). That only stays true if framework imports
+are confined to adapters, so this test makes the boundary a property of the
+codebase rather than an intention in a document.
+
+It fails in two directions:
+
+  * a framework import appears in a file that is not a declared adapter, or
+  * a declared adapter no longer imports a framework (the allowlist has gone
+    stale and is now blessing files for nothing).
+
+Adding a path to ``ADAPTERS`` is a deliberate architectural act. It is not the
+fix for a failing test — the usual fix is to move the framework-touching lines
+into an existing binder and leave the domain function plain.
+"""
+
+from __future__ import annotations
+
+import ast
+import pathlib
+
+import pytest
+
+from agents.core.events import AG_UI_EVENT, AG_UI_EVENT_KIND, AgentEvent, EventKind
+
+BACKEND = pathlib.Path(__file__).resolve().parent.parent
+
+# Package prefixes that constitute "an agent framework" for boundary purposes.
+# Matched on the top-level module, so `langchain_core` and `langchain_openai`
+# count as `langchain` — the distribution split is not a boundary.
+FRAMEWORK_PREFIXES = ("langchain", "langgraph", "deepagents", "claude_agent_sdk")
+# Kept after the ADK engine was removed: this list says what *counts* as an
+# agent framework, not what is installed, so it still catches ADK arriving back
+# in a non-adapter file.
+FRAMEWORK_DOTTED = ("google.adk",)
+
+# Directories that hold first-party application code.
+SOURCE_ROOTS = ("agents", "routes", "service", "models", "utils")
+
+# ---------------------------------------------------------------------------
+# The allowlist: every file permitted to import an agent framework, and why.
+# ---------------------------------------------------------------------------
+
+ADAPTERS: dict[str, str] = {
+    # -- No runner is here. Each one's harness-shaped middle moved into
+    #    agents/core/deep_session.py (the audit's last, when its bare
+    #    create_agent turned out to mount none of the shared middleware), and
+    #    all three are pinned framework-free below.
+
+    # -- Shared LangChain adapter: the model-transport + events-out ports for
+    #    every V1 runner. Extracted from agents/audit/v1/runner.py on the second
+    #    consumer (insights), per the ports rule.
+    "agents/core/lc.py":                    "LangChain adapter: resolve_chat_model + stream_agent",
+    # -- The deepagents session: assembly + loop, extracted from the insights
+    #    runner on the second consumer (content). The only place deepagents is
+    #    load-bearing.
+    "agents/core/deep_session.py":          "deepagents adapter: the session runners' shared assembly + loop",
+
+    # -- The ChatGPT-on-subscription adapter: a ChatOpenAI subclass pointed at
+    #    the Codex backend, so v1's OpenAI slot can run on a subscription.
+    #    Framework-facing by construction — it subclasses a chat model.
+    "agents/core/codex.py":                 "LangChain adapter: _ChatOpenAICodex (ChatGPT subscription auth)",
+
+    # -- Session/state port, second implementation. The durable half of what
+    #    agents/core/session.py does in memory: a LangGraph checkpointer chosen
+    #    from DATABASE_URL, owned by the app lifespan.
+    "agents/core/checkpoint.py":            "LangGraph checkpointer adapter (postgres/sqlite/in-memory)",
+
+    # -- Tool binders. Domain logic stays plain; these wrap it per harness.
+    "agents/core/connector_tools.py":       "LangChain binder: connector discovery tools",
+    "agents/core/memory_tools.py":          "binder pair: build_memory_tools_lc / _sdk",
+    "agents/core/artifact_tools.py":        "binder: build_artifact_tools_lc (the SDK half is agents/audit/tools.py)",
+    "agents/core/web_tools.py":             "LangChain binder: WebFetch + the provider's native web search spec",
+    "agents/core/mcp_tools.py":             "LangChain binder: ListConnectedTools / CallConnectedTool over service/mcp",
+    "agents/audit/v1/tools.py":             "LangChain tool binder",
+    "agents/content/tools.py":              "LangChain tool binder (content tools)",
+    "agents/insights/data_tools.py":        "LangChain binder: FetchData + connector notes",
+    "agents/tools/execution_tools.py":      "binder pair: build_execution_tools_lc / _mcp_server",
+
+    # -- Named harness shims.
+
+    # -- The enrichment passes' bounded research loop: web tools, then one
+    #    typed answer. Both passes call it, so neither imports a framework.
+    "agents/core/research.py":              "create_agent research loop with a structured answer",
+
+    # -- Boundary debt. Allowed today, but these are the wrong layer: a route is
+    #    transport and a service is domain, so neither should know a harness.
+    #    Moving them behind a binder is the next boundary cleanup; until then
+    #    they are listed here honestly rather than silently.
+    "routes/chat.py":                       "DEBT — route imports LangChain directly",
+    "service/memory_consolidation.py":      "DEBT — service imports LangChain",
+}
+
+# Domain modules that must NEVER import a framework. These hold the durable
+# assets — vocabulary, schemas, registries, prompt text — and they are what
+# survives a harness swap. Listed explicitly so the guarantee is legible.
+FRAMEWORK_FREE: tuple[str, ...] = (
+    "agents/core/events.py",
+    "agents/core/prompts.py",
+    "agents/core/ports/__init__.py",
+    "agents/core/telemetry.py",
+    "agents/core/session.py",
+    "agents/models.py",
+    "agents/engines.py",
+    "agents/audit/schema.py",
+    "agents/audit/prompts.py",
+    "agents/content/schema.py",
+    "agents/content/prompts.py",
+    "agents/content/artifacts.py",
+    "agents/content/assessment.py",
+    # The session runners: what they own is tools, prompts, limits and hooks,
+    # and none of that needs a framework symbol. If one of them grows a
+    # harness import again, the shared session has a gap — fill it there.
+    "agents/audit/v1/runner.py",
+    "agents/content/v1/runner.py",
+    "agents/insights/v1/runner.py",
+    "agents/content/subagents/__init__.py",
+    "agents/content/subagents/draft_post.py",
+    "agents/content/subagents/general_purpose.py",
+    "agents/content/subagents/research_pillar.py",
+    "agents/content/subagents/review_post.py",
+    "agents/insights/schema.py",
+)
+
+
+def _framework_of(module: str) -> str | None:
+    top = module.split(".")[0]
+    for prefix in FRAMEWORK_PREFIXES:
+        if top == prefix or top.startswith(prefix + "_"):
+            return prefix
+    for dotted in FRAMEWORK_DOTTED:
+        if module == dotted or module.startswith(dotted + "."):
+            return dotted
+    return None
+
+
+def _frameworks_imported(path: pathlib.Path) -> set[str]:
+    """Every framework imported by a file, including inside functions.
+
+    Deferred imports are the common shape here (binders import their harness
+    inside the build function), so an AST walk is required — a top-of-file scan
+    would miss most of the real boundary.
+    """
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if (fw := _framework_of(alias.name)):
+                    found.add(fw)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            if (fw := _framework_of(node.module)):
+                found.add(fw)
+    return found
+
+
+def _source_files() -> list[pathlib.Path]:
+    files: list[pathlib.Path] = []
+    for root in SOURCE_ROOTS:
+        for path in sorted((BACKEND / root).rglob("*.py")):
+            if "__pycache__" not in path.as_posix():
+                files.append(path)
+    return files
+
+
+def _actual_importers() -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for path in _source_files():
+        if (fws := _frameworks_imported(path)):
+            out[path.relative_to(BACKEND).as_posix()] = fws
+    return out
+
+
+def test_framework_imports_stay_in_adapters():
+    """No agent-framework import outside the declared adapter set."""
+    unexpected = {
+        rel: sorted(fws)
+        for rel, fws in _actual_importers().items()
+        if rel not in ADAPTERS
+    }
+    assert not unexpected, (
+        "Agent-framework imports found outside agents/core/ports' adapter set:\n"
+        + "\n".join(f"  {rel}: {', '.join(fws)}" for rel, fws in sorted(unexpected.items()))
+        + "\n\nKeep domain logic framework-free and put the framework call in a "
+          "binder (see agents/core/memory_tools.py). Only add to ADAPTERS if this "
+          "file is genuinely a new adapter."
+    )
+
+
+def test_allowlist_has_no_dead_entries():
+    """Every allowlisted adapter still imports a framework.
+
+    A stale entry silently widens the boundary, which is exactly the failure
+    mode this gate exists to prevent.
+    """
+    actual = _actual_importers()
+    dead = sorted(rel for rel in ADAPTERS if rel not in actual)
+    assert not dead, (
+        "ADAPTERS lists files that no longer import a framework — remove them:\n"
+        + "\n".join(f"  {rel}" for rel in dead)
+    )
+
+
+@pytest.mark.parametrize("rel", FRAMEWORK_FREE)
+def test_domain_modules_import_no_framework(rel: str):
+    """The durable layer stays portable.
+
+    These modules are what survives a harness swap. If one of them grows a
+    framework import, the swap stops being cheap — which is the moment to
+    notice, not later.
+    """
+    path = BACKEND / rel
+    if not path.exists():
+        pytest.skip(f"{rel} not in this checkout")
+    found = _frameworks_imported(path)
+    assert not found, f"{rel} must stay framework-free but imports: {sorted(found)}"
+
+
+def test_ag_ui_map_is_exhaustive():
+    """Every event has a declared AG-UI meaning.
+
+    The map is the entire AG-UI adapter (agents/core/events.py). A missing
+    entry means a new event would silently have no external meaning.
+    """
+    missing = sorted(e.name for e in AgentEvent if e not in AG_UI_EVENT)
+    assert not missing, f"AgentEvent members missing from AG_UI_EVENT: {missing}"
+
+    missing_kinds = sorted(k.name for k in EventKind if k not in AG_UI_EVENT_KIND)
+    assert not missing_kinds, f"EventKind members missing from AG_UI_EVENT_KIND: {missing_kinds}"
+
+
+# ---------------------------------------------------------------------------
+# Frontend mirror parity — the events-out port has two sides
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "js_rel",
+    [
+        "app/src/lib/auditEvents.js",
+        "app/src/lib/contentEvents.js",
+        "app/src/lib/insightsEvents.js",
+    ],
+)
+def test_frontend_event_mirrors_reference_real_backend_values(js_rel: str):
+    """Every event string the frontend names must be one the backend can emit.
+
+    ``LEGACY_*`` keys are exempt by design: they name wire values the backend
+    has stopped emitting, kept so an app deployed ahead of the backend still
+    renders. Everything else is a typo or a drift.
+    """
+    import re
+
+    js_path = BACKEND.parent / js_rel
+    if not js_path.exists():
+        pytest.skip(f"{js_rel} not in this checkout")
+
+    from agents.core.events import AgentStep
+
+    valid = {e.value for e in AgentEvent} | {s.value for s in AgentStep}
+    pairs = re.findall(r'([A-Z_0-9]+):\s*"([a-z_0-9]+)"', js_path.read_text())
+    unknown = {v for k, v in pairs if not k.startswith("LEGACY_")} - valid
+    assert not unknown, f"{js_rel} references unknown events/steps: {sorted(unknown)}"
+
+
+@pytest.mark.parametrize(
+    "js_rel",
+    [
+        "app/src/lib/auditEvents.js",
+        "app/src/lib/contentEvents.js",
+        "app/src/lib/insightsEvents.js",
+    ],
+)
+def test_legacy_frontend_values_are_genuinely_retired(js_rel: str):
+    """A LEGACY_* key must name a value the backend no longer emits.
+
+    Otherwise the exemption above becomes a hole big enough to hide a real
+    drift in.
+    """
+    import re
+
+    js_path = BACKEND.parent / js_rel
+    if not js_path.exists():
+        pytest.skip(f"{js_rel} not in this checkout")
+
+    live = {e.value for e in AgentEvent}
+    legacy = {
+        v for k, v in re.findall(r'([A-Z_0-9]+):\s*"([a-z_0-9]+)"', js_path.read_text())
+        if k.startswith("LEGACY_")
+    }
+    still_live = legacy & live
+    assert not still_live, (
+        f"{js_rel} marks these LEGACY_ but the backend still emits them: {sorted(still_live)}"
+    )
+
+
+def test_no_live_event_uses_report_vocabulary():
+    """The artifact mechanism is named for artifacts, not reports.
+
+    "Report" was audit vocabulary sitting on a primitive every agent uses —
+    content streams plans and post drafts through the same tag, and the artifact
+    store versions all of them alike. The deprecated Python aliases were removed
+    once nothing referenced them; this keeps them from creeping back.
+
+    Note this governs the *mechanism* only. ``artifacts.kind == "report"`` is a
+    different thing and stays: it discriminates report / document / ticket /
+    image, so it says what an artifact *is*.
+    """
+    offenders = sorted(e.name for e in AgentEvent if "report" in e.value or "report" in e.name.lower())
+    assert not offenders, (
+        f"AgentEvent still carries report vocabulary: {offenders}. "
+        "Use artifact_chunk / artifact_version."
+    )

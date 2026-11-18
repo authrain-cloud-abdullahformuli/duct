@@ -1,0 +1,368 @@
+"use client";
+
+// One live example per canon row in DESIGN.md.
+//
+// The rule text is NOT here — it is parsed out of DESIGN.md by `canon.js`, and
+// joined to these by `id`. This file only answers "what does the rule look
+// like", using the real components with real props.
+//
+// A row with no entry here is a GAP, and the catalogue says so rather than
+// quietly listing twelve of thirteen. That is the same move as the type-scale
+// ratchet: make the shortfall a number on screen, and closing it becomes a
+// task instead of a good intention.
+//
+// Every example must be the pattern as DESIGN.md states it, not an
+// approximation. An example that drifts is worse than a missing one — a
+// missing one is honest.
+
+import { CircleAlert, Inbox } from "lucide-react";
+
+import DeskDayOne from "@/components/insights/desk/DeskDayOne";
+import PipelineProgress from "@/components/PipelineProgress";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Page, PageHeader, Section, TileGrid } from "@/components/ui/page";
+import { Textarea } from "@/components/ui/textarea";
+import { Button, buttonVariants } from "@/components/ui/button";
+import EmptyState from "@/components/ui/empty-state";
+import { ClampText, ClampTooltipContent, clampClass } from "@/components/ui/clamp-text";
+import { DialogFooter } from "@/components/ui/dialog";
+import { Skeleton, SkeletonDocument, SkeletonList } from "@/components/ui/skeleton";
+import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipTrigger } from "@/components/ui/tooltip";
+import { StepStatus } from "@/lib/agentSteps";
+
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import PauseCard from "@/components/workspace/PauseCard";
+import { AgentEvent } from "@/lib/agentEvents";
+import { canonId } from "./canon";
+
+/** A labelled specimen, so several variants of one rule read as one rule. */
+function Specimen({ label, children }) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      {children}
+    </div>
+  );
+}
+
+const EXAMPLES = {
+  // The specimens render the primitives, never a copy of their markup: a
+  // catalogue entry that hand-rolls the thing it documents is how forks start.
+  "Page frame": () => (
+    <Page>
+      <PageHeader title="Changes" status="1 change set waiting for you" help="Agents propose, you approve." />
+      <Section title="All changes">
+        <Card className="gap-0 p-0">
+          <div className="border-b px-4 py-3 text-sm">Pause Performance Max, keep brand search</div>
+          <div className="px-4 py-3 text-sm">Add negatives from last week&rsquo;s search terms</div>
+        </Card>
+      </Section>
+    </Page>
+  ),
+
+  Card: () => (
+    <Card>
+      <CardHeader>
+        <CardTitle>Home</CardTitle>
+        <CardDescription>Nine sources connected. Last brief two days ago.</CardDescription>
+      </CardHeader>
+      <CardFooter className="text-xs text-muted-foreground">Updated 2 hours ago</CardFooter>
+    </Card>
+  ),
+
+  "Grid of cards": () => (
+    <TileGrid cols={2}>
+      <Card size="sm">
+        <CardTitle>Search Console</CardTitle>
+        <CardDescription>Which searches bring people in, and which ones stopped.</CardDescription>
+        <CardFooter className="text-xs text-muted-foreground">Not connected</CardFooter>
+      </Card>
+      <Card size="sm">
+        <CardTitle>Stripe</CardTitle>
+        <CardDescription>The revenue every other number should answer to.</CardDescription>
+        <CardFooter className="text-xs text-muted-foreground">Not connected</CardFooter>
+      </Card>
+    </TileGrid>
+  ),
+
+  "Multi-line field": () => (
+    <Textarea
+      aria-label="Short description"
+      defaultValue="AI interior design and virtual staging. Upload a photo of any room and get a photorealistic redesign in seconds."
+    />
+  ),
+
+  "Busy indicator": () => (
+    <div className="flex flex-wrap items-center gap-6">
+      <Specimen label="On its own">
+        <Spinner label="Loading connectors" />
+      </Specimen>
+      <Specimen label="Inheriting currentColor in a button">
+        <Button size="sm" variant="secondary" disabled>
+          <Spinner />
+          Checking…
+        </Button>
+      </Specimen>
+    </div>
+  ),
+
+  "Long-running agent work": () => (
+    <PipelineProgress
+      stages={[
+        { id: "collect", label: "Collecting data" },
+        { id: "check", label: "Checking the numbers" },
+        { id: "synthesise", label: "Synthesising", virtual: true },
+      ]}
+      steps={[
+        { step_id: "collect", status: StepStatus.SUCCESS },
+        { step_id: "check", status: StepStatus.RUNNING },
+      ]}
+      activeId="synthesise"
+      synthesising
+      lines={[
+        "Reading Search Console…",
+        "Reconciling spend against conversions…",
+        "Looking for the number that moved…",
+      ]}
+    />
+  ),
+
+  "Status badge": () => (
+    <div className="flex flex-wrap gap-2">
+      <Badge>Connected</Badge>
+      <Badge variant="secondary">Draft</Badge>
+      <Badge variant="destructive">Failed</Badge>
+      <Badge variant="outline">Coming soon</Badge>
+    </div>
+  ),
+
+  "Destructive confirm": () => (
+    // Always open: a confirm nobody can see is not a specimen — which is also
+    // why four `window.confirm` calls survived a design pass, since /preview
+    // could not render one. The anatomy is the rule: title quotes the object,
+    // body states scope and irreversibility, action is verb + noun.
+    <ConfirmDialog
+      open
+      title="Disconnect “Google Search Console”?"
+      description="Duct forgets these credentials. Reports and scheduled runs that read from Search Console stop working until you connect it again, and reconnecting means signing in with Google once more."
+      cancel="Keep it"
+      action="Disconnect"
+      destructive
+    />
+  ),
+
+  "Destructive action (the button that opens that confirm)": () => (
+    <div className="flex flex-wrap items-center gap-6">
+      <Specimen label="Button">
+        <Button size="sm" variant="destructive">
+          Delete project
+        </Button>
+      </Specimen>
+      <Specimen label="AlertDialogAction, which defaults to primary">
+        <button type="button" className={buttonVariants({ variant: "destructive" })}>
+          Disconnect
+        </button>
+      </Specimen>
+    </div>
+  ),
+
+  "Dialog actions": () => (
+    <div className="rounded-xl border bg-card p-4">
+      <p className="text-sm font-medium">Rename project</p>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Everyone on the project sees the new name.
+      </p>
+      {/* Destructive/secondary left, primary rightmost — and it reverses to
+          primary-first when the row stacks, which the phone frame shows. */}
+      <DialogFooter className="mt-4">
+        <Button size="sm" variant="secondary">
+          Cancel
+        </Button>
+        <Button size="sm">Save name</Button>
+      </DialogFooter>
+    </div>
+  ),
+
+  // The specimen renders `ui/empty-state` rather than restating its markup:
+  // this row is the reason the component exists, and a catalogue entry that
+  // hand-rolls the thing it documents is how the four forks started.
+  "Empty state (whole surface)": () => (
+    <EmptyState
+      icon={Inbox}
+      title="No briefs yet"
+      actions={<Button size="sm">Connect a source</Button>}
+    >
+      Connect a source and Duct writes the first one for you.
+    </EmptyState>
+  ),
+
+  // Same component, teaching instead of reporting: the `example` slot takes
+  // the real filled component over invented props, dimmed and out of the
+  // accessibility tree.
+  "Empty state (with an example)": () => (
+    <EmptyState
+      icon={Inbox}
+      title="No briefs yet"
+      exampleLabel="Example brief"
+      actions={<Button size="sm">Connect a source</Button>}
+      example={
+        <div className="rounded-xl border bg-card p-5">
+          <p className="text-sm font-medium">Ads says 4,212. Stripe settled 1,890.</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Nobody had compared them. The gap is refunds and failed cards.
+          </p>
+        </div>
+      }
+    >
+      Connect a source and Duct writes the first one for you.
+    </EmptyState>
+  ),
+
+  "Empty state (inside a stable layout)": () => (
+    <div className="rounded-xl border bg-card p-5">
+      <p className="text-sm font-medium">Needs you</p>
+      {/* One muted line in place, so the surrounding layout does not jump
+          between the empty and the loaded state. */}
+      <p className="mt-2 text-xs text-muted-foreground">Nothing needs you right now.</p>
+    </div>
+  ),
+
+  "First-run": () => (
+    <DeskDayOne hasProject sourceCount={0} hasThread={false} onAsk={() => {}} />
+  ),
+
+  "Inline error": () => (
+    <div className="flex flex-col gap-4">
+      <Specimen label="Field or row level">
+        <p role="alert" className="text-sm text-destructive">
+          That project name is already taken.
+        </p>
+      </Specimen>
+      <Specimen label="Section level">
+        <div
+          role="alert"
+          className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive"
+        >
+          <CircleAlert className="mb-1.5 size-4" aria-hidden="true" />
+          Search Console rejected the credentials. Reconnect it to keep this report running.
+        </div>
+      </Specimen>
+    </div>
+  ),
+
+  "Corner notification": () => (
+    // Rendered in place rather than fixed to the corner, so it can be measured
+    // beside the others. The `toast` SURFACE puts it where it really sits.
+    <div className="w-[min(24rem,100%)] rounded-xl border bg-card p-4 shadow-lg" role="status">
+      <p className="text-sm font-medium">Update ready</p>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Restart Duct to pick up version 1.4.
+      </p>
+      <div className="mt-3 flex gap-2">
+        <Button size="sm">Restart now</Button>
+        <Button size="sm" variant="ghost">
+          Later
+        </Button>
+      </div>
+    </div>
+  ),
+
+  "Loading a page": () => (
+    <div className="flex flex-col gap-4">
+      <Specimen label="Skeleton mirroring the loaded layout">
+        <div className="rounded-xl border bg-card p-5">
+          <div className="flex items-center gap-3">
+            <Skeleton className="size-9 rounded-lg" />
+            <div className="flex flex-1 flex-col gap-1.5">
+              <Skeleton className="h-3.5 w-1/3" />
+              <Skeleton className="h-3 w-2/3" />
+            </div>
+          </div>
+          <Skeleton className="mt-4 h-24 w-full rounded-lg" />
+        </div>
+      </Specimen>
+      <Specimen label="A list (SkeletonList)">
+        <SkeletonList rows={3} />
+      </Specimen>
+      <Specimen label="A document (SkeletonDocument)">
+        <div className="rounded-xl border bg-card p-5">
+          <SkeletonDocument />
+        </div>
+      </Specimen>
+    </div>
+  ),
+
+  "Agent question (pick from options)": () => (
+    <PauseCard
+      pause={{
+        event: AgentEvent.QUESTIONS_REQUIRED,
+        interrupt_id: "catalogue-question",
+        questions: [
+          {
+            question: "Where should next month's plan go?",
+            multiSelect: false,
+            options: [
+              { label: "Keep the current plan", description: "The 23 days as scheduled." },
+              { label: "Change the mix", description: "More cheat sheets, fewer talking heads." },
+              { label: "Start over", description: "A new angle for one audience." },
+            ],
+          },
+        ],
+      }}
+      onAnswer={() => {}}
+    />
+  ),
+
+  "Truncated text (2+ lines)": () => (
+    // The case the rule exists for: an agent-written finding title long
+    // enough to run a fixed-height card or rail off-screen if it isn't capped.
+    <div className="flex max-w-sm flex-col gap-6">
+      <Specimen label="Self-contained — its own tab stop, clamp and tooltip trigger">
+        <ClampText
+          text="North-star window: Next 90 days: get net new MRR positive and keep it there. Measured 30-day position — $219.95 of new MRR against $297.86 lost to failed payments plus $209.88 sitting past-due, so the window is still net negative."
+          className="text-sm"
+        />
+      </Specimen>
+      <Specimen label="Inside an existing Link — clampClass + ClampTooltipContent on that element, no second tab stop">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <a href="#" className="text-sm font-medium underline-offset-2 hover:underline">
+              <span className={clampClass(2)}>
+                Checked Search Console: organic clicks up 18% week over week, led by
+                three pages that moved onto page one after last month&rsquo;s content
+                refresh landed in the index.
+              </span>
+            </a>
+          </TooltipTrigger>
+          <ClampTooltipContent text="Checked Search Console: organic clicks up 18% week over week, led by three pages that moved onto page one after last month's content refresh landed in the index." />
+        </Tooltip>
+      </Specimen>
+    </div>
+  ),
+};
+
+/**
+ * Scene-shaped entries, so the frame resolves `?scene=canon-…` with no special
+ * case and every device, theme, lens and inspection call works unchanged.
+ */
+export const CATALOGUE = Object.entries(EXAMPLES).map(([job, render]) => ({
+  id: canonId(job),
+  group: "Canon",
+  title: job,
+  state: "canonical",
+  render,
+}));
+
+export const CATALOGUE_BY_ID = new Map(CATALOGUE.map((c) => [c.id, c]));

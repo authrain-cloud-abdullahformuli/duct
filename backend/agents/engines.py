@@ -1,0 +1,825 @@
+"""Engine enum with per-engine defaults and supported model mappings.
+
+Mirrors agents/models.py for the engine dimension. Setting GENERATE_ENGINE
+is sufficient — provider and model default from the engine definition here,
+so GENERATE_PROVIDER and GENERATE_MODEL become optional overrides.
+
+Engine → default provider → default model:
+  v1  (LangChain)          → google_genai → gemini-2.5-flash
+  v3  (Claude Agent SDK)   → anthropic    → claude-sonnet-5
+
+Supported providers per engine:
+  v1  OpenAI, Google, Anthropic + OpenRouter — all four native in LangChain,
+      OpenRouter via `langchain-openrouter` (one key, 400+ models). A gateway
+      with no package of its own is still reachable as the OpenAI shape at its
+      own base URL; see GATEWAY_BASE_URL in agents/models.py
+  v3  anthropic only (Claude Agent SDK does not support other providers natively)
+
+A v2 (Google ADK) engine existed until it was removed: nothing dispatched its
+runner, and the UI offered it while silently serving v1. Its defaults were
+identical to v1's, so `resolve_engine` folding a stored "v2" back to V1 changes
+no behaviour.
+
+Only v1 gets OpenRouter, and that asymmetry is the point: v3's harness is
+provider-locked by design (anthropics/claude-agent-sdk-python#410, closed
+`not planned`), which is why v1 is the target harness for bring-your-own-model.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import Enum
+from typing import TYPE_CHECKING
+
+from agents.core.codex import is_plan_credential, is_usable_credential
+from agents.models import (
+    DEFAULT_IMAGE_MODELS,
+    DEFAULT_VIDEO_MODELS,
+    IMAGE_PROVIDER_ORDER,
+    MODEL_FALLBACK,
+    VIDEO_PROVIDER_ORDER,
+    ImageModel,
+    ModelName,
+    Provider,
+    VideoModel,
+    compatible_model_id,
+    compatible_served_id,
+    current_model_id,
+    is_compatible_model,
+    is_ollama_model,
+    ollama_model_id,
+    provider_of,
+)
+
+if TYPE_CHECKING:
+    # tiers.py imports this module; the runtime import in resolve_job_run is
+    # deferred for the same reason.
+    from agents.tiers import Job
+
+logger = logging.getLogger(__name__)
+
+
+class Engine(str, Enum):
+    """The agent harness. One member since the Claude Agent SDK (v3) was
+    removed — kept as a type rather than inlined because it is the seam a
+    second harness would arrive on, and every stored preference and request
+    still carries the string."""
+
+    V1 = "v1"  # LangChain
+
+
+# Default provider for each engine when GENERATE_PROVIDER is unset
+ENGINE_DEFAULT_PROVIDER: dict[Engine, Provider] = {
+    Engine.V1: Provider.GOOGLE_GENAI,
+}
+
+# Default model for each (engine, provider) pair when GENERATE_MODEL is unset
+ENGINE_DEFAULT_MODEL: dict[tuple[Engine, Provider], ModelName] = {
+    # v1 — LangChain (all providers native)
+    (Engine.V1, Provider.GOOGLE_GENAI): ModelName.GEMINI_3_8_FLASH,
+    (Engine.V1, Provider.ANTHROPIC):    ModelName.CLAUDE_SONNET,
+    (Engine.V1, Provider.OPENAI):       ModelName.GPT_5_MINI,
+    (Engine.V1, Provider.OPENROUTER):   ModelName.OR_DEEPSEEK_V4_1_FLASH,
+}
+
+# Which providers each engine supports
+ENGINE_SUPPORTED_PROVIDERS: dict[Engine, frozenset[Provider]] = {
+    Engine.V1: frozenset({
+        Provider.OPENAI, Provider.GOOGLE_GENAI, Provider.ANTHROPIC, Provider.OPENROUTER,
+        Provider.XAI, Provider.OLLAMA, Provider.OPENAI_COMPATIBLE,
+    }),
+}
+
+# Env var name each provider's SDK reads. Still keyed by engine because the
+# eval harness and the provider-status route resolve a key by (engine,
+# provider) pair.
+ENGINE_PROVIDER_ENV_VAR: dict[Engine, dict[Provider, str]] = {
+    Engine.V1: {
+        Provider.OPENAI:       "OPENAI_API_KEY",
+        Provider.GOOGLE_GENAI: "GOOGLE_API_KEY",
+        Provider.ANTHROPIC:    "ANTHROPIC_API_KEY",
+        Provider.OPENROUTER:   "OPENROUTER_API_KEY",
+        Provider.XAI:          "XAI_API_KEY",
+        # Not a key: the server the instance runs open models on.
+        Provider.OLLAMA:       "OLLAMA_BASE_URL",
+    },
+}
+
+
+def resolve_fallback_models(
+    engine: Engine,
+    provider: Provider,
+    model: ModelName | str,
+) -> tuple[ModelName, ...]:
+    """Models to try when ``model`` errors, in order. Empty means "do not retry".
+
+    The engine policy over ``agents/models.MODEL_FALLBACK``, which holds the
+    mapping itself — the split is the same one the rest of this module keeps:
+    ``models.py`` owns what a model *is*, ``engines.py`` owns which engine may
+    use it. Call this rather than reading the dict.
+
+    Only v1 gets a chain: v3's harness owns its own retries inside the CLI, so
+    mounting one there would be a second, invisible retry loop layered on the
+    SDK's.
+
+    A raw OpenRouter slug (a ``str``, not a ``ModelName``) resolves to no chain.
+    """
+    if engine is not Engine.V1:
+        return ()
+    if not isinstance(model, ModelName):
+        return ()
+    candidates = MODEL_FALLBACK.get(model, ())
+    supported = ENGINE_SUPPORTED_PROVIDERS.get(engine, frozenset())
+    if provider not in supported:
+        return ()
+    # A CLI-only id can never be a fallback target on v1 — same rule as
+    # resolve_engine_model, which is where that constraint is stated.
+    return tuple(candidates)
+
+
+# Duct config attribute name → API key for each provider
+PROVIDER_CONFIG_ATTR: dict[Provider, str] = {
+    Provider.OPENAI:       "openai_api_key",
+    Provider.GOOGLE_GENAI: "gemini_api_key",
+    Provider.ANTHROPIC:    "anthropic_api_key",
+    Provider.OPENROUTER:   "openrouter_api_key",
+    Provider.XAI:          "xai_api_key",
+    # The one entry that is not a key. Ollama's credential is the server
+    # itself, so this says whether the instance offers one; nothing here ever
+    # spends it as a key (resolve_provider_key answers Ollama first).
+    Provider.OLLAMA:       "ollama_base_url",
+}
+
+
+def ollama_ready() -> bool:
+    """The instance's Ollama server is set, answering, and holds a model that
+    calls tools — the three things a run on it needs. Asked of the server
+    (``service/ollama.py``, cached for a minute), never assumed from the URL:
+    a local install defaults to one whether or not Ollama is installed."""
+    from service.ollama import tool_models
+
+    return bool(tool_models())
+
+
+def default_ollama_model() -> str:
+    """The model a run on Ollama takes when nobody picked one: the server's
+    most recently pulled model that calls tools, or "" when it has none."""
+    from service.ollama import tool_models
+
+    models = tool_models()
+    return ollama_model_id(models[0].tag) if models else ""
+
+
+# ---------------------------------------------------------------------------
+# Resolver helpers
+# ---------------------------------------------------------------------------
+
+def resolve_engine(name: str | None) -> Engine:
+    """Resolve a string to an Engine enum, defaulting to V1."""
+    if not name:
+        return Engine.V1
+    try:
+        return Engine(name.lower().strip())
+    except ValueError:
+        return Engine.V1
+
+
+def resolve_engine_provider(engine: Engine, override: str | None = None) -> Provider:
+    """Resolve the provider for a given engine.
+
+    Uses override if provided and supported; otherwise returns the engine's
+    default provider. If the override is not supported by the engine, falls
+    back to the engine default and the caller should warn.
+    """
+    if not override:
+        return ENGINE_DEFAULT_PROVIDER[engine]
+    try:
+        candidate = Provider(override.lower().strip())
+    except ValueError:
+        return ENGINE_DEFAULT_PROVIDER[engine]
+    if candidate not in ENGINE_SUPPORTED_PROVIDERS[engine]:
+        return ENGINE_DEFAULT_PROVIDER[engine]
+    return candidate
+
+
+def resolve_engine_model(
+    engine: Engine,
+    provider: Provider,
+    override: str | None = None,
+) -> ModelName | str:
+    """Resolve the model for a given engine + provider.
+
+    Uses the override if it names a known ModelName; otherwise returns the
+    engine's default for that provider.
+
+    **OpenRouter is the exception, deliberately.** It fronts 400+ models, so the
+    ModelName enum is a curated default list rather than a whitelist — silently
+    substituting a default would throw away the model a bring-your-own-key
+    customer explicitly asked for, which is the whole feature. An unrecognised
+    ``vendor/slug`` is passed through verbatim and the gateway decides whether
+    it exists. The slug shape is required so a typo'd bare name still falls back
+    instead of becoming a guaranteed upstream 404.
+
+    A retired catalogue id resolves to its successor before any of that
+    (``RETIRED_MODELS``): a saved Heavy pick of Opus 5 means "Opus", and the
+    provider default would have quietly moved it to Sonnet.
+    """
+    default = ENGINE_DEFAULT_MODEL.get(
+        (engine, provider),
+        ENGINE_DEFAULT_MODEL.get((engine, ENGINE_DEFAULT_PROVIDER[engine]), ModelName.GEMINI_2_5_FLASH),
+    )
+    if provider is Provider.OLLAMA:
+        # No catalogue and no fixed default: a picked tag runs as picked, and
+        # nothing picked takes the server's own first choice.
+        if override and is_ollama_model(override):
+            return override.strip()
+        return default_ollama_model() or default
+    if provider is Provider.OPENAI_COMPATIBLE:
+        # A model from the user's own server runs as picked. Nothing picked is
+        # settled once the key is in hand (``endpoint_model``), since only the
+        # credential knows which models they chose.
+        if override and is_compatible_model(override):
+            return override.strip()
+        return default
+    if not override:
+        return default
+    candidate = current_model_id(override)
+    try:
+        resolved = ModelName(candidate)
+    except ValueError:
+        if provider == Provider.OPENROUTER and "/" in candidate:
+            return candidate
+        return default
+    return resolved
+
+
+def endpoint_model(provider: Provider, model: ModelName | str, key: str) -> ModelName | str:
+    """The model a run on the user's own endpoint takes when nothing names one
+    they still offer: the first model they chose when they connected it.
+
+    A tier saved with a model they have since deselected counts as nothing
+    named. Sending it anyway would fail on a server that no longer serves it,
+    or run on one they decided against."""
+    if provider is not Provider.OPENAI_COMPATIBLE:
+        return model
+    from service.compatible import unpack
+
+    endpoint = unpack(key)
+    if endpoint is None:
+        return model
+    if is_compatible_model(model) and endpoint.model(compatible_served_id(model)) is not None:
+        return model
+    return compatible_model_id(endpoint.models[0].id)
+
+
+def get_env_var_for_engine_provider(engine: Engine, provider: Provider) -> str | None:
+    """Return the env var name that the engine's framework reads for this provider."""
+    return ENGINE_PROVIDER_ENV_VAR.get(engine, {}).get(provider)
+
+
+# ---------------------------------------------------------------------------
+# Whose key pays for a run
+# ---------------------------------------------------------------------------
+#
+# Every LLM credential a run spends comes through resolve_provider_key below.
+# That is the point of putting it here rather than at each call site: a run
+# billed to Duct's own Console account is a policy decision, and a policy that
+# lives in six copies of `getattr(cfg, PROVIDER_CONFIG_ATTR[provider], "")` is
+# one that will be reintroduced by the next agent to need a key.
+#
+# Grepping for that getattr is the standing audit — outside this module it
+# should return nothing but the settings/status readers, which ask whether a
+# key exists and never spend one.
+
+
+class ProviderKeyRequired(RuntimeError):
+    """No credential this run is allowed to spend.
+
+    Carries the provider so the API layer can turn it into a 402 the browser
+    can act on — the Providers dialog for that provider — rather than a 500
+    that reads like an outage.
+    """
+
+    def __init__(self, provider: Provider | str, detail: str = "") -> None:
+        self.provider = getattr(provider, "value", str(provider))
+        super().__init__(
+            detail
+            or f"No {self.provider} API key for this request. Add your own key in Settings → Providers."
+        )
+
+
+@dataclass(frozen=True)
+class ProviderKey:
+    """A resolved credential and, just as importantly, whose account it is."""
+
+    key: str
+    provider: Provider
+    #: ``user``  — an X-Provider-* header on this request
+    #: ``stored``— this user's saved, encrypted key
+    #: ``env``   — this instance's env file (desktop / self-hosted: the user's own)
+    #: ``cloud`` — Duct's hosted key; our account is paying
+    #: ``subscription`` — the user's own ChatGPT plan: an access token the
+    #: desktop shell minted for this request (agents/core/codex.py)
+    #: ``instance`` — no key at all: the Ollama server this instance offers
+    source: str
+
+    @property
+    def billed_to_duct(self) -> bool:
+        """True when this run costs Duct money. Log it; it should be rare."""
+        return self.source == "cloud"
+
+
+def resolve_provider_key(
+    provider: Provider,
+    user_keys: Mapping[Provider, str] | None = None,
+    *,
+    stored_keys: Mapping[Provider, str] | None = None,
+    duct_pays: bool = False,
+    plan_ok: bool = True,
+) -> ProviderKey:
+    """The key this run may spend, in precedence order, or raise.
+
+    1. ``user_keys``   — the caller's ``X-Provider-*`` header for this request
+    2. ``stored_keys`` — their saved encrypted key (background jobs have no
+       request to carry a header, so this is the only BYOK they can have)
+    3. this instance's env key — **only** when ``allow_server_provider_keys()``
+       says the env file belongs to the user running it, or the call site
+       explicitly declared ``duct_pays``
+
+    ``duct_pays`` is for flows Duct deliberately funds — the lead-magnet teaser
+    audit is demand gen, not a customer's run. Pass it as an expression at the
+    call site (``duct_pays=req.lead_magnet``) so the condition stays readable.
+
+    ``plan_ok=False`` says this particular call cannot spend a ChatGPT plan,
+    whatever the provider would accept elsewhere. Only images pass it today:
+    the plan reaches ``chatgpt.com/backend-api/codex`` and nothing else, so a
+    caller that talks to ``api.openai.com`` gets a 401 from a credential every
+    other layer just called reachable. Treated as "not a key for this call"
+    rather than as an error, so a stored API key underneath it still serves.
+
+    Kept free of any DB or request import: the caller merges what it has and
+    this decides. ``service/provider_keys.py`` is the piece that loads stored
+    keys, and it is the only thing that needs a session.
+    """
+    from config import allow_server_provider_keys, get_configs
+
+    if provider is Provider.OLLAMA:
+        # No key to spend and nobody billed: whoever set OLLAMA_BASE_URL offered
+        # that server to every user of this instance.
+        if (get_configs().ollama_base_url or "").strip():
+            return ProviderKey("", provider, "instance")
+        raise ProviderKeyRequired(provider, "This server runs no Ollama. Set OLLAMA_BASE_URL to offer one.")
+
+    supplied = (user_keys or {}).get(provider, "")
+    plan = is_plan_credential(provider, supplied)
+    # A value this provider cannot accept is not a key to spend — fall through
+    # to the stored or env one rather than sending it and collecting a 401.
+    # A plan token under ``plan_ok=False`` is the same statement one layer in:
+    # OpenAI accepts it, this call cannot, so it is not a key here either.
+    if is_usable_credential(provider, supplied) and (plan_ok or not plan):
+        # The header's own shape says whose account this is: a ChatGPT access
+        # token is the user's plan, not a key they pasted, and the settings
+        # page words the two differently. Shape alone is not enough — only
+        # OpenAI has a plan path at all, so a JWT in any other slot is a
+        # mis-paste and billing it to "their subscription" would be fiction.
+        source = "subscription" if plan else "user"
+        return ProviderKey(supplied.strip(), provider, source)
+
+    saved = (stored_keys or {}).get(provider, "")
+    if saved and saved.strip():
+        return ProviderKey(saved.strip(), provider, "stored")
+
+    cfg = get_configs()
+    may_use_ours = duct_pays or allow_server_provider_keys()
+    if not may_use_ours:
+        # The whole reason this module exists. There IS a key in the env on the
+        # hosted deployment and we are declining to spend it.
+        raise ProviderKeyRequired(provider)
+
+    server_key = (getattr(cfg, PROVIDER_CONFIG_ATTR.get(provider, ""), "") or "").strip()
+    if server_key:
+        # Same field, two different answers to "who is paying" — see
+        # routes/providers.providers_status, which draws the same distinction.
+        local = bool(cfg.duct_local) or cfg.app_env == "local"
+        return ProviderKey(server_key, provider, "env" if local else "cloud")
+
+    raise ProviderKeyRequired(provider)
+
+
+# ---------------------------------------------------------------------------
+# One resolver for "which model, on whose key" — shared by every V1 runner
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RunModel:
+    """Everything a V1 runner needs to open a model: provider, model, key."""
+
+    provider: Provider
+    model: ModelName | str
+    api_key: str
+    #: The artifact summariser still runs on the Agent SDK, so only an
+    #: Anthropic key works there — a run on another provider persists its
+    #: artifacts without a digest. Empty when that is the case.
+    summary_key: str
+
+
+@dataclass(frozen=True)
+class ImageRun:
+    """The provider, model and key a run spends on images."""
+
+    provider: Provider
+    model: ImageModel
+    api_key: str
+    #: Same vocabulary as ``ProviderKey.source``.
+    source: str
+
+
+def web_search_key(
+    user_keys: Mapping[Provider, str] | None,
+    stored_keys: Mapping[Provider, str] | None,
+    *,
+    billed_to_duct: bool = False,
+) -> str:
+    """The Gemini key behind Duct's own WebSearch, for a run whose model has no
+    built-in search (``agents/core/web_tools.py``), or "" for no search.
+
+    The caller's own Gemini key, header before saved. This instance's only for
+    a run Duct already pays for (the lead-magnet audit) or where the env file is
+    the user's own (``allow_server_provider_keys``). Grounded search is billed
+    per query, and every audit on the hosted deployment used to search on
+    Duct's key whatever key the caller brought.
+    """
+    from config import allow_server_provider_keys, get_configs
+
+    for keys in (user_keys, stored_keys):
+        key = ((keys or {}).get(Provider.GOOGLE_GENAI) or "").strip()
+        if key:
+            return key
+    if billed_to_duct or allow_server_provider_keys():
+        return get_configs().gemini_api_key or ""
+    return ""
+
+
+def resolve_image_run(
+    user_keys: Mapping[Provider, str] | None = None,
+    stored_keys: Mapping[Provider, str] | None = None,
+    *,
+    preferred: str = "",
+) -> ImageRun | None:
+    """Which image-capable provider this run may spend, or None for none.
+
+    Images are a second provider inside a content run and get their own
+    resolution: the conversation's key is whatever the user brought for chat,
+    and it need not be an image-capable one. Providers are tried in
+    ``IMAGE_PROVIDER_ORDER`` under the same credential rules as every other
+    call (``resolve_provider_key``), and the first one with a spendable key
+    wins. None is a normal answer — the image tools decline politely — not an
+    error, because a content session is worth having without pictures.
+
+    ``preferred`` is the user's saved ``image_model``, and it is a preference
+    rather than an instruction: an unknown id, or one whose provider has no
+    spendable key, falls through to the order above instead of failing. That
+    matches the tier ladder — a pick you cannot pay for steps down, it does not
+    stop the run — and it is what keeps the setting safe to carry across a
+    machine where a different key happens to be present.
+
+    A ChatGPT plan is never spendable here, on any provider. ``service/openai/
+    images.py`` calls ``api.openai.com/v1/images``, which takes an API key and
+    nothing else, while the plan token only authenticates the Codex backend.
+    Before this, a desktop user signed in with ChatGPT and holding no other key
+    resolved OpenAI as their image provider (it is second in
+    ``IMAGE_PROVIDER_ORDER``), the settings page promised gpt-image on their
+    plan, and every picture came back 401. ``plan_ok=False`` makes that
+    provider fall through to their stored key, or out of the running.
+    """
+    hit = _first_spendable_media(
+        preferred_image_model(preferred), IMAGE_PROVIDER_ORDER, DEFAULT_IMAGE_MODELS,
+        user_keys, stored_keys,
+    )
+    if hit is None:
+        return None
+    provider, model, resolved = hit
+    return ImageRun(provider=provider, model=model, api_key=resolved.key, source=resolved.source)
+
+
+def _first_spendable_media(wanted, order, defaults, user_keys, stored_keys):
+    """The saved pick when its provider can pay, else each provider in
+    ``order`` with its default model, first spendable wins; or None.
+
+    Images and video both resolve this way, under one credential rule:
+    ``plan_ok=False``, because a ChatGPT plan authenticates the Codex backend
+    and nothing that makes media. Returns ``(provider, model, ProviderKey)``.
+    """
+    candidates = [(provider_of(wanted), wanted)] if wanted is not None else []
+    candidates += [(provider, defaults[provider]) for provider in order]
+    for provider, model in candidates:
+        try:
+            resolved = resolve_provider_key(
+                provider, user_keys, stored_keys=stored_keys, plan_ok=False
+            )
+        except ProviderKeyRequired:
+            continue  # asked for, cannot pay for it — fall through to the order
+        return provider, model, resolved
+    return None
+
+
+def preferred_image_model(preferred: str) -> "ImageModel | None":
+    """The saved pick as a catalogue member, or None for anything else.
+
+    Anything else includes the empty string (nobody picked), a model retired
+    from the catalogue since it was saved, and a chat model id pasted into the
+    field. All three mean the same thing to the caller — resolve normally —
+    so they are one branch rather than three error paths.
+    """
+    if not preferred:
+        return None
+    try:
+        return ImageModel(str(preferred).strip())
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class VideoRun:
+    """The provider, model and key a run spends on video clips."""
+
+    provider: Provider
+    model: VideoModel
+    api_key: str
+    #: Same vocabulary as ``ProviderKey.source``.
+    source: str
+
+
+def resolve_video_run(
+    user_keys: Mapping[Provider, str] | None = None,
+    stored_keys: Mapping[Provider, str] | None = None,
+    *,
+    preferred: str = "",
+) -> VideoRun | None:
+    """Which video-capable provider this run may spend, or None for none.
+
+    The image rules exactly (``resolve_image_run``): its own resolution, a
+    saved pick that is a preference rather than an instruction, no ChatGPT
+    plan, and None as a normal answer — the video tool then declines with a
+    sentence naming the keys that would unblock it.
+    """
+    hit = _first_spendable_media(
+        preferred_video_model(preferred), VIDEO_PROVIDER_ORDER, DEFAULT_VIDEO_MODELS,
+        user_keys, stored_keys,
+    )
+    if hit is None:
+        return None
+    provider, model, resolved = hit
+    return VideoRun(provider=provider, model=model, api_key=resolved.key, source=resolved.source)
+
+
+def preferred_video_model(preferred: str) -> "VideoModel | None":
+    """The saved video pick as a catalogue member, or None (see
+    ``preferred_image_model``)."""
+    if not preferred:
+        return None
+    try:
+        return VideoModel(str(preferred).strip())
+    except ValueError:
+        return None
+
+
+def resolve_run_model(
+    engine_override: str = "",
+    user_keys: Mapping[Provider, str] | None = None,
+    stored_keys: Mapping[Provider, str] | None = None,
+    *,
+    log_prefix: str = "agent",
+) -> RunModel:
+    """Engine → provider → model → key, for a run on the LangChain harness.
+
+    Lived in ``agents/insights/setup.py`` until content became the second
+    runner that needed it; the membership gate and the memory blocks stayed
+    there because they are insights-shaped, this is not. The rules:
+
+    * ``user_keys`` are per-request bring-your-own keys from the ``X-Provider-*``
+      headers; ``stored_keys`` are the same user's saved keys, which is all a
+      background worker can have. A caller's key wins over the server's for
+      the *resolved* provider only — an OpenAI key someone supplied must never
+      be spent on a Gemini call.
+    * A caller's key can also *choose* the provider, in the one case where that
+      is unambiguous: the operator expressed no preference (``GENERATE_PROVIDER``
+      unset) and the caller supplied exactly one key. Nobody pastes an
+      OpenRouter key hoping to be billed for Gemini. Two keys is not a
+      preference, so that case keeps the engine default rather than guessing.
+    * Whether the server's own key may be spent at all is decided by
+      ``resolve_provider_key``, which fails closed on the hosted deployment.
+      ``ProviderKeyRequired`` propagates deliberately: "you have not connected
+      a key" is a 402 the browser can act on, not a 500.
+
+    The engine override selects a provider/model *within* V1: V1 is the only
+    harness the session runners implement, so a stored ``"v3"`` preference
+    resolves to its Anthropic default rather than a different runner.
+    """
+    from config import get_configs
+
+    cfg = get_configs()
+    engine = resolve_engine(engine_override or cfg.generate_engine or "v1")
+    provider = resolve_engine_provider(engine, cfg.generate_provider or None)
+    model_override = cfg.generate_model or None
+    # A saved key is as much "the caller asked for this provider" as a header
+    # one — the only difference is that it survived a page refresh.
+    byo = {**(stored_keys or {}), **(user_keys or {})}
+    if not cfg.generate_provider and len(byo) == 1:
+        (candidate,) = byo.keys()
+        if candidate in ENGINE_SUPPORTED_PROVIDERS.get(engine, frozenset()):
+            # GENERATE_MODEL goes with the provider the operator picked, so it
+            # is dropped along with it — a Gemini model id forwarded to
+            # OpenRouter is a guaranteed 404, and the engine default for the
+            # new provider is the only id known to fit.
+            if candidate is not provider:
+                model_override = None
+            provider = candidate
+    model = resolve_engine_model(engine, provider, model_override)
+    resolved = resolve_provider_key(provider, user_keys, stored_keys=stored_keys)
+    model = endpoint_model(provider, model, resolved.key)
+    if resolved.billed_to_duct:
+        logger.info("%s: run billed to Duct (%s/%s)", log_prefix, provider.value, resolved.source)
+    api_key = resolved.key
+    summary_key = api_key if getattr(provider, "value", str(provider)) == "anthropic" else ""
+    return RunModel(provider=provider, model=model, api_key=api_key, summary_key=summary_key)
+
+
+@dataclass(frozen=True)
+class JobRun:
+    """A run resolved through the tier map: what it runs on, and whose key."""
+
+    provider: Provider
+    model: ModelName | str
+    api_key: str
+    #: Same vocabulary as ``ProviderKey.source``.
+    source: str
+    #: The tier that served, or "" when the vendor's own ladder or the engine
+    #: floor did.
+    tier: str = ""
+    #: The tier the job was assigned before anything was stepped over.
+    tier_requested: str = ""
+    #: ``(tier, reason)`` for every tier stepped over, in the order it happened.
+    #: ``agents/tiers.describe_skip`` turns one into a sentence.
+    tier_skipped: tuple[tuple[str, str], ...] = ()
+    #: Seconds until the requested tier's provider is out of cooldown, when it
+    #: is the thing that stepped the run down. A duration, not a timestamp —
+    #: the client anchors it to its own clock, the rule ``MODEL_RETRYING``
+    #: already follows.
+    tier_retry_in: float = 0.0
+    #: Hash of the key this run spends, for ``agents/core/quota.py``. Never the
+    #: key itself: this travels into middleware and into logs.
+    identity: str = ""
+
+
+def resolve_job_run(
+    job: "Job",
+    *,
+    engine_override: str = "",
+    user_keys: Mapping[Provider, str] | None = None,
+    stored_keys: Mapping[Provider, str] | None = None,
+    tier_map: Mapping[str, str] | None = None,
+    auto_fallback: bool = True,
+    duct_pays: bool = False,
+    log_prefix: str = "agent",
+    tier_override: str = "",
+) -> JobRun:
+    """Provider, model and key for ``job`` — the first agent run to read the
+    tier map, and the rule that a run lands on a provider the caller can pay.
+
+    ``resolve_run_model`` above lets a lone bring-your-own key choose the
+    provider only when the operator set no ``GENERATE_PROVIDER``. On the
+    hosted deployment one is always set, so a user holding only an OpenAI key
+    was asked for a Google one and got a 402. This resolves the other way
+    round: which providers are *reachable* for this request (the caller's
+    keys, plus the server's where a run may spend them), then the job's tier
+    walked down over that set (``agents/tiers.resolve_tier_model``). When the
+    map names nobody reachable — the default map is all one vendor — the run
+    takes the caller's own provider at the job's tier on that vendor's ladder,
+    header keys before saved ones. Only with nothing at all does it raise
+    ``ProviderKeyRequired``, the 402 the browser knows how to act on.
+
+    ``tier_override`` is the composer's lift for this one run ("heavy",
+    "standard", "light"); it moves the starting rung and nothing else, and an
+    unknown value is ignored rather than refused — a stale preference must
+    not stop a run.
+    """
+    from agents.core import quota
+    from agents.tiers import (
+        JOB_TIER,
+        PROVIDER_TRIPLES,
+        SKIP_COOLED_DOWN,
+        Tier,
+        resolve_tier_model,
+        tier_pick,
+    )
+    from config import allow_server_provider_keys, get_configs
+
+    cfg = get_configs()
+    engine = resolve_engine(engine_override or cfg.generate_engine or "v1")
+    supported = ENGINE_SUPPORTED_PROVIDERS.get(engine, frozenset())
+
+    def _has(keys: Mapping[Provider, str] | None, provider: Provider) -> bool:
+        return bool((keys or {}).get(provider, "").strip())
+
+    reachable = {p for p in Provider if _has(user_keys, p) or _has(stored_keys, p)}
+    if duct_pays or allow_server_provider_keys():
+        reachable |= {
+            p for p in Provider
+            if p is not Provider.OLLAMA
+            and (getattr(cfg, PROVIDER_CONFIG_ATTR.get(p, ""), "") or "").strip()
+        }
+    # Not gated like a key: the operator offered this server to everyone, and
+    # spending it costs nobody's account.
+    if Provider.OLLAMA in supported and ollama_ready():
+        reachable.add(Provider.OLLAMA)
+
+    # Which of those a provider has already told us are out of quota. Resolved
+    # per provider because the identity *is* the key, and a caller holding an
+    # Anthropic key and an OpenAI one has two of them — a single lookup would
+    # ask the wrong account's question.
+    # ``auto_fallback`` off means the user would rather see the rate limit than
+    # a quieter model. Skipping the lookup, not just the ladder check, is what
+    # makes that literal: with no cooling set the resolution is identical to
+    # the one that shipped before any of this existed.
+    cooling: set[Provider] = set()
+    retry_in: dict[Provider, float] = {}
+    for candidate in reachable if auto_fallback else ():
+        try:
+            key = resolve_provider_key(
+                candidate, user_keys, stored_keys=stored_keys, duct_pays=duct_pays
+            ).key
+        except ProviderKeyRequired:
+            continue
+        left = quota.cooling_seconds(quota.credential_identity(key)).get(candidate)
+        if left is not None:
+            cooling.add(candidate)
+            retry_in[candidate] = left
+
+    try:
+        override = Tier(tier_override) if tier_override else None
+    except ValueError:
+        override = None
+    resolution = resolve_tier_model(
+        job,
+        engine,
+        tier_map=dict(tier_map or {}) or None,
+        reachable=frozenset(reachable),
+        cooling=frozenset(cooling),
+        override_tier=override,
+    )
+    skipped: tuple[tuple[str, str], ...] = ()
+    requested = ""
+    cooled_wait = 0.0
+    if resolution is not None:
+        provider, model = resolution.provider, resolution.model
+        tier = resolution.tier.value if resolution.tier else ""
+        requested = resolution.requested.value
+        skipped = tuple((t.value, reason) for t, reason in resolution.skipped)
+        # The wait the user is actually waiting on is the first tier quota took
+        # away — the one they picked, not whichever later rung also happened to
+        # be cooled.
+        for stepped, reason in resolution.skipped:
+            if reason == SKIP_COOLED_DOWN:
+                _, cooled = tier_pick(stepped, dict(tier_map or {}))
+                cooled_wait = retry_in.get(cooled, 0.0)
+                break
+        # The operator's GENERATE_MODEL still applies to the operator's own
+        # provider when the caller sent no map of their own — the same
+        # precedence ``resolve_run_model`` gives it.
+        if not tier_map and cfg.generate_model and provider_of(cfg.generate_model) is provider:
+            model = resolve_engine_model(engine, provider, cfg.generate_model)
+    else:
+        # Keys first, the caller's own before saved ones; the instance's Ollama
+        # last, so a key someone brought is never passed over for it.
+        ordered = [
+            p for p in [*(user_keys or {}).keys(), *(stored_keys or {}).keys(), Provider.OLLAMA]
+            if p in reachable and p in supported
+        ]
+        if not ordered:
+            raise ProviderKeyRequired(ENGINE_DEFAULT_PROVIDER[engine])
+        provider = ordered[0]
+        wanted = JOB_TIER.get(job)
+        picked = PROVIDER_TRIPLES.get(provider, {}).get(wanted) if wanted else None
+        model = resolve_engine_model(engine, provider, picked.value if picked else None)
+        tier = wanted.value if (picked and wanted) else ""
+        requested = wanted.value if wanted else ""
+
+    resolved = resolve_provider_key(provider, user_keys, stored_keys=stored_keys, duct_pays=duct_pays)
+    if resolved.billed_to_duct:
+        logger.info("%s: run billed to Duct (%s/%s)", log_prefix, provider.value, resolved.source)
+    model = endpoint_model(provider, model, resolved.key)
+    return JobRun(
+        provider=provider,
+        model=model,
+        api_key=resolved.key,
+        source=resolved.source,
+        tier=tier,
+        tier_requested=requested,
+        tier_skipped=skipped,
+        tier_retry_in=round(max(0.0, cooled_wait), 1),
+        identity=quota.credential_identity(resolved.key),
+    )

@@ -1,0 +1,156 @@
+# Dependabot — security and version updates across the four stacks.
+#
+# Monthly, one minor-and-patch PR per lockfile. Weekly with three or four
+# groups per directory opened 28 PRs in two weeks (2026-10-29 to 11-11), and
+# the groups of one directory share a lockfile, so merging one left its
+# siblings conflicting until Dependabot rebased them. One group per lockfile
+# cannot conflict with itself. Majors stay out of the groups and arrive one
+# by one, because a breaking bump is its own decision (google-ads 33 → 35
+# switched the API version under us).
+#
+# Security updates ignore the schedule, the groups and the PR limit, so a
+# real advisory still arrives at once as its own PR. Nothing here slows them.
+
+version: 2
+
+updates:
+  # --- app: Next.js on Cloudflare Workers ---------------------------------
+  - package-ecosystem: npm
+    directory: /app
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    groups:
+      # Everything minor or patch, production and dev alike, in one PR. Next,
+      # OpenNext and wrangler move together inside it, which is what their own
+      # group used to exist for.
+      app-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # `@lingui/swc-plugin` is pinned exact in app/package.json and has to stay
+    # that way: the plugin ships a Wasm build whose `swc_core` must fall in the
+    # range Next's own runtime accepts, so the pair moves together or not at
+    # all. 6.7.0 against Next 16.3.5 fails with "failed to run Wasm plugin",
+    # the Lingui macros then reach the bundler unexpanded, and the build dies
+    # on an unresolvable `babel-plugin-macros` — which is exactly how #178
+    # arrived red. Dependabot cannot read the reasoning in app/AGENTS.md, so
+    # without this it proposes the same broken bump every Monday.
+    #
+    # Only version updates are ignored: a security advisory is not a
+    # `version-update:*` type, so a real CVE still opens its own PR. Lifting
+    # this is a deliberate act that belongs with a Next bump, and the gate is
+    # `npm --prefix app run build` actually completing.
+    ignore:
+      - dependency-name: "@lingui/swc-plugin"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
+    labels:
+      - dependencies
+      - app
+
+  # --- site: Playwright smoke tests only ----------------------------------
+  - package-ecosystem: npm
+    directory: /site
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    groups:
+      site-test-tooling:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - site
+
+  # --- backend: FastAPI + the agent stack ---------------------------------
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    groups:
+      backend-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    # The agent stack is bumped by hand, never from here. The rulebook
+    # (docs/engineering/agent-engineering.md, Maintenance) bumps it alone and
+    # in order: langgraph with its checkpoint packages, then core and
+    # langchain with the provider partners, then `deepagents`, which is
+    # pinned exactly because it changes behaviour in minor releases (task
+    # planning became opt-in in 0.7). tests/test_deepagents_harness.py is the
+    # gate. Every grouped PR Dependabot opened for it was closed unmerged, so
+    # proposing it was only noise. Security advisories still open their own PR.
+    ignore:
+      - dependency-name: "langchain*"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
+      - dependency-name: "langgraph*"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
+      - dependency-name: "deepagents"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+          - version-update:semver-patch
+    labels:
+      - dependencies
+      - backend
+
+  # --- desktop: Tauri shell ------------------------------------------------
+  - package-ecosystem: cargo
+    directory: /desktop/src-tauri
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      tauri:
+        patterns:
+          - "tauri*"
+      rust-dependencies:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - desktop
+
+  - package-ecosystem: npm
+    directory: /desktop
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    groups:
+      desktop-tooling:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - desktop
+
+  # --- GitHub Actions ------------------------------------------------------
+  #
+  # Worth keeping current: these run with repository secrets, and a stale
+  # third-party action is a supply-chain surface.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - ci

@@ -1,0 +1,530 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  Cell,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import {
+  ArrowUpDown,
+  BarChart2,
+  CalendarRange,
+  ExternalLink,
+  Eye,
+  Heart,
+  MessageCircle,
+  RefreshCw,
+  Share2,
+  TrendingUp,
+} from "lucide-react";
+import { msg } from "@lingui/core/macro";
+import { Plural, Trans, useLingui } from "@lingui/react/macro";
+import EmptyState from "@/components/ui/empty-state";
+import { Button } from "@/components/ui/button";
+import Link from "next/link";
+import { connectVendorKey, getContentAnalytics, listLinkedAccounts, listPublishers } from "@/lib/contentApi";
+import ConnectorGate, { schedulerOptions } from "./ConnectorGate";
+import { PlatformGlyph, platformMeta } from "./platformGlyphs";
+import { compactNumber, dayKey, formatDate, formatNumber, titleCase, toDate } from "@/lib/format";
+
+// Sort keys are API-ish identifiers; these are what the buttons say.
+const SORT_LABELS = {
+  views: msg`Views`,
+  likes: msg`Likes`,
+  date: msg`Date`,
+};
+
+// share_url comes from the third-party Post-Bridge API, so treat it as untrusted:
+// only render it as a link when it resolves to an http(s) URL. Blocks javascript:
+// and other script-bearing schemes from reaching an href.
+function safeHref(u) {
+  if (typeof u !== "string" || !u) return null;
+  try {
+    const url = new URL(u, typeof window !== "undefined" ? window.location.origin : "https://getduct.ai");
+    return /^https?:$/.test(url.protocol) ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+
+// The three reads, injectable so /preview can draw the tab's states over data.
+const API_READS = Object.freeze({
+  publishers: listPublishers,
+  linked: listLinkedAccounts,
+  analytics: getContentAnalytics,
+});
+
+export default function AnalyticsView({ projectId, onLinkAccounts, reads = API_READS }) {
+  const { t, i18n } = useLingui();
+  // Axis/cell dates follow the interface language, as the labels around them do.
+  const shortDate = (d) => formatDate(d, { withYear: false, locale: i18n.locale, fallback: "—" });
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState("");
+  // A scheduler that was asked and did not answer. The rows the others gave
+  // still show; this is a line beside them, not the page's error.
+  const [notices, setNotices] = useState([]);
+  const [sortKey, setSortKey] = useState("views"); // views | likes | date
+  // null until known, and left null when it can't be read: the tab then
+  // loads as before and the analytics call says what went wrong.
+  const [publishers, setPublishers] = useState(null);
+  // The accounts this project linked. "No numbers yet" means two different
+  // things with and without one: link an account, or wait for a post to go
+  // out. On 2026-11-08 the tab told someone with a linked account to link one.
+  const [linked, setLinked] = useState([]);
+  const noScheduler = Array.isArray(publishers) && !publishers.some((p) => p.connected);
+
+  const load = useCallback(async (refresh = false) => {
+    if (refresh) setRefreshing(true); else setLoading(true);
+    setError("");
+    try {
+      const pubs = await reads.publishers(projectId).catch(() => null);
+      setPublishers(pubs);
+      // With no scheduler there is nothing to read, and asking would only
+      // put the server's "connect one" sentence where the gate says it better.
+      if (Array.isArray(pubs) && !pubs.some((p) => p.connected)) {
+        setRows([]);
+        return;
+      }
+      const [links, data] = await Promise.all([
+        reads.linked(projectId).catch(() => []),
+        reads.analytics(projectId, { refresh }),
+      ]);
+      setLinked(Array.isArray(links) ? links : []);
+      // { rows, notices } since schedulers answer separately; a bare list is
+      // an older server.
+      setRows(Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : []);
+      setNotices(Array.isArray(data?.notices) ? data.notices : []);
+    } catch (e) {
+      setError(e.message || t`Couldn't load analytics.`);
+    } finally {
+      setRefreshing(false);
+      setLoading(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
+
+  useEffect(() => { load(false); }, [load]);
+
+  const totals = useMemo(() => rows.reduce(
+    (a, r) => ({
+      views: a.views + (r.view_count || 0),
+      likes: a.likes + (r.like_count || 0),
+      comments: a.comments + (r.comment_count || 0),
+      shares: a.shares + (r.share_count || 0),
+    }),
+    { views: 0, likes: 0, comments: 0, shares: 0 }
+  ), [rows]);
+
+  const avgViews = rows.length ? Math.round(totals.views / rows.length) : 0;
+  const postCount = formatNumber(rows.length);
+  const avgViewsText = formatNumber(avgViews);
+  const engagement = totals.likes + totals.comments + totals.shares;
+  const engagementRate = totals.views ? (engagement / totals.views) * 100 : 0;
+
+  // Views over time — aggregate by day.
+  const timeline = useMemo(() => {
+    const byDay = new Map();
+    for (const r of rows) {
+      const d = toDate(r.platform_created_at);
+      if (!d) continue;
+      const k = dayKey(d);
+      const cur = byDay.get(k) || { key: k, date: d, views: 0 };
+      cur.views += r.view_count || 0;
+      byDay.set(k, cur);
+    }
+    return [...byDay.values()]
+      .sort((a, b) => a.date - b.date)
+      .map((x) => ({ label: shortDate(x.date), views: x.views }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, i18n.locale]);
+
+  // Top posts by views.
+  const topPosts = useMemo(
+    () => [...rows]
+      .sort((a, b) => (b.view_count || 0) - (a.view_count || 0))
+      .slice(0, 8)
+      .map((r, i) => ({ ...r, rank: i + 1, name: (r.title || platformMeta(r.platform).label).slice(0, 28) })),
+    [rows]
+  );
+
+  // Breakdown by pillar / format — over posts attributed to our system.
+  const pillarData = useMemo(() => aggregateBy(rows, "pillar", titleCase), [rows]);
+  const formatData = useMemo(() => aggregateBy(rows, "format_name", (f) => f || ""), [rows]);
+
+  const rowCount = rows.length;
+  const sortedRows = useMemo(() => {
+    const copy = [...rows];
+    if (sortKey === "likes") copy.sort((a, b) => (b.like_count || 0) - (a.like_count || 0));
+    else if (sortKey === "date") copy.sort((a, b) => (toDate(b.platform_created_at)?.getTime() || 0) - (toDate(a.platform_created_at)?.getTime() || 0));
+    else copy.sort((a, b) => (b.view_count || 0) - (a.view_count || 0));
+    return copy;
+  }, [rows, sortKey]);
+
+  async function connect(publisher, apiKey) {
+    await connectVendorKey(publisher.id, apiKey);
+    load(false);
+  }
+
+  if (!loading && noScheduler) {
+    return <AnalyticsGate publishers={publishers} onConnect={connect} />;
+  }
+
+  return (
+    <div className="max-w-6xl space-y-6">
+      {/* Header */}
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold tracking-tight"><Trans>Analytics</Trans></h2>
+          <p className="text-sm text-muted-foreground">
+            <Trans>Live performance from your schedulers, across your linked accounts.</Trans>
+          </p>
+        </div>
+        <Button variant="outline" size="sm" onClick={() => load(true)} disabled={refreshing || loading}>
+          <RefreshCw className={`size-3.5 ${refreshing ? "animate-spin" : ""}`} />
+          {refreshing ? <Trans>Syncing…</Trans> : <Trans>Refresh numbers</Trans>}
+        </Button>
+      </div>
+
+      {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
+      {notices.map((n) => (
+        <p key={n.publisher} className="text-sm text-warning" role="status">{n.message}</p>
+      ))}
+
+      {loading ? (
+        <div className="flex items-center justify-center gap-2 py-24 text-sm text-muted-foreground">
+          <RefreshCw className="size-4 animate-spin" /> <Trans>Fetching analytics from your schedulers…</Trans>
+        </div>
+      ) : rows.length === 0 && linked.length === 0 ? (
+        // "Link the accounts in the Accounts tab" was a correct instruction
+        // with nothing to click, on the one tab where the reader has already
+        // decided they want this to work. The button is that same sentence.
+        <EmptyState
+          icon={BarChart2}
+          title={t`No analytics yet`}
+          actions={
+            <>
+              {onLinkAccounts && (
+                <Button size="sm" onClick={onLinkAccounts}>
+                  <Trans>Link an account</Trans>
+                </Button>
+              )}
+              <Button variant="ghost" size="sm" onClick={() => load(true)} disabled={refreshing}>
+                <RefreshCw className={`size-3.5 ${refreshing ? "animate-spin" : ""}`} aria-hidden="true" />
+                {refreshing ? <Trans>Syncing…</Trans> : <Trans>Refresh numbers</Trans>}
+              </Button>
+            </>
+          }
+        >
+          <Trans>Numbers arrive once posts go out through your scheduler and the accounts are linked.</Trans>
+        </EmptyState>
+      ) : rows.length === 0 ? (
+        // Linked, and nothing reported yet: the next step is a post, not a link.
+        <EmptyState
+          icon={BarChart2}
+          title={t`Nothing posted yet`}
+          actions={
+            <>
+              <Button size="sm" asChild>
+                <Link href="/content/plan"><Trans>Open the plan board</Trans></Link>
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => load(true)} disabled={refreshing}>
+                <RefreshCw className={`size-3.5 ${refreshing ? "animate-spin" : ""}`} aria-hidden="true" />
+                {refreshing ? <Trans>Syncing…</Trans> : <Trans>Refresh numbers</Trans>}
+              </Button>
+            </>
+          }
+        >
+          <LinkedSummary linked={linked} publishers={publishers} />
+        </EmptyState>
+      ) : (
+        <>
+          {/* Stat cards */}
+          <div className="grid grid-cols-2 gap-3 @4xl:grid-cols-5">
+            <StatCard icon={Eye} label={t`Views`} value={formatNumber(totals.views)} accent="text-info" />
+            <StatCard icon={Heart} label={t`Likes`} value={formatNumber(totals.likes)} accent="text-destructive" />
+            <StatCard icon={MessageCircle} label={t`Comments`} value={formatNumber(totals.comments)} accent="text-brand" />
+            <StatCard icon={Share2} label={t`Shares`} value={formatNumber(totals.shares)} accent="text-success" />
+            <StatCard icon={TrendingUp} label={t`Engagement`} value={`${engagementRate.toFixed(1)}%`} sub={t`${postCount} posts · ${avgViewsText} avg views`} accent="text-warning" />
+          </div>
+
+          {/* Charts */}
+          <div className="grid grid-cols-1 gap-4 @2xl:grid-cols-2">
+            <ChartCard title={t`Views over time`}>
+              {timeline.length > 1 ? (
+                <ResponsiveContainer width="100%" height={220}>
+                  <AreaChart data={timeline} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="viewsFill" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="var(--primary)" stopOpacity={0.35} />
+                        <stop offset="100%" stopColor="var(--primary)" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <XAxis dataKey="label" tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} />
+                    <YAxis tickFormatter={compactNumber} tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} width={44} />
+                    <Tooltip content={<ChartTooltip />} />
+                    <Area type="monotone" dataKey="views" stroke="var(--primary)" strokeWidth={2} fill="url(#viewsFill)" />
+                  </AreaChart>
+                </ResponsiveContainer>
+              ) : (
+                <EmptyChart label={t`Not enough dated posts to chart a trend yet.`} />
+              )}
+            </ChartCard>
+
+            <ChartCard title={t`Top posts by views`}>
+              <ResponsiveContainer width="100%" height={220}>
+                <BarChart data={topPosts} layout="vertical" margin={{ top: 4, right: 12, left: 8, bottom: 0 }}>
+                  <XAxis type="number" tickFormatter={compactNumber} tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} />
+                  <YAxis type="category" dataKey="name" width={120} tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} />
+                  <Tooltip content={<ChartTooltip />} cursor={{ fill: "var(--muted)", opacity: 0.4 }} />
+                  <Bar dataKey="view_count" radius={[0, 4, 4, 0]}>
+                    {topPosts.map((p) => (
+                      <Cell key={p.id} fill={platformMeta(p.platform).color} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </ChartCard>
+          </div>
+
+          {/* Breakdown by pillar / format (attributed posts) */}
+          {(pillarData.length > 0 || formatData.length > 0) && (
+            <div className="grid grid-cols-1 gap-4 @2xl:grid-cols-2">
+              <ChartCard title={t`Views by pillar`}>
+                {pillarData.length ? <CategoryBars data={pillarData} /> : <EmptyChart label={t`No pillar-attributed posts yet.`} />}
+              </ChartCard>
+              <ChartCard title={t`Views by format`}>
+                {formatData.length ? <CategoryBars data={formatData} /> : <EmptyChart label={t`No format-attributed posts yet.`} />}
+              </ChartCard>
+            </div>
+          )}
+
+          {/* Posts table */}
+          <div className="overflow-hidden rounded-2xl border border-border">
+            <div className="flex items-center justify-between gap-3 border-b border-border/60 px-4 py-3">
+              <h3 className="text-sm font-semibold"><Trans>All posts <span className="text-muted-foreground tabular-nums">· {rowCount}</span></Trans></h3>
+              <div className="flex items-center gap-1.5">
+                <ArrowUpDown className="size-3 text-muted-foreground" />
+                {["views", "likes", "date"].map((k) => (
+                  <button
+                    key={k}
+                    onClick={() => setSortKey(k)}
+                    className={`rounded px-2 py-0.5 text-xs font-medium capitalize transition-colors ${
+                      sortKey === k ? "bg-foreground text-background" : "text-muted-foreground hover:bg-muted"
+                    }`}
+                  >
+                    {i18n._(SORT_LABELS[k])}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-muted/40 text-xs text-muted-foreground">
+                  <tr>
+                    <th className="px-3 py-2 text-left font-medium"><Trans>Post</Trans></th>
+                    <th className="px-3 py-2 text-left font-medium"><Trans>Date</Trans></th>
+                    <th className="px-3 py-2 text-right font-medium"><Trans>Views</Trans></th>
+                    <th className="px-3 py-2 text-right font-medium"><Trans>Likes</Trans></th>
+                    <th className="px-3 py-2 text-right font-medium"><Trans>Comments</Trans></th>
+                    <th className="px-3 py-2 text-right font-medium"><Trans>Shares</Trans></th>
+                    <th className="px-2 py-2" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedRows.map((r) => {
+                    const meta = platformMeta(r.platform);
+                    const d = toDate(r.platform_created_at);
+                    return (
+                      <tr key={r.id} className="border-t border-border/60 hover:bg-muted/20">
+                        <td className="px-3 py-2">
+                          <div className="flex items-center gap-2.5">
+                            {r.cover_image_url ? (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img src={r.cover_image_url} alt="" className="h-12 w-8 shrink-0 rounded object-cover border border-border/60" />
+                            ) : (
+                              <span className="flex h-12 w-8 shrink-0 items-center justify-center rounded text-white" style={{ backgroundColor: meta.color }}>
+                                <PlatformGlyph platform={r.platform} className="size-3.5" />
+                              </span>
+                            )}
+                            <div className="min-w-0 max-w-[320px]">
+                              <p className="flex items-center gap-1.5 text-muted-foreground">
+                                <PlatformGlyph platform={r.platform} className="size-3 shrink-0" />
+                                <span className="text-2xs uppercase tracking-wide">{meta.label}</span>
+                                {r.published_via === "duct" && (
+                                  <span className="rounded-full bg-primary/10 px-1.5 py-px text-2xs font-semibold text-brand"><Trans>via Duct</Trans></span>
+                                )}
+                                {r.pillar && (
+                                  <span className="rounded-full bg-muted px-1.5 py-px text-2xs font-medium text-muted-foreground">{titleCase(r.pillar)}</span>
+                                )}
+                              </p>
+                              <p className="line-clamp-2 text-xs text-foreground">{r.title || <span className="italic text-muted-foreground"><Trans>No caption</Trans></span>}</p>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2 text-xs text-muted-foreground">{shortDate(d)}</td>
+                        <td className="px-3 py-2 text-right font-medium numeric">{formatNumber(r.view_count)}</td>
+                        <td className="px-3 py-2 text-right numeric">{formatNumber(r.like_count)}</td>
+                        <td className="px-3 py-2 text-right numeric">{formatNumber(r.comment_count)}</td>
+                        <td className="px-3 py-2 text-right numeric">{formatNumber(r.share_count)}</td>
+                        <td className="px-2 py-2 text-right">
+                          {safeHref(r.share_url) && (
+                            <a href={safeHref(r.share_url)} target="_blank" rel="noopener noreferrer" className="inline-flex text-muted-foreground hover:text-foreground" title={t`Open post`}>
+                              <ExternalLink className="size-3.5" />
+                            </a>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Analytics before any scheduler is connected: what the tab shows once one
+ *  is, and the schedulers that unlock it. Exported for /preview. */
+/** "Zernio hasn't reported a post for @kestrel on LinkedIn yet": the linked
+ *  accounts by name, so the person can see the tab knows them. */
+function LinkedSummary({ linked, publishers }) {
+  const names = linked
+    .slice(0, 3)
+    .map((l) => `@${String(l.username || "").replace(/^@/, "")} (${platformMeta(l.platform).label})`)
+    .join(", ");
+  const more = linked.length - Math.min(linked.length, 3);
+  const scheduler = (publishers || []).find((p) => p.id === linked[0]?.publisher)?.label || linked[0]?.publisher || "";
+  return (
+    <>
+      {more > 0 ? (
+        <Trans>{scheduler} hasn&rsquo;t reported a post for {names} and {more} more yet.</Trans>
+      ) : (
+        <Trans>{scheduler} hasn&rsquo;t reported a post for {names} yet.</Trans>
+      )}{" "}
+      <Trans>Numbers land here after the first post goes out, and on Refresh once it has synced.</Trans>
+    </>
+  );
+}
+
+
+export function AnalyticsGate({ publishers, onConnect }) {
+  const { t } = useLingui();
+  return (
+    <div className="max-w-6xl">
+      <ConnectorGate
+        title={t`See how every post did`}
+        lead={t`Connect a scheduler and Duct reads each post's numbers back: per post, per account, per pillar.`}
+        benefits={[
+          { icon: Eye, title: t`Every post, every account`, text: t`Views, likes, comments and shares in one table, wherever the post went out.` },
+          { icon: TrendingUp, title: t`What's working`, text: t`Pillars and formats ranked by what they earned, not by guesswork.` },
+          { icon: CalendarRange, title: t`Plans that learn`, text: t`The next plan leans on your own best posts and posting times.` },
+        ]}
+        connectLabel={t`Connect a scheduler to start`}
+        connectors={schedulerOptions(publishers, onConnect)}
+        footnote={t`Your own account and API key, stored encrypted. Numbers sync from the posts Duct publishes and the ones you post yourself.`}
+        example={<AnalyticsExample />}
+      />
+    </div>
+  );
+}
+
+// The stat row as it reads with a few weeks of posts behind it, drawn by the
+// real cards. Invented numbers, framed as an example by ConnectorGate.
+function AnalyticsExample() {
+  const { t } = useLingui();
+  return (
+    <div className="grid grid-cols-2 gap-3">
+      <StatCard icon={Eye} label={t`Views`} value={formatNumber(48210)} accent="text-info" />
+      <StatCard icon={Heart} label={t`Likes`} value={formatNumber(3140)} accent="text-destructive" />
+      <StatCard icon={MessageCircle} label={t`Comments`} value={formatNumber(412)} accent="text-brand" />
+      <StatCard icon={Share2} label={t`Shares`} value={formatNumber(920)} accent="text-success" />
+    </div>
+  );
+}
+
+function StatCard({ icon: Icon, label, value, sub, accent = "text-foreground" }) {
+  return (
+    <div className="rounded-2xl border border-border bg-card p-4">
+      <div className="flex items-center gap-1.5">
+        <Icon className={`size-3.5 ${accent}`} />
+        <span className="text-xs font-medium text-muted-foreground">{label}</span>
+      </div>
+      <p className="mt-1.5 text-2xl font-semibold tabular-nums">{value}</p>
+      {sub && <p className="mt-0.5 text-2xs text-muted-foreground">{sub}</p>}
+    </div>
+  );
+}
+
+/** Sum views grouped by a row key, over attributed rows only. Sorted desc. */
+function aggregateBy(rows, key, label) {
+  const map = new Map();
+  for (const r of rows) {
+    const raw = r[key];
+    if (!raw) continue;
+    const name = label(raw);
+    map.set(name, (map.get(name) || 0) + (r.view_count || 0));
+  }
+  return [...map.entries()]
+    .map(([name, views]) => ({ name, views }))
+    .sort((a, b) => b.views - a.views);
+}
+
+function CategoryBars({ data }) {
+  return (
+    <ResponsiveContainer width="100%" height={220}>
+      <BarChart data={data} layout="vertical" margin={{ top: 4, right: 12, left: 8, bottom: 0 }}>
+        <XAxis type="number" tickFormatter={compactNumber} tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} />
+        <YAxis type="category" dataKey="name" width={110} tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} />
+        <Tooltip content={<ChartTooltip />} cursor={{ fill: "var(--muted)", opacity: 0.4 }} />
+        <Bar dataKey="views" fill="var(--primary)" radius={[0, 4, 4, 0]} />
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+function ChartCard({ title, children }) {
+  return (
+    <div className="rounded-2xl border border-border bg-card p-4">
+      <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</h3>
+      {children}
+    </div>
+  );
+}
+
+function EmptyChart({ label }) {
+  return (
+    <div className="flex h-[220px] items-center justify-center text-center text-xs text-muted-foreground">
+      {label}
+    </div>
+  );
+}
+
+// Every chart here counts views, so the tooltip owns that word instead of
+// taking a " views" suffix to splice onto a number a translator cannot reorder.
+function ChartTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  const p = payload[0];
+  const name = p.payload?.title || p.payload?.name || label;
+  const views = p.value ?? 0;
+  return (
+    <div className="rounded-lg border border-border bg-popover px-2.5 py-1.5 text-xs shadow-md">
+      {name && <p className="mb-0.5 max-w-[220px] truncate font-medium">{name}</p>}
+      <p className="tabular-nums text-muted-foreground">
+        <Plural value={views} one="# view" other="# views" />
+      </p>
+    </div>
+  );
+}

@@ -1,0 +1,24 @@
+{
+  "name": "duct-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tauri build",
+    "build:dev": "tauri build --debug --bundles app --config src-tauri/tauri.dev.conf.json",
+    "build:selfhost": "tauri build --config src-tauri/tauri.selfhost.conf.json",
+    "dev": "tauri dev",
+    "dev:local": "tauri dev --config src-tauri/tauri.local.conf.json",
+    "install:dev-app": "node scripts/install-dev-app.mjs",
+    "sidecar": "node scripts/ensure-sidecar-fresh.mjs --force",
+    "postbuild:dev": "node scripts/install-dev-app.mjs",
+    "prebuild:selfhost": "node scripts/ensure-sidecar-fresh.mjs",
+    "prebuild:dev": "node scripts/ensure-sidecar-fresh.mjs",
+    "predev": "node scripts/ensure-sidecar-fresh.mjs",
+    "predev:local": "node scripts/ensure-sidecar-fresh.mjs",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -1,0 +1,419 @@
+"use client";
+
+// Reusable manual-credentials connector card (Phase 7 connectors: Apple
+// Search Ads, Meta Ads, Stripe, RevenueCat, OpenAI Ads).
+//
+// These platforms either have no OAuth at all or gate it behind app-review
+// processes (Meta App Review, Stripe App publishing, RevenueCat support
+// registration), so the user pastes read credentials instead. Flow:
+// paste → "Verify & save" calls POST /api/connectors/{id}/accounts to prove
+// the credentials work and list reachable accounts → pick one when several →
+// credentials are stored Fernet-encrypted server-side (/api/user/connectors).
+// Unlike the Google OAuth cards there is no session-only mode: manual
+// credentials exist to make server-side pulls possible, so saving requires
+// being signed in.
+//
+// The paste form lives in the tile's dialog — a five-field Apple Search Ads
+// form inline would set the height of every card in the grid.
+//
+// `oneClick` is for a provider that does have a sign-in flow, but not on
+// every server: GitHub connects through Duct's GitHub App where one is
+// registered, and a self-hosted install has none. When present it leads the
+// dialog and the paste form folds behind "use a token instead", so the card
+// is one component in both deployments rather than two that drift.
+
+import { useState } from "react";
+import { ExternalLink } from "lucide-react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  listConnectorAccounts,
+  saveServerConnector,
+} from "../../lib/connectorsApi";
+import { STORAGE_NONE, rowStorage } from "../../lib/credentialStorage";
+import { isLocalBackendActive } from "../../lib/localBackend";
+import ConnectorDialog from "./ConnectorDialog";
+import ConnectorTile from "./ConnectorTile";
+import StorageBadge from "./StorageBadge";
+import ProjectBinding from "./ProjectBinding";
+import { trackEvent, AnalyticsEvent } from "@/lib/analytics";
+import { NATIVE_SOURCE } from "../../lib/connectorSource";
+import { Textarea } from "@/components/ui/textarea";
+
+export default function ManualConnectorCard({
+  type,            // connector id: "apple_ads" | "meta_ads" | ...
+  title,
+  description,
+  logo,
+  fields,          // [{key, label, placeholder, secret?, multiline?, optional?, hint?}]
+  accountField = "account_id", // credential key the picked account id is saved under
+  docsUrl,
+  docsLabel,
+  signedIn,
+  serverRowList = [], // ALL stored rows for this connector_type (one per account)
+  onSaved,         // async () => void — refresh the stored-rows map
+  onRemoveRow,     // async (rowId) => void — remove one stored account row
+  // Optional provider sign-in, offered above the paste form:
+  // { label, againLabel, blurb, waiting, onStart, manageUrl, manageLabel, tokenLabel }
+  // onStart resolves "browser" when the desktop shell handed off to the system
+  // browser (show `waiting`), or navigates this window away.
+  oneClick = null,
+  // Per-project account mapping
+  projectName,
+  binding,
+  onMappingChange,
+  onEntityChange,
+  mappingBusy,
+  // The large first-run tile (ConnectorTile `featured`) and what it unlocks.
+  featured = false,
+  benefit,
+}) {
+  const { t } = useLingui();
+  const [open, setOpen] = useState(false);
+  const [values, setValues] = useState({});
+  const [accounts, setAccounts] = useState(null); // null = not verified yet
+  const [pickedAccount, setPickedAccount] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  // Several projects can use several accounts (per-project mappings), so a
+  // connected card can still open the paste form to add another one.
+  const [adding, setAdding] = useState(false);
+  const [tokenOpen, setTokenOpen] = useState(false);
+
+  const connected = serverRowList.length > 0;
+  // There is no session-only mode here: saving requires being signed in and
+  // writes the row server-side, which is the point of pasting a key at all.
+  const storage = connected
+    ? rowStorage(serverRowList[0], { localSidecar: isLocalBackendActive() })
+    : STORAGE_NONE;
+  const formOpen = oneClick ? tokenOpen : !connected || adding;
+
+  function setValue(key, v) {
+    setValues((prev) => ({ ...prev, [key]: v }));
+  }
+
+  function credentialDict() {
+    const creds = {};
+    for (const f of fields) {
+      const v = (values[f.key] || "").trim();
+      if (v) creds[f.key] = v;
+    }
+    return creds;
+  }
+
+  async function verifyAndSave(event) {
+    event.preventDefault();
+    setError("");
+    setNotice("");
+    const missing = fields.filter((f) => !f.optional && !(values[f.key] || "").trim());
+    if (missing.length) {
+      const names = missing.map((f) => f.label).join(", ");
+      setError(t`Missing: ${names}`);
+      return;
+    }
+    setBusy(true);
+    try {
+      const creds = credentialDict();
+      const rows = await listConnectorAccounts(type, creds);
+      setAccounts(rows);
+      // A warning about the key itself (Stripe's full secret key, GitHub's
+      // classic token) rides on every row. It is said whether or not a pick
+      // follows: a GitHub token usually reaches several repositories, and the
+      // one-row path was the only place it used to show.
+      const warning = rows.find((r) => r.warning)?.warning || "";
+      const caution = warning ? ` ⚠ ${warning}` : "";
+
+      // One reachable account → save immediately; several → wait for a pick.
+      if (rows.length === 1 || pickedAccount) {
+        const chosen = rows.find((r) => r.account_id === pickedAccount) || rows[0] || {};
+        await persist(creds, chosen);
+        const accountName = chosen.account_name;
+        const verified = accountName
+          ? t`Verified — ${accountName}. Credentials saved (encrypted).`
+          : t`Verified. Credentials saved (encrypted).`;
+        setNotice(verified + caution);
+      } else if (rows.length > 1) {
+        const count = rows.length;
+        setNotice(t`Verified — ${count} accounts reachable. Pick one below to finish.` + caution);
+      } else {
+        setNotice(t`Credentials verified, but no accounts are reachable with them.`);
+      }
+    } catch (err) {
+      setAccounts(null);
+      setError(err.message || String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function persist(creds, account) {
+    if (!signedIn) {
+      throw new Error(t`Sign in to save — manual credentials are stored server-side (encrypted) so agents and scheduled pulls can use them.`);
+    }
+    const blob = { ...creds };
+    if (account?.account_id) blob[accountField] = account.account_id;
+    await saveServerConnector({
+      connector_type: type,
+      account_id: account?.account_id || "",
+      account_name: account?.account_name || "",
+      credentials: blob,
+    });
+    setValues({});
+    setAccounts(null);
+    setPickedAccount("");
+    setAdding(false);
+    setTokenOpen(false);
+    // After saveServerConnector resolved — a credential the server rejected is
+    // not a connection.
+    trackEvent(AnalyticsEvent.ConnectorConnected, { provider: type });
+    await onSaved?.();
+  }
+
+  async function startOneClick() {
+    setError("");
+    setNotice("");
+    setBusy(true);
+    try {
+      const mode = await oneClick.onStart();
+      if (mode === "browser") setNotice(oneClick.waiting);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function pickAccount(accountId) {
+    setPickedAccount(accountId);
+    setBusy(true);
+    setError("");
+    try {
+      const chosen = (accounts || []).find((r) => r.account_id === accountId);
+      await persist(credentialDict(), chosen);
+      const accountName = chosen?.account_name || accountId;
+      setNotice(t`Saved — ${accountName}.` + (chosen?.warning ? ` ⚠ ${chosen.warning}` : ""));
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const accountCount = serverRowList.length;
+  const firstAccountName = connected ? serverRowList[0].account_name : "";
+  const status = connected
+    ? accountCount > 1
+      ? t`Connected — ${accountCount} accounts`
+      : firstAccountName
+        ? t`Connected — ${firstAccountName}`
+        : t`Connected`
+    : t`Not connected`;
+
+  return (
+    <>
+      <ConnectorTile
+        logo={logo}
+        title={title}
+        description={description}
+        source={NATIVE_SOURCE}
+        tone={connected ? "on" : "off"}
+        status={status}
+        storage={storage}
+        onClick={() => setOpen(true)}
+        featured={featured}
+        benefit={benefit}
+      />
+
+      <ConnectorDialog
+        open={open}
+        onOpenChange={setOpen}
+        logo={logo}
+        title={title}
+        description={description}
+        source={NATIVE_SOURCE}
+        // The same status row the OAuth dialogs carry. It was missing here —
+        // the import for it had been sitting unused — so a pasted credential
+        // gave no answer to "is this live, and where does it live?" once the
+        // dialog was open, which is the moment the question is being asked.
+        status={
+          <span className="conn-state">
+            <span className="conn-state-glyph" title={status}>
+              <span
+                className={`conn-dot${connected ? " conn-dot--on" : ""}`}
+                role="img"
+                aria-label={status}
+              />
+            </span>
+            {connected && <StorageBadge storage={storage} />}
+          </span>
+        }
+      >
+        {connected && (
+          <div className="conn-dialog-section">
+            {serverRowList.map((row) => (
+              <div key={row.id} className="conn-account-row">
+                <span>{row.account_name || row.account_id || t`Default account`}</span>
+                <Button type="button" variant="outline" size="sm" onClick={() => onRemoveRow?.(row.id)}>
+                  <Trans>Remove</Trans>
+                </Button>
+              </div>
+            ))}
+            {/* With a provider sign-in, more accounts come from the provider's
+                own picker below, not from pasting another key. */}
+            {!oneClick && (
+              <div>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setAdding((isOpen) => !isOpen)}
+                >
+                  {adding ? <Trans>Cancel</Trans> : <Trans>Add another account</Trans>}
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {oneClick && (
+          <div className="conn-dialog-section">
+            <p className="conn-hint">{oneClick.blurb}</p>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              <Button
+                type="button"
+                size="sm"
+                variant={connected ? "secondary" : "default"}
+                disabled={busy || !signedIn}
+                onClick={startOneClick}
+              >
+                {connected ? oneClick.againLabel : oneClick.label}
+              </Button>
+              {connected && oneClick.manageUrl && (
+                <Button asChild variant="link" size="sm" className="px-0">
+                  <a href={oneClick.manageUrl} target="_blank" rel="noreferrer">
+                    {oneClick.manageLabel}
+                    <ExternalLink aria-hidden="true" />
+                  </a>
+                </Button>
+              )}
+            </div>
+            {!signedIn && (
+              <p className="conn-hint">
+                <Trans>Sign in first — the connection is saved to your account.</Trans>
+              </p>
+            )}
+            <div>
+              <Button
+                type="button"
+                variant="link"
+                size="sm"
+                className="px-0"
+                aria-expanded={tokenOpen}
+                onClick={() => setTokenOpen((isOpen) => !isOpen)}
+              >
+                {tokenOpen ? <Trans>Hide the token form</Trans> : oneClick.tokenLabel}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {formOpen && (
+          <form onSubmit={verifyAndSave} className="conn-dialog-section">
+            {docsUrl && (
+              <p className="conn-hint">
+                <a className="app-link" href={docsUrl} target="_blank" rel="noreferrer">
+                  {docsLabel || <Trans>Where to find these credentials</Trans>}
+                </a>
+              </p>
+            )}
+            {fields.map((f) => {
+              const fieldLabel = f.label;
+              return (
+              <div key={f.key} className="conn-field">
+                <Label htmlFor={`${type}-${f.key}`}>
+                  {f.optional ? <Trans>{fieldLabel} (optional)</Trans> : fieldLabel}
+                </Label>
+                {f.multiline ? (
+                  <Textarea
+                    id={`${type}-${f.key}`}
+                    rows={4}
+                    autoComplete="off"
+                    placeholder={f.placeholder}
+                    value={values[f.key] || ""}
+                    onChange={(e) => setValue(f.key, e.target.value)}
+                    className="font-mono"
+                    spellCheck={false}
+                  />
+                ) : (
+                  <Input
+                    id={`${type}-${f.key}`}
+                    type={f.secret ? "password" : "text"}
+                    autoComplete="off"
+                    placeholder={f.placeholder}
+                    value={values[f.key] || ""}
+                    onChange={(e) => setValue(f.key, e.target.value)}
+                  />
+                )}
+                {f.hint && <p className="conn-hint">{f.hint}</p>}
+              </div>
+              );
+            })}
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <Button type="submit" size="sm" disabled={busy || !signedIn}>
+                {busy ? <Trans>Verifying…</Trans> : <Trans>Verify & save</Trans>}
+              </Button>
+              {!signedIn && (
+                <span className="conn-hint">
+                  <Trans>Sign in first — credentials are stored encrypted server-side.</Trans>
+                </span>
+              )}
+            </div>
+          </form>
+        )}
+
+        {accounts && accounts.length > 1 && formOpen && (
+          <div className="conn-dialog-section">
+            <p className="conn-hint">
+              <Trans>Pick the account to use:</Trans>
+            </p>
+            {accounts.map((a) => (
+              <Button
+                key={a.account_id || a.account_name}
+                type="button"
+                size="sm"
+                variant={pickedAccount === a.account_id ? "default" : "outline"}
+                disabled={busy}
+                onClick={() => pickAccount(a.account_id)}
+                style={{ justifyContent: "flex-start" }}
+              >
+                {a.account_name || a.account_id}
+                {a.currency ? ` · ${a.currency}` : ""}
+              </Button>
+            ))}
+          </div>
+        )}
+
+        {error && (
+          <p role="alert" className="text-destructive" style={{ margin: "12px 0 0", fontSize: 13 }}>
+            {error}
+          </p>
+        )}
+        {notice && !error && (
+          <p className="conn-hint" style={{ marginTop: 12 }}>{notice}</p>
+        )}
+
+        <ProjectBinding
+          projectName={projectName}
+          rows={serverRowList}
+          binding={binding}
+          onMappingChange={onMappingChange}
+          onEntityChange={onEntityChange}
+          busy={mappingBusy}
+        />
+      </ConnectorDialog>
+    </>
+  );
+}

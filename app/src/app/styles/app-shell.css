@@ -1,0 +1,135 @@
+/* app-shell — Header, logo, the two content regions, and page toolbars.
+   Split out of globals.css; see that file for the load order. */
+/* ── Top header: layout only — frosted surface comes from Tailwind on <header> (avoids unlayered bg beating utilities) ── */
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  /* The top safe area is this bar's to clear (theme.css pads the body's sides
+     only): under a status bar or a Dynamic Island the bar grows by the inset
+     and keeps its 3.25rem of controls below it. Zero everywhere else. */
+  padding-top: env(safe-area-inset-top, 0px);
+  min-height: calc(3.25rem + env(safe-area-inset-top, 0px));
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+}
+
+.logo {
+  font-family: var(--serif);
+  font-size: 1.375rem;
+  color: var(--foreground);
+  letter-spacing: -0.3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.logo-mark {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--orange);
+  animation: pop 2.5s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+@keyframes pop {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.5);
+  }
+}
+
+
+
+
+/* The two content regions are CONTAINERS, which is what lets page components
+   use `@`-variants (`@lg:grid-cols-2`) instead of viewport ones.
+   The viewport is the wrong ruler here: the sidebar takes 16rem out of it, so
+   at a 1024px window `lg:` fires while the content area is only ~740px wide,
+   and every grid that trusted it came out a column too many. Declaring the
+   container per REGION rather than per component means a component adapts
+   correctly wherever it is placed — the panes in SplitWorkspace declare one
+   too, for exactly that reason. */
+/* `container-type: inline-size` zeroes an element's INTRINSIC inline size —
+   the box is told to size from its parent, not its contents. So a container
+   must never be a box that is sized BY its contents, or it collapses to its
+   padding and everything inside it overflows a 32px column.
+
+   That is why `width: 100%` is load-bearing below and not decoration. This is
+   a flex item of SidebarInset (a column flex container), and `margin-inline:
+   auto` is enough to suppress the `stretch` that would otherwise have given it
+   a width — auto cross-axis margins turn a flex item into a fit-content box.
+   Fit-content of a size-contained box is zero. With an explicit `width` the
+   size is definite, the auto margins go back to only centring, and the
+   `max-width` still caps the reading column. */
+/* One gutter for every page, wide or not. The two regions used to pad 1rem
+   and 1.5rem, which is why a page title sat 8px further right on Content
+   Studio than anywhere else. The gutter grows with the window from a phone's
+   16px to a desktop's 32px (Material: 16dp compact, 24dp from medium; Apple:
+   16/20pt), and the top inset matches the widest side so the title starts in
+   the corner of a square, not a slot. */
+.app-main,
+.app-main-wide {
+  container-type: inline-size;
+  width: 100%;
+  padding: 2rem clamp(1rem, 3vw, 2rem) 5rem;
+}
+
+.app-main {
+  /* rem, not px: the cap follows the reader's text size and the desktop
+     app's zoom, so a zoomed-in page keeps the same measure. 77rem holds a
+     three-column grid of cards comfortably and stops a 27" window from
+     stretching a list into lines nobody can track across. */
+  max-width: 81rem; /* 77rem of content inside a 2rem gutter */
+  margin: 0 auto;
+}
+
+/* Fluid full-width variant for tool surfaces (Content's board) that should
+   use the whole window. `margin: 0` rather than `0 auto` is what keeps this
+   one stretching — see .app-main. */
+.app-main-wide {
+  max-width: 100%;
+  margin: 0;
+}
+
+.report-detail-title {
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+
+
+/* Room for the connection banner, only while there is one.
+
+   `ConnectionBanner` is `position: fixed` at the bottom, so it used to sit on
+   top of whatever the page ended with — a form's last field at 375px, the
+   sidebar's theme toggle and account row at 1024px. `:has()` lets the shell
+   notice the banner is mounted and reserve its height, so nothing is ever
+   hidden behind it, and the reservation disappears with the banner rather
+   than being padding the layout carries forever.
+
+   The height is generous on purpose: the bar wraps to two lines at narrow
+   widths, and over-reserving costs a little whitespace while under-reserving
+   costs the thing the banner was covering. */
+body:has([data-connection-banner]) .app-main,
+body:has([data-connection-banner]) .app-main-wide {
+  padding-bottom: 6.5rem;
+}
+
+/* Above `sm` the banner is a card in the bottom-left corner rather than a
+   full-width bar, so it is shorter and it is over the sidebar, not the page. */
+@media (min-width: 40rem) {
+  body:has([data-connection-banner]) .app-main,
+  body:has([data-connection-banner]) .app-main-wide {
+    padding-bottom: 1.5rem;
+  }
+
+  body:has([data-connection-banner]) [data-slot="sidebar-footer"] {
+    padding-bottom: 5.5rem;
+  }
+}

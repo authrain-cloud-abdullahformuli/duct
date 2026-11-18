@@ -1,0 +1,557 @@
+"""Application configuration from environment and optional `.env` / `.env.local` files."""
+
+from __future__ import annotations
+
+import logging
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_BACKEND_DIR = Path(__file__).resolve().parent
+
+
+def _first(data: dict[str, Any], *keys: str) -> Any:
+    """First present, non-empty value among `keys` — used to read a setting by
+    field name or by any of its env aliases."""
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _truthy(value: Any) -> bool:
+    """Interpret a raw settings value as a bool.
+
+    Values reaching a `mode="before"` validator come straight from the env, so a
+    bool field is still the string "1" / "true" at this point.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _settings_env_files() -> tuple[Path, ...]:
+    """Return dotenv files to load. Always loaded — including under pytest —
+    so integration tests can use the same API keys as the running server.
+
+    `DUCT_ENV_FILE` replaces the default pair with an explicit list (separated by
+    `os.pathsep`), so a run can be pinned to a chosen environment — the desktop
+    sidecar embodies whichever env it is started with rather than always the
+    developer's `.env.local`. Duct is configured entirely through the
+    environment, so this is the one knob that decides *which* environment; it
+    never overrides what that file says.
+
+    Relative paths resolve against `backend/`, so `DUCT_ENV_FILE=.env.prod`
+    works from anywhere — including a frozen bundle, whose `_BACKEND_DIR` points
+    inside the app and holds no env files of its own.
+    """
+    override = os.environ.get("DUCT_ENV_FILE", "").strip()
+    if not override:
+        return (
+            _BACKEND_DIR / ".env",
+            _BACKEND_DIR / ".env.local",
+        )
+    paths = []
+    for raw in override.split(os.pathsep):
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        paths.append(path if path.is_absolute() else _BACKEND_DIR / path)
+    return tuple(paths)
+
+
+def describe_database(url: str) -> str:
+    """A database URL with its credentials removed, safe to log.
+
+    The sidecar prints this at startup: which database a run ended up on is the
+    single most useful line in the log and the easiest thing to get wrong, but
+    the URL itself carries a password.
+    """
+    if not url:
+        return "(unset)"
+    parsed = urlsplit(url)
+    if parsed.scheme.startswith("sqlite"):
+        return f"sqlite {parsed.path or ':memory:'}"
+    host = parsed.hostname or "?"
+    port = f":{parsed.port}" if parsed.port else ""
+    database = parsed.path.lstrip("/") or "?"
+    return f"{parsed.scheme} {host}{port}/{database}"
+
+
+class Configs(BaseSettings):
+    """Backend settings; all keys optional with defaults so imports work without a full `.env`.
+
+    Loads `backend/.env` then `backend/.env.local` (later overrides; missing files are ignored).
+    """
+
+    # CORS / OAuth redirect target
+    frontend_origin: str = Field(default="http://localhost:3003")
+    # Marketing site origin (getduct.ai) — allowed for public lead-magnet endpoints
+    site_origin: str = Field(default="https://getduct.ai")
+
+    # Public origin of this API (scheme + host [+ port], no path). Used to build OAuth redirect
+    # URIs when GOOGLE_OAUTH_REDIRECT_URI / GOOGLE_SIGNIN_REDIRECT_URI are unset.
+    api_public_url: str = Field(default="http://localhost:8002")
+
+    # The MCP Registry the Connections search reads (service/mcp/registry.py).
+    # An operator's choice, not a user's, so it may be a private registry on an
+    # internal network. Empty turns the search off and the app hides it.
+    mcp_registry_url: str = Field(default="https://registry.modelcontextprotocol.io")
+
+    # Whether this process runs the schedule loop (service/schedules.py). On
+    # by default, in the cloud and in the desktop sidecar alike. Turn it off
+    # on the web process once a separate worker service runs the same loop,
+    # so two loops never compete for the same claims for no reason.
+    scheduler_enabled: bool = Field(default=True)
+
+    # Desktop (local) mode: the backend runs as a sidecar on the user's own
+    # machine rather than on Railway. Flips the persistence defaults to a
+    # per-user SQLite file and a writable data dir — see the model validator
+    # below, and `local_server.py` for the entrypoint that sets DUCT_LOCAL.
+    duct_local: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("DUCT_LOCAL", "DUCT_DESKTOP"),
+    )
+    # Per-user writable directory (SQLite DB, uploads, agent artifacts). Empty
+    # means "derive the OS-conventional path" — see utils/appdirs.py.
+    duct_data_dir: str = Field(default="", validation_alias=AliasChoices("DUCT_DATA_DIR"))
+
+    # A second sink for the log lines that otherwise exist only in the terminal
+    # that launched the server. Empty means stderr alone. Set it and the same
+    # formatted lines — app namespaces, the access log, and uvicorn's own
+    # tracebacks — are appended to the file as well, which is the only way an
+    # agent debugging a dev server can read them: it cannot see the editor
+    # terminal, and a 500 whose traceback nobody can quote costs a round trip
+    # every time. Not on by default because an always-on log is one nobody
+    # rotates; the launch configs set it for dev.
+    duct_log_file: str = Field(default="", validation_alias=AliasChoices("DUCT_LOG_FILE"))
+
+    # Primary relational store for auth-first persistence.
+    database_url: str = ""
+    # Safety default for deployed environments: rely on Alembic migrations, not SQLModel create_all.
+    # Set INIT_DB_ON_STARTUP=true only for local/dev bootstrap workflows.
+    init_db_on_startup: bool = False
+
+    # Google OAuth (same app can back Google Ads API). If unset/empty, derived as
+    # {api_public_url}/auth/google/callback (alias for the Google Ads connector callback).
+    #
+    # Two clients live in the same GCP project and are not interchangeable:
+    #   web     - fixed https redirect, used by the hosted API and local uvicorn
+    #   desktop - loopback redirect on an OS-picked port, which Google accepts
+    #             only for an installed-app client (see desktop/src-tauri/src/sidecar.rs)
+    # The pair below is the *effective* one for this process: the web client
+    # normally, swapped for the desktop pair under DUCT_LOCAL (see the validator
+    # at the bottom of this class). The legacy unprefixed names stay valid so a
+    # deployment can be renamed after the code ships, not before.
+    google_oauth_client_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("GOOGLE_WEB_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_ID"),
+    )
+    google_oauth_client_secret: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "GOOGLE_WEB_OAUTH_CLIENT_SECRET", "GOOGLE_OAUTH_CLIENT_SECRET"
+        ),
+    )
+    google_desktop_oauth_client_id: str = Field(
+        default="", validation_alias=AliasChoices("GOOGLE_DESKTOP_OAUTH_CLIENT_ID")
+    )
+    google_desktop_oauth_client_secret: str = Field(
+        default="", validation_alias=AliasChoices("GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET")
+    )
+    google_oauth_redirect_uri: str = Field(default="")
+
+    # Google Ads API. No developer token: sunset 2026-09-09, access level now
+    # follows the Cloud project that owns the OAuth client.
+    google_ads_client_id: str = ""
+    google_ads_client_secret: str = ""
+    google_ads_refresh_token: str = ""
+    google_ads_customer_id: str = ""
+    google_ads_login_customer_id: str = ""
+    ga4_property_id: str = ""
+    gsc_site_url: str = ""
+
+    # GitHub App — the one-click GitHub connection (service/github/app.py).
+    # All four or none: with any one missing the Connections page offers only
+    # the pasted fine-grained token, which is what a self-hosted install runs,
+    # because an App's private key cannot ship inside a public binary. The
+    # callback and setup URLs derive from api_public_url, so registering the
+    # App on GitHub is the only step outside this file.
+    github_app_slug: str = ""
+    github_app_client_id: str = ""
+    github_app_client_secret: str = ""
+    # PEM, with real newlines or literal "\n" escapes: a dotenv line and some
+    # dashboards cannot hold a multi-line value. A cut-short one is dropped
+    # (see the validator).
+    github_app_private_key: str = ""
+
+    # Google Sign-In (user identity, separate from connector OAuth). If unset/empty, derived as
+    # {api_public_url}/auth/signin/google/callback.
+    google_signin_redirect_uri: str = Field(default="")
+    jwt_secret: str = Field(
+        default="",
+        validation_alias=AliasChoices("JWT_SECRET", "DUCT_JWT_SECRET"),
+    )
+
+    # Cloudflare Turnstile (bot protection)
+    turnstile_site_key: str = ""
+    turnstile_secret_key: str = ""
+
+    # Cloudflare Email Service credentials — one of the providers behind the
+    # email seam (service/email/providers/). See `email_provider` below.
+    cloudflare_email_api_token: str = ""
+    cloudflare_account_id: str = ""
+    # Sender for lead audit reports; falls back to `email_from` when unset.
+    # Kept separate so a reply to a cold marketing email does not land wherever
+    # project invitations reply to.
+    lead_email_from: str = ""
+    # Comma-separated internal CC for lead audit reports. Empty by default and
+    # supplied via LEAD_EMAIL_CC — real addresses must not ship in source.
+    lead_email_cc: str = ""
+
+    # Protects /api/* routes (header X-API-Key). Same value the Next app sends as X-API-Key.
+    duct_api_key: str = ""
+
+    # Fernet key for encrypting connector refresh tokens at rest.
+    # Generate: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    credentials_encryption_key: str = ""
+
+    # Image storage backend: "local" (disk + /uploads StaticFiles, the dev
+    # default) or "r2" (Cloudflare R2 over the S3 API, served from R2's CDN).
+    # "" / "auto" picks "r2" automatically when the R2 settings below are all
+    # present, else "local". See service/storage.py.
+    storage_backend: str = ""
+
+    # Local-backend disk root (dev only — prod uses R2, no volume). Defaults to a
+    # gitignored dir under backend/; only the 'local' backend reads it, and the
+    # server serves it at /uploads. No env needed for local dev.
+    uploads_dir: str = Field(default_factory=lambda: str(_BACKEND_DIR / ".uploads"))
+    r2_account_id:        str = ""
+    r2_access_key_id:     str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket:            str = ""
+    # Public base URL the bucket is served from (R2 public dev URL or a custom
+    # CDN domain), e.g. "https://media.getduct.ai". No trailing slash needed.
+    r2_public_base_url:   str = ""
+    # Private bucket for artifacts (report HTML, documents). Optional — falls
+    # back to r2_bucket. Recommended in prod: a separate bucket with NO public
+    # custom domain, since artifact bytes are served only through the authed
+    # /api/user/artifacts endpoints (service/storage.py put_private).
+    r2_artifacts_bucket:  str = ""
+
+    # PostBridge — a fallback for local dev and the desktop sidecar only
+    # (service/vendor_keys.py). Each user saves their own key in Content →
+    # Accounts; a hosted instance never spends this one, because it is the
+    # operator's account and every signup would be publishing through it.
+    postbridge_api_key: str = ""
+    # Zernio, the other scheduler (service/zernio/), on the same terms.
+    zernio_api_key: str = ""
+
+    # Apify API token, for TikTok discovery (service/apify/). Like PostBridge's:
+    # users save their own in Content → Discover, and this one is spent only
+    # in local dev and the desktop sidecar (service/vendor_keys.py), never on
+    # a hosted instance, where it would pay for every signup's scraping.
+    apify_api_key: str = ""
+
+    # Which email provider delivers everything: "cloudflare", "smtp" or
+    # "console". Empty picks the first one whose credentials are present, and
+    # "console" when none are — so local dev, CI and a self-hosted install run
+    # every mail flow with no vendor account, logging what they would have sent.
+    # See service/email/sender.py; adding a provider does not touch this file.
+    email_provider: str = ""
+    # SMTP, the open-standard provider (service/email/providers/smtp.py): any
+    # mail server or vendor relay, or Mailpit on :1025 with security "none" to
+    # catch mail locally. Port 0 means the security mode's standard port
+    # (587, 465 or 25). Security is "starttls" (empty means this), "tls" for
+    # implicit TLS, or "none", which is plain text and only for this machine.
+    smtp_host: str = ""
+    smtp_port: int = Field(default=0, ge=0, le=65535)
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_security: str = ""
+    # Default From address. Must be on a domain verified with the active
+    # provider, otherwise sends are rejected.
+    email_from: str = Field(default="noreply@getduct.ai")
+    email_from_name: str = Field(default="Duct")
+    # How long a project invitation link stays redeemable.
+    invitation_ttl_days: int = Field(default=7, ge=1, le=90)
+
+    # When false (default), FastAPI does not serve /openapi.json, /docs, or /redoc.
+    expose_openapi_docs: bool = False
+
+    # When expose_openapi_docs is true and this password is non-empty, /docs, /redoc, and
+    # /openapi.json require HTTP Basic auth (username defaults to openapi_docs_basic_user).
+    openapi_docs_basic_user: str = Field(
+        default="docs",
+        validation_alias=AliasChoices(
+            "OPENAPI_DOCS_BASIC_USER",
+            "DUCT_OPENAPI_DOCS_BASIC_USER",
+        ),
+    )
+    openapi_docs_basic_password: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "OPENAPI_DOCS_BASIC_PASSWORD",
+            "DUCT_OPENAPI_DOCS_BASIC_PASSWORD",
+        ),
+    )
+
+    # LLM synthesis (insight generation; see agents.models for provider/model strings)
+    generate_provider: str = ""
+    generate_model: str = ""
+    gemini_api_key: str = ""
+    openai_api_key: str = ""
+    anthropic_api_key: str = ""
+    # Kill switch for "Continue with ChatGPT" — the desktop shell's sign-in to
+    # the user's own ChatGPT plan, which runs on an undocumented backend that
+    # can change without notice. False hides the path in the app and the
+    # server ignores a plan token it is sent (service/auth.py); the API-key
+    # path is untouched. Read by /api/providers/status.
+    chatgpt_auth_enabled: bool = True
+    # xAI (Grok), on its own LangChain integration.
+    xai_api_key: str = ""
+    # OpenRouter — its own LangChain integration. One key
+    # reaches 500+ models across 60+ providers, which is the practical answer
+    # for bring-your-own-model: consumer subscriptions never grant API access,
+    # so every customer arrives with a key, and for the open-weight/Chinese long
+    # tail that key is usually this one.
+    openrouter_api_key: str = ""
+    # Override OpenRouter's endpoint — a regional endpoint, or a self-hosted
+    # proxy that speaks OpenRouter's API. Empty means OpenRouter's own endpoint.
+    #
+    # NOT the way to reach a different gateway any more. This used to double as
+    # that, because the provider was ChatOpenAI aimed elsewhere; it is now
+    # ChatOpenRouter, which speaks OpenRouter's API rather than plain
+    # chat-completions. A self-hosted router (LiteLLM, Bifrost, Portkey) or a
+    # model server (vLLM, llama.cpp) is an OpenAI-compatible endpoint, which a
+    # user brings in Settings (Provider.OPENAI_COMPATIBLE). Ollama has a
+    # provider of its own, below.
+    openrouter_base_url: str = ""
+    # An Ollama server this instance runs open models on (agents/models.py,
+    # Provider.OLLAMA), e.g. http://localhost:11434. Not a key: whoever sets it
+    # offers that server to every user of the instance. Empty means no Ollama,
+    # and nothing probes for one; the hosted deployment leaves it empty.
+    ollama_base_url: str = ""
+    # The context Duct asks Ollama to load, and the window it budgets a thread
+    # in. Ollama's own default is 4,096 tokens on a machine without a large GPU,
+    # which silently cuts Duct's system prompt and tools short; a model trained
+    # on less is held to its own length. Same name as Ollama's server setting,
+    # because it means the same thing.
+    ollama_context_length: int = Field(default=32_768, ge=4_096, le=1_048_576)
+    # Whether a user's OpenAI-compatible endpoint may be on a private network
+    # (a vLLM box on the LAN, LM Studio on localhost). Off by default because
+    # the address is user input: on a hosted instance it would let anyone aim
+    # Duct at its own internal network. A desktop sidecar and local dev allow
+    # it regardless (``allow_server_provider_keys``); a self-hosted server
+    # whose model server is internal turns this on.
+    private_model_endpoints: bool = False
+    # Engine selection. One engine ("v1") since the Claude Agent SDK was
+    # removed; the field stays because stored preferences and requests still
+    # carry the string.
+    generate_engine: str = Field(default="v1")
+
+    # Product analytics and error tracking (service/analytics.py). No key, no
+    # PostHog: a self-hosted instance measures nothing unless it opts in. A
+    # loopback deployment (a developer, the desktop sidecar) stays quiet even
+    # with a key unless POSTHOG_ENABLE_LOCALHOST says otherwise.
+    posthog_api_key: str = ""
+    posthog_host: str = "https://us.i.posthog.com"
+    posthog_enable_localhost: bool = False
+
+    # Which deployment this is; tags every analytics event and agent trace.
+    app_env: str = Field(
+        default="local",
+        validation_alias=AliasChoices("APP_ENV", "ENVIRONMENT"),
+    )
+    # Where the agent's OpenTelemetry spans go (agents/core/telemetry.py).
+    # The standard OTel variable name, so Jaeger locally (scripts/jaeger.sh)
+    # and a collector in production are the same setting. Unset means tracing is off.
+    otel_exporter_otlp_endpoint: str = ""
+
+    model_config = SettingsConfigDict(
+        env_file=_settings_env_files(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+        # Fields carrying a validation_alias would otherwise ignore their own
+        # name as a kwarg, which every `Configs(google_oauth_client_id=...)`
+        # in the tests relies on.
+        populate_by_name=True,
+    )
+
+    @model_validator(mode="after")
+    def _prefer_desktop_oauth_client_in_local_mode(self) -> "Configs":
+        """Desktop sign-in redirects to http://127.0.0.1:<os-picked port>.
+
+        Google accepts a loopback redirect on an arbitrary port only for an
+        installed-app client, so the sidecar cannot use the web client the
+        hosted API runs on. Both pairs ship in the same env file; this picks
+        the right one rather than making every call site ask.
+        """
+        if (
+            self.duct_local
+            and self.google_desktop_oauth_client_id
+            and self.google_desktop_oauth_client_secret
+        ):
+            self.google_oauth_client_id = self.google_desktop_oauth_client_id
+            self.google_oauth_client_secret = self.google_desktop_oauth_client_secret
+        return self
+
+    @field_validator("jwt_secret", mode="after")
+    @classmethod
+    def _jwt_secret_strength(cls, v: str) -> str:
+        if v and len(v) < 32:
+            raise ValueError("JWT_SECRET must be at least 32 characters.")
+        return v
+
+    @field_validator("github_app_private_key", mode="after")
+    @classmethod
+    def _github_app_key_whole(cls, v: str) -> str:
+        # A PEM pasted across lines into a dotenv file keeps only its first line,
+        # and python-dotenv merely warns. Kept, that key lets people connect and
+        # then fails every pull; dropped, the App is off, GitHub falls back to the
+        # pasted token, and this line says why. Not a raise like JWT_SECRET's: an
+        # optional connector's typo should not take the whole API down.
+        if v and "-----END" not in v:
+            logging.getLogger(__name__).error(
+                "GITHUB_APP_PRIVATE_KEY is cut short, so the GitHub App is off. "
+                "Write the PEM on one line with \\n in place of each line break."
+            )
+            return ""
+        return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _strip_strings_and_derive_oauth_redirects(cls, data: Any) -> Any:
+        """Strip string inputs; fill OAuth redirect URIs from api_public_url when unset."""
+        if not isinstance(data, dict):
+            return data
+        out: dict[str, Any] = {}
+        for key, val in data.items():
+            if isinstance(val, str):
+                out[key] = val.strip()
+            else:
+                out[key] = val
+        base_default = cls.model_fields["api_public_url"].default
+        if not isinstance(base_default, str):
+            base_default = "http://localhost:8002"
+        raw_base = out.get("api_public_url")
+        base = (raw_base if isinstance(raw_base, str) and raw_base else base_default).rstrip("/")
+        out["api_public_url"] = base
+        gor = out.get("google_oauth_redirect_uri")
+        if not isinstance(gor, str) or not gor:
+            out["google_oauth_redirect_uri"] = f"{base}/auth/google/callback"
+        gsr = out.get("google_signin_redirect_uri")
+        if not isinstance(gsr, str) or not gsr:
+            out["google_signin_redirect_uri"] = f"{base}/auth/signin/google/callback"
+        return cls._apply_local_mode_defaults(out)
+
+    @classmethod
+    def _apply_local_mode_defaults(cls, out: dict[str, Any]) -> dict[str, Any]:
+        """In desktop mode, point persistence at the per-user data directory.
+
+        Only fills values the operator has not set explicitly, so a developer can
+        still run local mode against Postgres by exporting DATABASE_URL. Nothing
+        here runs for the Railway deployment, where duct_local is false.
+        """
+        # Values reach a before-validator keyed by whatever name the source used:
+        # the field name for kwargs, but the env var name for the settings sources.
+        # Both spellings have to be checked or local mode silently no-ops from env.
+        if not _truthy(_first(out, "duct_local", "DUCT_LOCAL", "DUCT_DESKTOP")):
+            return out
+
+        from utils.appdirs import ensure_data_dir  # local import: leaf module, no cycle
+
+        data_dir = ensure_data_dir(str(_first(out, "duct_data_dir", "DUCT_DATA_DIR") or ""))
+        out["duct_data_dir"] = str(data_dir)
+
+        if not out.get("database_url"):
+            # SQLModel/Alembic are driver-agnostic; sqlite keeps the app single-file.
+            out["database_url"] = f"sqlite:///{data_dir / 'duct.db'}"
+        if not out.get("uploads_dir"):
+            out["uploads_dir"] = str(data_dir / "uploads")
+        if "init_db_on_startup" not in out:
+            # Explicitly OFF for desktop. Alembic owns the schema here, same as
+            # the deployment — `db/migrate.py` runs it at startup. Leaving
+            # create_all on would also defeat that module's fresh-vs-legacy
+            # detection: it would build every table before the check ran, so a
+            # first launch would look like a pre-Alembic install and get stamped
+            # at the wrong baseline.
+            out["init_db_on_startup"] = False
+        return out
+
+
+@lru_cache
+def get_configs() -> Configs:
+    return Configs()
+
+
+def allow_server_provider_keys() -> bool:
+    """True when a run may fall back to *this instance's* own provider keys.
+
+    The same env field means two opposite things depending on where the process
+    runs, and the difference is the whole of bring-your-own-key:
+
+      - desktop sidecar (``DUCT_LOCAL``) or local dev — the env file IS the
+        user's own key. Falling back to it is BYOK by another route, so it is
+        allowed and nothing is being spent on their behalf.
+      - hosted (Railway) — the env key is Duct's Console account. Spending it
+        on a customer's run is exactly what BYOK exists to prevent, so a run
+        with no caller key of its own must fail closed rather than quietly
+        bill us.
+
+    Deliberate demand-gen exceptions (the lead-magnet teaser audit) pass
+    ``duct_pays=True`` to ``agents.engines.resolve_provider_key`` instead of
+    widening this predicate: "Duct pays for this" is then a decision written at
+    one visible call site rather than a fallback nobody can see.
+    """
+    cfg = get_configs()
+    return bool(cfg.duct_local) or cfg.app_env == "local"
+
+
+# Origins the desktop sidecar accepts. The webview loads from three places
+# during the move to a bundled frontend: `tauri://localhost` once the app ships
+# its own static build, the hosted app until then, and a loopback dev server
+# under `tauri dev`.
+DESKTOP_CORS_ORIGIN_REGEX = (
+    r"^(tauri://localhost"
+    r"|https://app\.getduct\.ai"
+    r"|http://(localhost|127\.0\.0\.1)(:\d+)?)$"
+)
+
+
+def cors_kwargs(cfg: Configs) -> dict[str, Any]:
+    """CORS settings for `CORSMiddleware`, chosen by how the app is deployed.
+
+    Three cases, in precedence order:
+
+    * **local dev** — any loopback port, so the site, app and storybook can all
+      talk to one running server.
+    * **desktop sidecar** — the origins above. Listing only `frontend_origin`
+      would block every origin a shipped build actually loads, and widening it
+      here costs nothing: the sidecar binds 127.0.0.1 and every route worth
+      reaching sits behind the per-install `X-API-Key`.
+    * **deployed** — the explicit frontend/site origins and nothing else.
+    """
+    kwargs: dict[str, Any] = {
+        "allow_credentials": True,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+    }
+    if cfg.app_env == "local":
+        kwargs["allow_origin_regex"] = r"http://(localhost|127\.0\.0\.1)(:\d+)?"
+    elif cfg.duct_local:
+        kwargs["allow_origin_regex"] = DESKTOP_CORS_ORIGIN_REGEX
+    else:
+        kwargs["allow_origins"] = [
+            o for o in [cfg.frontend_origin, cfg.site_origin] if o
+        ]
+    return kwargs

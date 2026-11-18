@@ -1,0 +1,290 @@
+"""Offline unit tests for the agent evaluation harness (tests/eval).
+
+These run in the normal (no-network) suite — they guard the scoring logic, the
+rubric rendering, the credential resolution, and the content rubric/artifact
+helpers so the harness itself can't silently regress. The live judge call is
+exercised separately in test_content_post_e2e.py (@pytest.mark.live).
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from tests.eval import (
+    Dimension,
+    DimensionScore,
+    JudgeVerdict,
+    Marker,
+    MarkerVerdict,
+    Rubric,
+    build_scorecard,
+    resolve_judge_api_key,
+)
+from tests.eval.client import judge_available
+from tests.eval.judge import _parse_verdict
+from tests.eval.prompts import render_rubric
+from tests.eval.rubrics.content_post import build_content_post_artifact, content_post_rubric
+
+
+def _rubric() -> Rubric:
+    return Rubric(
+        name="demo",
+        pass_threshold=3.5,
+        dimensions=[
+            Dimension("a", "Axis A", "desc a", weight=2.0, min_score=3),
+            Dimension("b", "Axis B", "desc b", weight=1.0, min_score=1),
+        ],
+        markers=[
+            Marker("must", "a required thing", kind="required"),
+            Marker("nope", "a forbidden thing", kind="forbidden"),
+        ],
+    )
+
+
+def _verdict(a: int, b: int, *, must: bool, nope: bool) -> JudgeVerdict:
+    return JudgeVerdict(
+        dimensions=[
+            DimensionScore(key="a", score=a, rationale="r"),
+            DimensionScore(key="b", score=b, rationale="r"),
+        ],
+        markers=[
+            MarkerVerdict(key="must", satisfied=must, evidence="e"),
+            MarkerVerdict(key="nope", satisfied=nope, evidence="e"),
+        ],
+        summary="s",
+    )
+
+
+def test_scorecard_passes_when_all_gates_clear():
+    sc = build_scorecard(_rubric(), _verdict(4, 5, must=True, nope=False))
+    # weighted overall = (2*4 + 1*5) / 3 = 4.333
+    assert sc.passed is True
+    assert round(sc.overall, 2) == 4.33
+    assert sc.failures == []
+    assert sc.dimension_scores == {"a": 4, "b": 5}
+
+
+# Four independent gates, each of which alone must fail the scorecard. Every row
+# is otherwise a passing verdict, so the named gate is the only thing under test.
+@pytest.mark.parametrize(
+    ("gate", "scores", "must", "nope", "failure_text"),
+    [
+        ("dimension min score", (2, 5), True, False, "scored 2 < required minimum 3"),
+        ("required marker unsatisfied", (4, 4), False, False, "required marker 'must'"),
+        ("forbidden marker present", (4, 4), True, True, "forbidden marker 'nope'"),
+        # a=3 clears its min, but b=1 drags the weighted overall to (6+1)/3=2.33
+        ("weighted overall below threshold", (3, 1), True, False, "pass threshold"),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_scorecard_fails_on(gate, scores, must, nope, failure_text):
+    sc = build_scorecard(_rubric(), _verdict(*scores, must=must, nope=nope))
+    assert sc.passed is False, gate
+    assert any(failure_text in f for f in sc.failures), (gate, sc.failures)
+
+
+def test_scorecard_flags_missing_dimension():
+    verdict = JudgeVerdict(
+        dimensions=[DimensionScore(key="a", score=4, rationale="r")],  # 'b' missing
+        markers=[
+            MarkerVerdict(key="must", satisfied=True, evidence="e"),
+            MarkerVerdict(key="nope", satisfied=False, evidence="e"),
+        ],
+        summary="s",
+    )
+    sc = build_scorecard(_rubric(), verdict)
+    assert sc.passed is False
+    assert any("dimension 'b' missing" in f for f in sc.failures)
+
+
+def test_scorecard_markdown_and_dict_roundtrip():
+    sc = build_scorecard(_rubric(), _verdict(4, 5, must=True, nope=False))
+    md = sc.as_markdown()
+    assert "Eval scorecard — demo" in md and "PASS" in md
+    d = sc.as_dict()
+    assert d["passed"] is True and d["overall"] == 4.33 and d["rubric"] == "demo"
+
+
+def test_render_rubric_lists_every_key():
+    text = render_rubric(_rubric())
+    for key in ("`a`", "`b`", "`must`", "`nope`"):
+        assert key in text
+
+
+def test_judge_system_prompt_embeds_persona():
+    from tests.eval.prompts import build_judge_system_prompt
+
+    assert "Evaluate as this end user" not in build_judge_system_prompt("")
+    with_persona = build_judge_system_prompt("a sound-off TikTok scroller")
+    assert "a sound-off TikTok scroller" in with_persona
+    assert "Evaluate as this end user" in with_persona
+
+
+def test_parse_verdict_handles_json_fence():
+    # Gemini responses expose the text via resp.text; tolerate a ```json fence.
+    resp = SimpleNamespace(text=(
+        '```json\n{"dimensions":[{"key":"a","score":3,"rationale":"r"}],'
+        '"markers":[],"summary":"ok"}\n```'
+    ))
+    verdict = _parse_verdict(resp)
+    assert verdict.dimensions[0].key == "a" and verdict.dimensions[0].score == 3
+
+
+def test_resolve_judge_api_key_prefers_env(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "g-123")
+    assert resolve_judge_api_key() == "g-123"
+
+
+def test_judge_unavailable_without_any_credential(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    # Neutralise any backend/.env fallback so this asserts the no-cred path.
+    monkeypatch.setattr("tests.eval.client._config_cred", lambda _name: "")
+    assert judge_available() is False
+
+
+def test_content_rubric_shape_is_stable():
+    rubric = content_post_rubric()
+    keys = set(rubric.dimension_keys())
+    assert {"hook", "image_quality", "image_fidelity", "cohesion"}.issubset(keys)
+    assert {"mentions_ai", "single_hook_emotion"}.issubset(set(rubric.marker_keys()))
+    # Hook and image quality carry the heaviest weight — they're what degrades first.
+    weights = {d.key: d.weight for d in rubric.dimensions}
+    assert weights["hook"] >= 1.5 and weights["image_quality"] >= 1.5
+    # The content judge evaluates as a short-form viewer persona.
+    assert rubric.persona and "scroll" in rubric.persona.lower()
+
+
+def test_build_content_post_artifact_renders_copy_and_flags_missing_images():
+    post = SimpleNamespace(
+        pillar="grooming", topic="jawline mistakes", layout="full-bleed",
+        hook_emotion="frustration", hook_type="identity_challenge",
+        hook_text="You did everything right and still…", save_cta="(save for slide 3)",
+        bridge_text="I found this free app", emotional_arc="build → reveal",
+        strategic_note="loops the pillar", visual_brief="soft daylight",
+        caption="the mistake nobody told you", hashtags=["#grooming", "#jawline"],
+        title="3 mistakes", slides=[
+            {"slide_id": "slide-01", "role": "hook", "kind": "photo",
+             "headline": "Still no jawline?", "image_prompt": "man, soft light", "image_url": "/uploads/x.png"},
+            {"slide_id": "slide-02", "role": "finding", "kind": "photo",
+             "headline": "Three things", "image_prompt": "closeup"},  # no image_url → MISSING
+        ],
+    )
+    artifact = build_content_post_artifact(post, brand_summary="MaxAura — men's grooming", images=[])
+    assert "Still no jawline?" in artifact.body
+    assert "image=yes" in artifact.body and "image=MISSING" in artifact.body
+    assert artifact.title.startswith("jawline mistakes")
+
+
+def test_the_audit_judge_sees_roadmap_tasks_and_why_a_priority_matters():
+    """The judge failed two reports for an "empty" roadmap that had three full
+    phases: the renderer printed only the phase labels. It also read a field no
+    priority has, so the business rationale never reached the judge either."""
+    from agents.audit.schema import (
+        AffectedUrl, AuditCategory, AuditFinding, AuditPriority, AuditReport,
+        RoadmapPhase, RoadmapTask, StructuredAuditData,
+    )
+    from tests.eval.rubrics.audit_report import render_audit_artifact
+
+    data = StructuredAuditData(
+        url="https://getduct.ai", generated_at="now", overall_score=61, score_band="needs_work",
+        pages_crawled=24, total_sitemap_urls=24,
+        categories=[AuditCategory(
+            id="on_page_seo", label="On-page SEO", score=80, tooltip="", fail_count=1,
+            findings=[AuditFinding(
+                id="h1", severity="fail", title="No H1 on /pricing", description="d", tooltip="t",
+                affected_urls=[AffectedUrl(url="https://getduct.ai/pricing", issue_value="0 H1s")],
+            )],
+        )],
+        top_priorities=[AuditPriority(
+            rank=1, title="Add the H1", why_it_matters="Pricing is the money page.",
+            severity="fail", category_id="on_page_seo", finding_id="h1",
+        )],
+        roadmap=[RoadmapPhase(label="0–30 days", theme="Unblock", tasks=[
+            RoadmapTask(task="Add an H1 to /pricing", effort_estimate="under_1hr"),
+        ])],
+    )
+    body = render_audit_artifact(AuditReport(url=data.url, generated_at="now", structured_data=data)).body
+
+    assert "0–30 days — Unblock" in body
+    assert "· Add an H1 to /pricing [under_1hr]" in body
+    assert "why: Pricing is the money page." in body
+    assert "affected: https://getduct.ai/pricing (0 H1s)" in body
+    assert "1 fail · 0 warn" in body
+
+
+def test_a_verdict_cut_off_mid_string_is_retried_once_with_a_doubled_budget():
+    """Two live audit runs lost their scorecard to a verdict truncated at the
+    output cap: the report was fine, the judge's JSON ended mid-rationale."""
+    from tests.eval.judge import JudgeArtifact, evaluate
+    from tests.eval.rubrics.audit_report import audit_report_rubric
+
+    good = (
+        '{"dimensions":[{"key":"evidence_grounding","score":4,"rationale":"r"}],'
+        '"markers":[],"summary":"ok"}'
+    )
+    calls: list[int] = []
+
+    class _Models:
+        def generate_content(self, *, model, contents, config):
+            calls.append(config.max_output_tokens)
+            text = '{"dimensions":[{"key":"evidence_grounding","score":4,"rationale":"cut off he' \
+                if len(calls) == 1 else good
+            return SimpleNamespace(text=text, parsed=None)
+
+    scorecard = evaluate(
+        audit_report_rubric(), JudgeArtifact(title="t", body="b"),
+        client=SimpleNamespace(models=_Models()), model="fake", max_output_tokens=1000,
+    )
+
+    assert calls == [1000, 2000]
+    assert scorecard.dimension_scores["evidence_grounding"] == 4
+
+
+def test_the_text_judge_is_glm_and_pinned_to_hosts_that_can_answer(monkeypatch):
+    """GLM 5.3 Flash is served by 33 OpenRouter hosts; some cannot make the
+    tool call a verdict is sent as and some run it at fp4. The judge's request
+    asks only for hosts that take every parameter, at fp8 or better."""
+    from tests.eval.client import DEFAULT_TEXT_JUDGE_MODEL, TEXT_JUDGE_ROUTING
+    from tests.eval.judge import text_judge_model
+
+    monkeypatch.delenv("DUCT_JUDGE_PROVIDER", raising=False)
+    monkeypatch.delenv("DUCT_JUDGE_MODEL", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+
+    llm = text_judge_model()
+
+    assert DEFAULT_TEXT_JUDGE_MODEL == "z-ai/glm-5.3-flash"
+    assert llm.model_name == DEFAULT_TEXT_JUDGE_MODEL
+    assert llm._default_params["provider"] == TEXT_JUDGE_ROUTING
+    assert TEXT_JUDGE_ROUTING["require_parameters"] is True
+    assert "fp4" not in TEXT_JUDGE_ROUTING["quantizations"]
+    # At its default depth GLM ran past five minutes and never called the tool.
+    assert llm._default_params["reasoning"] == {"effort": "low"}
+
+
+def test_a_judge_that_answers_in_prose_is_asked_again_then_reported(monkeypatch):
+    """A reply with no tool call parses to None. It is asked for again, and
+    when none ever comes that is an error the gate reports as a skipped
+    verdict, never a scorecard built from nothing."""
+    from tests.eval import judge as judge_mod
+    from tests.eval.judge import JudgeArtifact, NoVerdict, _evaluate_text
+    from tests.eval.rubrics.audit_report import audit_report_rubric
+
+    good = {"dimensions": [{"key": "evidence_grounding", "score": 4, "rationale": "r"}],
+            "markers": [], "summary": "ok"}
+
+    def judge_replying(*replies):
+        queue = list(replies)
+        runnable = SimpleNamespace(invoke=lambda _messages: queue.pop(0))
+        return lambda _model=None: SimpleNamespace(with_structured_output=lambda _schema: runnable)
+
+    monkeypatch.setattr(judge_mod, "text_judge_model", judge_replying(None, good))
+    card = _evaluate_text(audit_report_rubric(), JudgeArtifact(title="t", body="b"))
+    assert card.dimension_scores["evidence_grounding"] == 4
+
+    monkeypatch.setattr(judge_mod, "text_judge_model", judge_replying(None, None, None))
+    with pytest.raises(NoVerdict):
+        _evaluate_text(audit_report_rubric(), JudgeArtifact(title="t", body="b"))

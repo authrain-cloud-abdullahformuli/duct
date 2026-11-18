@@ -1,0 +1,771 @@
+/**
+ * REST + SSE helpers for the Content Studio agent.
+ *
+ * Session lifecycle (create, stream, reconnect, chat, answers, close) is
+ * `useAgentSession` over the unified /api/agents/tiktok_studio/* endpoints —
+ * the same hook every agent workspace runs on. This file supplies the create
+ * body (`contentSessionBody`) and the content-specific CRUD + slide-render
+ * routes under /api/content/*.
+ */
+
+import {
+  BASE,
+  backendAuthedHeaders,
+  getAgentConversation,
+  listAgentConversations,
+  archiveAgentConversation,
+} from "./api.js";
+import { throwForStatus } from "./authFetch.js";
+import { cached, invalidate } from "./contentCache.js";
+import { feedRequest } from "./contentFeed.js";
+
+/** Unified agent-type id for this workspace (see backend agents/registry.py). */
+const AGENT_TYPE = "tiktok_studio";
+
+// Cache TTLs (ms). Short — these only smooth out tab-switch refetches.
+const TTL_POSTS     = 60_000;
+const TTL_BRAND     = 120_000;
+const TTL_ANALYTICS = 120_000;
+const TTL_FORMATS   = 120_000;
+
+/** Resolve a backend-relative asset URL (e.g. /uploads/...) to an absolute URL. */
+export function mediaUrl(u) {
+  if (!u) return "";
+  if (/^(https?:|data:|blob:)/i.test(u)) return u;
+  return `${BASE}${u.startsWith("/") ? "" : "/"}${u}`;
+}
+
+/**
+ * Thumbnail variant of an absolute image URL. When the media domain has
+ * Cloudflare Image Resizing enabled (NEXT_PUBLIC_CDN_IMAGE_RESIZING="true"),
+ * rewrites to a width-capped, auto-format (WebP/AVIF) render via /cdn-cgi/image/
+ * — so the board/list pull small images while the editor keeps full-res. Safe
+ * passthrough (returns the URL unchanged) when disabled or for relative/data URLs.
+ */
+export function cdnImage(u, { width = 480, quality = 80 } = {}) {
+  if (!u || process.env.NEXT_PUBLIC_CDN_IMAGE_RESIZING !== "true") return u;
+  if (!/^https?:\/\//i.test(u)) return u;
+  try {
+    const url = new URL(u);
+    const opts = `width=${width},quality=${quality},format=auto,fit=scale-down`;
+    return `${url.origin}/cdn-cgi/image/${opts}${url.pathname}${url.search}`;
+  } catch {
+    return u;
+  }
+}
+
+async function jsonOrThrow(res) {
+  if (!res.ok) {
+    // A 401 has to retire the session rather than reach a chat panel as prose
+    // — see authFetch's endSession.
+    await throwForStatus(res);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// SSE — plan/post stream lifecycle
+// ---------------------------------------------------------------------------
+
+/** Unified agent-type id for this workspace (see backend agents/registry.py). */
+export const CONTENT_AGENT_TYPE = AGENT_TYPE;
+
+/** Conversation/resume body fields shared by both modes — omitted keys keep
+ * the normal first-open behaviour (server auto-creates a fresh conversation). */
+function resumeFields({ conversationId, resume, startFresh, artifactType, artifactId } = {}) {
+  return {
+    ...(conversationId ? { conversation_id: conversationId } : {}),
+    ...(resume         ? { resume: true } : {}),
+    ...(startFresh     ? { start_fresh: true } : {}),
+    ...(artifactType   ? { artifact_type: artifactType } : {}),
+    ...(artifactId     ? { artifact_id: artifactId } : {}),
+  };
+}
+
+/**
+ * The create body for a content session — what `useAgentSession` POSTs to
+ * /api/agents/tiktok_studio/sessions. The hook owns opening the stream,
+ * reconnecting and closing; this only knows the two modes' fields.
+ *
+ *   plan_month: { projectId, startDate?, days?, feed? }
+ *   draft_post: { projectId, planId?, dayIndex?, topic?, pillar?, channel? }
+ * plus the resume fields (conversationId, resume, startFresh, artifactType,
+ * artifactId) in either mode.
+ */
+export function contentSessionBody(mode, context = {}) {
+  const {
+    projectId, startDate, days, planId, dayIndex, topic, pillar, channel, cloneUrl, feed,
+    conversationId, resume, startFresh, artifactType, artifactId,
+  } = context;
+  const resumeBody = resumeFields({ conversationId, resume, startFresh, artifactType, artifactId });
+  if (mode === "plan_month") {
+    return {
+      mode,
+      project_id: projectId,
+      ...(startDate ? { start_date: startDate } : {}),
+      ...(days ? { days } : {}),
+      // A plan from shipped work (#561): the setup sheet's answers.
+      ...(feed ? { feed: feedRequest(feed) } : {}),
+      ...resumeBody,
+    };
+  }
+  return {
+    mode: "draft_post",
+    project_id: projectId,
+    ...(planId ? { plan_id: planId } : {}),
+    ...(dayIndex !== undefined && dayIndex !== null ? { day_index: dayIndex } : {}),
+    ...(topic ? { topic } : {}),
+    ...(pillar ? { pillar } : {}),
+    ...(channel ? { channel } : {}),
+    // A draft modelled on a TikTok post; the server validates it again.
+    ...(cloneUrl ? { clone_url: cloneUrl } : {}),
+    ...resumeBody,
+  };
+}
+
+/** Fetch a content conversation + its event log for chat rehydration. */
+export async function getContentConversation(conversationId) {
+  return getAgentConversation(AGENT_TYPE, conversationId);
+}
+
+/** List content conversations (resume lookup / history). */
+export async function listContentConversations(filters) {
+  return listAgentConversations(AGENT_TYPE, filters);
+}
+
+/** Archive a content conversation (start-fresh support). */
+export async function archiveContentConversation(conversationId) {
+  if (!conversationId) return;
+  await archiveAgentConversation(AGENT_TYPE, conversationId).catch(() => {});
+}
+
+/** GET a self-contained 1080×1920 single-slide doc (images inlined) to rasterize. */
+export async function getSlideRenderDoc(sessionId, postId, slideId) {
+  const url =
+    `${BASE}/api/content/slide-doc/${encodeURIComponent(sessionId)}` +
+    `?post_id=${encodeURIComponent(postId)}&slide_id=${encodeURIComponent(slideId)}`;
+  const res = await fetch(url, { headers: backendAuthedHeaders() });
+  return jsonOrThrow(res);
+}
+
+/** POST a rasterized slide PNG back to resolve the agent's render_slide request. */
+export async function postSlideRender(sessionId, { render_id, image_base64 }) {
+  const res = await fetch(
+    `${BASE}/api/content/slide-render/${encodeURIComponent(sessionId)}`,
+    {
+      method: "POST",
+      headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ render_id, image_base64 }),
+    },
+  );
+  return jsonOrThrow(res);
+}
+
+// Re-exported so the many `import { consumeSseStream } from "@/lib/contentApi"`
+// call sites keep working; the implementation lives in lib/sse.js.
+export { consumeSseStream, parseSseDataFrame } from "./sse.js";
+
+// ---------------------------------------------------------------------------
+// CRUD — brand, plans, posts, formats, avatars, assets
+// ---------------------------------------------------------------------------
+
+export async function getBrandContext(projectId) {
+  return cached(`brand:${projectId}`, TTL_BRAND, async () => {
+    const res = await fetch(
+      `${BASE}/api/content/brand?project_id=${encodeURIComponent(projectId)}`,
+      { headers: backendAuthedHeaders() },
+    );
+    return jsonOrThrow(res);
+  });
+}
+
+export async function putBrandContext(projectId, body) {
+  const res = await fetch(
+    `${BASE}/api/content/brand?project_id=${encodeURIComponent(projectId)}`,
+    {
+      method: "PUT",
+      headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    },
+  );
+  const out = await jsonOrThrow(res);
+  invalidate(`brand:${projectId}`);
+  return out;
+}
+
+export async function listPlans(projectId) {
+  const res = await fetch(
+    `${BASE}/api/content/plans?project_id=${encodeURIComponent(projectId)}`,
+    { headers: backendAuthedHeaders() },
+  );
+  return jsonOrThrow(res);
+}
+
+export async function getPlan(planId) {
+  const res = await fetch(
+    `${BASE}/api/content/plans/${encodeURIComponent(planId)}`,
+    { headers: backendAuthedHeaders() },
+  );
+  return jsonOrThrow(res);
+}
+
+export async function patchPlanDay(planId, day, patch) {
+  const res = await fetch(
+    `${BASE}/api/content/plans/${encodeURIComponent(planId)}/days/${day}`,
+    {
+      method: "PATCH",
+      headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(patch),
+    },
+  );
+  return jsonOrThrow(res);
+}
+
+// A plan the agent submits is a proposal until the person decides on the
+// viewport. Both calls answer for the session the proposal was made in; the
+// backend also echoes the decision as a PLAN_GENERATED event, so the pane
+// updates by itself, but the accept response is the saved plan and callers
+// apply it at once rather than waiting for that echo.
+
+/** Save a proposed plan. Replaces the live plan's future days, keeps its past and drafted ones. */
+export async function acceptPlan(sessionId, proposalId) {
+  const res = await fetch(`${BASE}/api/content/plans/accept`, {
+    method: "POST",
+    headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ session_id: sessionId, proposal_id: proposalId }),
+  });
+  return jsonOrThrow(res);
+}
+
+/** Discard a proposed plan. Nothing already saved changes. */
+export async function rejectPlan(sessionId, proposalId) {
+  const res = await fetch(`${BASE}/api/content/plans/reject`, {
+    method: "POST",
+    headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ session_id: sessionId, proposal_id: proposalId }),
+  });
+  return jsonOrThrow(res);
+}
+
+// Posts + their scheduler-sourced analytics both depend on post state, so any
+// post write clears both. Broad (prefix) invalidation keeps it simple and safe.
+function invalidatePosts() {
+  invalidate("posts:");
+  invalidate("analytics:");
+}
+
+export async function listPosts(projectId, { planId, status } = {}) {
+  return cached(`posts:${projectId}:${planId || ""}:${status || ""}`, TTL_POSTS, async () => {
+    const params = new URLSearchParams({ project_id: projectId });
+    if (planId) params.set("plan_id", planId);
+    if (status) params.set("status", status);
+    const res = await fetch(
+      `${BASE}/api/content/posts?${params.toString()}`,
+      { headers: backendAuthedHeaders() },
+    );
+    return jsonOrThrow(res);
+  });
+}
+
+export async function getPost(postId) {
+  const res = await fetch(
+    `${BASE}/api/content/posts/${encodeURIComponent(postId)}`,
+    { headers: backendAuthedHeaders() },
+  );
+  return jsonOrThrow(res);
+}
+
+export async function patchPost(postId, patch) {
+  const res = await fetch(
+    `${BASE}/api/content/posts/${encodeURIComponent(postId)}`,
+    {
+      method: "PATCH",
+      headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(patch),
+    },
+  );
+  const out = await jsonOrThrow(res);
+  invalidatePosts();
+  return out;
+}
+
+/** Make one of a video post's takes the clip it publishes. Returns the post. */
+export async function selectPostVideo(postId, assetId) {
+  const res = await fetch(
+    `${BASE}/api/content/posts/${encodeURIComponent(postId)}/video/select`,
+    {
+      method: "POST",
+      headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ asset_id: assetId }),
+    },
+  );
+  const out = await jsonOrThrow(res);
+  invalidatePosts();
+  return out;
+}
+
+export async function markPostPosted(postId, { publishedUrl } = {}) {
+  const url = new URL(
+    `${BASE}/api/content/posts/${encodeURIComponent(postId)}/mark-posted`,
+  );
+  if (publishedUrl) url.searchParams.set("published_url", publishedUrl);
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: backendAuthedHeaders(),
+  });
+  const out = await jsonOrThrow(res);
+  invalidatePosts();
+  return out;
+}
+
+/**
+ * The next good time for a post on `channel`, as `{ at, reason, posts, hour }`:
+ * `reason` is SlotReason.HISTORY once the account's own posts with numbers
+ * decide it, else SlotReason.DEFAULT. `tz` is the reader's zone, so the hour
+ * is theirs.
+ */
+export async function getBestSlot(projectId, channel, tz = browserTimeZone()) {
+  const params = new URLSearchParams({ project_id: projectId, channel, tz });
+  const res = await fetch(
+    `${BASE}/api/content/best-slot?${params.toString()}`,
+    { headers: backendAuthedHeaders() },
+  );
+  return jsonOrThrow(res);
+}
+
+/** No to a draft, with the SkipReason that shapes the next one. */
+export async function skipPost(postId, reason) {
+  const res = await fetch(
+    `${BASE}/api/content/posts/${encodeURIComponent(postId)}/skip`,
+    {
+      method: "POST",
+      headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ reason }),
+    },
+  );
+  const out = await jsonOrThrow(res);
+  invalidatePosts();
+  return out;
+}
+
+function browserTimeZone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch {
+    // An engine without Intl zones: the server reads "" as UTC.
+    return "";
+  }
+}
+
+/**
+ * A schedule time as an absolute instant. The picker's value
+ * ("2026-10-02T09:00") has no zone, and the server read it as UTC, so a
+ * post set for 9:00 in Madrid went out at 11:00. JavaScript reads that
+ * shape as the reader's own local time, which is what they picked.
+ */
+export function absoluteTime(value) {
+  if (!value) return value;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? value : d.toISOString();
+}
+
+/**
+ * A moment as the `datetime-local` picker's value, in the reader's zone:
+ * "2026-10-02T09:00". `toISOString` would give UTC, and the picker would show
+ * a time hours off from the one meant.
+ */
+export function localPickerValue(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
+ * POST /api/content/posts/{id}/publish — uploads the post's media to its
+ * scheduler then creates the post there.
+ *
+ * @param postId          Content post UUID
+ * @param socialAccountIds the scheduler's account ids (from listSocialAccounts)
+ * @param publisher       the scheduler holding those accounts (their `publisher`)
+ * @param scheduledAt     the picker's local time (optional; omit to post now)
+ * @param tiktokDraft     true → land as a TikTok draft, false → schedule/post
+ */
+export async function publishPost(postId, { socialAccountIds, publisher, scheduledAt, tiktokDraft = false } = {}) {
+  const res = await fetch(
+    `${BASE}/api/content/posts/${encodeURIComponent(postId)}/publish`,
+    {
+      method: "POST",
+      headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        social_account_ids: socialAccountIds.map(String),
+        ...(publisher ? { publisher } : {}),
+        ...(scheduledAt ? { scheduled_at: absoluteTime(scheduledAt) } : {}),
+        tiktok_draft: tiktokDraft,
+      }),
+    },
+  );
+  const out = await jsonOrThrow(res);
+  invalidatePosts();
+  return out;
+}
+
+export async function syncPostDaily(postId) {
+  const res = await fetch(
+    `${BASE}/api/content/posts/${encodeURIComponent(postId)}/sync-daily`,
+    { method: "POST", headers: backendAuthedHeaders() },
+  );
+  const out = await jsonOrThrow(res);
+  invalidatePosts();
+  return out;
+}
+
+export async function syncPostMetrics(postId) {
+  const res = await fetch(
+    `${BASE}/api/content/posts/${encodeURIComponent(postId)}/sync-metrics`,
+    { method: "POST", headers: backendAuthedHeaders() },
+  );
+  const out = await jsonOrThrow(res);
+  invalidatePosts();
+  return out;
+}
+
+/**
+ * POST /api/content/posts/{id}/metrics — numbers typed in from the platform's
+ * own analytics. `metrics` is `metricChanges()` from lib/contentMetrics: a
+ * number sets a metric, null withdraws one. A later sync never overwrites them.
+ */
+export async function enterPostMetrics(postId, metrics) {
+  const res = await fetch(
+    `${BASE}/api/content/posts/${encodeURIComponent(postId)}/metrics`,
+    {
+      method: "POST",
+      headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(metrics),
+    },
+  );
+  const out = await jsonOrThrow(res);
+  invalidatePosts();
+  return out;
+}
+
+export async function listSocialAccounts(projectId, platform) {
+  const url = new URL(`${BASE}/api/content/social-accounts`);
+  url.searchParams.set("project_id", projectId);
+  if (platform) url.searchParams.set("platform", platform);
+  const res = await fetch(url.toString(), { headers: backendAuthedHeaders() });
+  return jsonOrThrow(res);
+}
+
+/**
+ * The vendors each user brings their own key for: a scheduler to publish
+ * through (PostBridge, Zernio: listPublishers names them) and Apify
+ * (Discover). A project spends its owner's key, so only the owner connects
+ * one. Status is { connected, own_key, is_owner }. A scheduler's id is its
+ * vendor slug here too.
+ */
+export const VENDOR = Object.freeze({ APIFY: "apify" });
+
+// Where a user gets the Apify key; a scheduler's comes with it (dashboard_url).
+export const VENDOR_HOME = Object.freeze({
+  [VENDOR.APIFY]: "https://console.apify.com",
+});
+
+/**
+ * Every scheduler Duct can publish through, and whether this project's owner
+ * connected it: [{ id, label, dashboard_url, reports, connected, own_key,
+ * is_owner }]. Nothing is a default; with none connected nothing publishes.
+ */
+export async function listPublishers(projectId) {
+  const url = new URL(`${BASE}/api/content/publishers`);
+  url.searchParams.set("project_id", projectId);
+  const res = await fetch(url.toString(), { headers: backendAuthedHeaders() });
+  return jsonOrThrow(res);
+}
+
+export async function getVendorKeyStatus(vendor, projectId) {
+  const url = new URL(`${BASE}/api/content/vendor-keys/${vendor}`);
+  url.searchParams.set("project_id", projectId);
+  const res = await fetch(url.toString(), { headers: backendAuthedHeaders() });
+  return jsonOrThrow(res);
+}
+
+/** Save the caller's key for `vendor`. The server keeps it only once the vendor accepts it. */
+export async function connectVendorKey(vendor, apiKey) {
+  const res = await fetch(`${BASE}/api/content/vendor-keys/${vendor}`, {
+    method: "PUT",
+    headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ api_key: apiKey }),
+  });
+  return jsonOrThrow(res);
+}
+
+export async function disconnectVendorKey(vendor) {
+  const res = await fetch(`${BASE}/api/content/vendor-keys/${vendor}`, {
+    method: "DELETE",
+    headers: backendAuthedHeaders(),
+  });
+  return jsonOrThrow(res);
+}
+
+/**
+ * Per-post analytics for the project's linked accounts, pulled live from every
+ * connected scheduler. Pass { refresh: true } to ask them to sync first.
+ */
+export async function getContentAnalytics(projectId, { refresh = false } = {}) {
+  const fetchIt = async () => {
+    const url = new URL(`${BASE}/api/content/analytics`);
+    url.searchParams.set("project_id", projectId);
+    if (refresh) url.searchParams.set("refresh", "true");
+    const res = await fetch(url.toString(), { headers: backendAuthedHeaders() });
+    return jsonOrThrow(res);
+  };
+  // Explicit refresh drops the cache first, then fetches live + repopulates.
+  if (refresh) invalidate(`analytics:${projectId}`);
+  return cached(`analytics:${projectId}`, TTL_ANALYTICS, fetchIt);
+}
+
+/** The social accounts this project has linked (persisted selection). */
+export async function listLinkedAccounts(projectId) {
+  const url = new URL(`${BASE}/api/content/linked-accounts`);
+  url.searchParams.set("project_id", projectId);
+  const res = await fetch(url.toString(), { headers: backendAuthedHeaders() });
+  return jsonOrThrow(res);
+}
+
+/**
+ * Replace the project's linked-account set.
+ * accounts: [{ account_id: number, platform: string, username: string }]
+ */
+export async function saveLinkedAccounts(projectId, accounts) {
+  const res = await fetch(`${BASE}/api/content/linked-accounts`, {
+    method: "PUT",
+    headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ project_id: projectId, accounts }),
+  });
+  const out = await jsonOrThrow(res);
+  // Analytics is scoped to linked platforms — changing the set changes it.
+  invalidate(`analytics:${projectId}`);
+  return out;
+}
+
+/**
+ * The channels this project posts on: every one Duct offers, with the
+ * project's choice and words for each, the guide the agent is given and the
+ * linked scheduler accounts on it. `{ primary_publisher, chosen, channels: [{
+ * id, label, enabled, supported, long_form, profile: { enabled, username,
+ * display_name, bio, notes, target_media }, guide, accounts }] }`.
+ */
+export async function getChannels(projectId) {
+  const url = new URL(`${BASE}/api/content/channels`);
+  url.searchParams.set("project_id", projectId);
+  const res = await fetch(url.toString(), { headers: backendAuthedHeaders() });
+  return jsonOrThrow(res);
+}
+
+/** Replace the project's channel choices. `channels` is `{ [platform]: profile }`. */
+export async function saveChannels(projectId, { primaryPublisher = "", channels = {} } = {}) {
+  const res = await fetch(`${BASE}/api/content/channels`, {
+    method: "PUT",
+    headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ project_id: projectId, primary_publisher: primaryPublisher, channels }),
+  });
+  return jsonOrThrow(res);
+}
+
+/** GET /api/content/styles — shared, read-only style registry (base_css + styles[]). */
+export async function listStyles() {
+  return cached("styles:global", TTL_FORMATS, async () => {
+    const res = await fetch(`${BASE}/api/content/styles`, { headers: backendAuthedHeaders() });
+    return jsonOrThrow(res);
+  });
+}
+
+export async function listFormats(projectId) {
+  return cached(`formats:${projectId}`, TTL_FORMATS, async () => {
+    const res = await fetch(
+      `${BASE}/api/content/formats?project_id=${encodeURIComponent(projectId)}`,
+      { headers: backendAuthedHeaders() },
+    );
+    return jsonOrThrow(res);
+  });
+}
+
+/**
+ * POST /api/content/formats — create or update (idempotent on project_id+slug).
+ * body = { projectId, slug, name, data }
+ */
+export async function upsertFormat({ projectId, slug, name = "", data = {} }) {
+  const res = await fetch(`${BASE}/api/content/formats`, {
+    method: "POST",
+    headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ project_id: projectId, slug, name, data }),
+  });
+  const out = await jsonOrThrow(res);
+  invalidateFormats();
+  return out;
+}
+
+/** PATCH /api/content/formats/{id} — full FormatIn body required by the backend. */
+export async function patchFormat(formatId, { projectId, slug, name = "", data = {} }) {
+  const res = await fetch(`${BASE}/api/content/formats/${formatId}`, {
+    method: "PATCH",
+    headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ project_id: projectId, slug, name, data }),
+  });
+  const out = await jsonOrThrow(res);
+  invalidateFormats();
+  return out;
+}
+
+/** DELETE /api/content/formats/{id} */
+export async function deleteFormat(formatId) {
+  const res = await fetch(`${BASE}/api/content/formats/${formatId}`, {
+    method: "DELETE",
+    headers: backendAuthedHeaders(),
+  });
+  const out = await jsonOrThrow(res);
+  invalidateFormats();
+  return out;
+}
+
+// A format edit changes the format name posts render, so clear posts too.
+function invalidateFormats() {
+  invalidate("formats:");
+  invalidate("posts:");
+}
+
+export async function listAvatars(projectId) {
+  const res = await fetch(
+    `${BASE}/api/content/avatars?project_id=${encodeURIComponent(projectId)}`,
+    { headers: backendAuthedHeaders() },
+  );
+  return jsonOrThrow(res);
+}
+
+export async function listAssets(projectId, { assetType, postId } = {}) {
+  const params = new URLSearchParams({ project_id: projectId });
+  if (assetType) params.set("asset_type", assetType);
+  if (postId)    params.set("post_id", postId);
+  const res = await fetch(
+    `${BASE}/api/content/assets?${params.toString()}`,
+    { headers: backendAuthedHeaders() },
+  );
+  return jsonOrThrow(res);
+}
+
+export async function uploadAsset(projectId, assetType, file) {
+  const form = new FormData();
+  form.append("project_id", projectId);
+  form.append("asset_type", assetType);
+  form.append("file", file);
+  const res = await fetch(`${BASE}/api/content/uploads`, {
+    method: "POST",
+    headers: backendAuthedHeaders(),  // do NOT set Content-Type — browser adds boundary
+    body: form,
+  });
+  return jsonOrThrow(res);
+}
+
+
+// ---------------------------------------------------------------------------
+// Discovery (Apify TikTok scraper)
+// ---------------------------------------------------------------------------
+
+export async function startDiscoverRun({ projectId, actorId, inputPayload }) {
+  const res = await fetch(`${BASE}/api/content/discover/start`, {
+    method: "POST",
+    headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      project_id:    projectId,
+      actor_id:      actorId,
+      input_payload: inputPayload || {},
+    }),
+  });
+  return jsonOrThrow(res);
+}
+
+// Status and results read the run on the project owner's Apify key, so both
+// name the project.
+export async function getDiscoverRunStatus(runId, projectId) {
+  const url = new URL(`${BASE}/api/content/discover/status/${encodeURIComponent(runId)}`);
+  url.searchParams.set("project_id", projectId);
+  const res = await fetch(url.toString(), { headers: backendAuthedHeaders() });
+  return jsonOrThrow(res);
+}
+
+export async function getDiscoverResults(datasetId, projectId, limit = 200) {
+  const url = new URL(`${BASE}/api/content/discover/results/${encodeURIComponent(datasetId)}`);
+  url.searchParams.set("project_id", projectId);
+  url.searchParams.set("limit", String(limit));
+  const res = await fetch(url.toString(), { headers: backendAuthedHeaders() });
+  return jsonOrThrow(res);
+}
+
+/**
+ * Ask the backend to copy the pictures of saved references that lack them.
+ * Optional by design: nothing on screen waits for it, so any failure (offline,
+ * signed out, backend without the route) degrades to null instead of throwing.
+ */
+export async function recaptureReferenceMedia(projectId) {
+  try {
+    const res = await fetch(`${BASE}/api/content/discover/recapture`, {
+      method: "POST",
+      headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ project_id: projectId }),
+    });
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveDiscoveredReference({ projectId, actorId, runId, datasetId, request, post }) {
+  const res = await fetch(`${BASE}/api/content/discover/save`, {
+    method: "POST",
+    headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      project_id: projectId,
+      actor_id:   actorId,
+      run_id:     runId,
+      dataset_id: datasetId,
+      request:    request || {},
+      post,
+    }),
+  });
+  return jsonOrThrow(res);
+}
+
+// ---------------------------------------------------------------------------
+// The Analytics tab's report — the insights agent over the project's sources,
+// stored for a day (backend/routes/content_reports.py)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the tab needs in one read: the templates, the sources that can feed
+ * the chosen one, the latest stored report (flagged stale after a day), and
+ * whether a run is writing a new one. Never starts a run.
+ */
+export async function getAnalyticsReport(projectId, { template = "" } = {}) {
+  const url = new URL(`${BASE}/api/content/analytics/report`);
+  url.searchParams.set("project_id", projectId);
+  if (template) url.searchParams.set("template", template);
+  const res = await fetch(url.toString(), { headers: backendAuthedHeaders() });
+  return jsonOrThrow(res);
+}
+
+/**
+ * Start writing the report on the sources ticked (every ready one when the
+ * list is empty). Answers with the same shape as the read, `generating`
+ * true; a second call while it runs joins that run rather than paying for
+ * another. A 402 means no provider key — the Providers dialog's job.
+ */
+export async function generateAnalyticsReport(projectId, { template = "", sources = [] } = {}) {
+  const res = await fetch(`${BASE}/api/content/analytics/report`, {
+    method: "POST",
+    headers: { ...backendAuthedHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: projectId, template, sources }),
+  });
+  return jsonOrThrow(res);
+}

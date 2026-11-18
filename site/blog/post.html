@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<link rel="icon" href="../assets/icon.svg" type="image/svg+xml"/>
+<link rel="apple-touch-icon" href="../assets/apple-icon.svg"/>
+<title>Redirecting — Duct Blog</title>
+<!--
+  Compatibility shim. Posts used to render here in the browser from Markdown,
+  which meant a crawler that does not run JavaScript received 49 characters of
+  body text and a canonical of /blog/post shared by every post. Posts are now
+  pre-rendered to /blog/<slug> by scripts/build_blog.py.
+
+  This file stays only so links published before the change keep working. It is
+  noindex on purpose: the static page is the one that should rank, and the
+  sitemap points there. For a true 301 instead of this client-side hop, add a
+  redirect rule for /blog/post?slug=* in the Cloudflare dashboard.
+-->
+<link rel="canonical" href="https://getduct.ai/blog/"/>
+<meta name="description" content="This post has moved. Redirecting to the Duct blog."/>
+<meta name="robots" content="noindex, follow"/>
+<meta property="og:type" content="website"/>
+<meta property="og:url" content="https://getduct.ai/blog/"/>
+<meta property="og:title" content="Duct Blog"/>
+<meta property="og:description" content="This post has moved. Redirecting to the Duct blog."/>
+<meta property="og:image" content="https://getduct.ai/assets/og/blog.jpg"/>
+<meta property="og:image:width" content="1200"/>
+<meta property="og:image:height" content="630"/>
+<meta property="og:site_name" content="Duct"/>
+<meta name="twitter:card" content="summary_large_image"/>
+<meta name="twitter:title" content="Duct Blog"/>
+<meta name="twitter:description" content="This post has moved. Redirecting to the Duct blog."/>
+<meta name="twitter:image" content="https://getduct.ai/assets/og/blog.jpg"/>
+<link rel="alternate" type="application/rss+xml" title="Duct Blog" href="/blog/feed.xml"/>
+<link rel="stylesheet" href="../assets/duct.css"/>
+<script src="../assets/config.js" defer></script>
+</head>
+<body>
+
+<main id="main-content" style="max-width:640px;margin:0 auto;padding:160px 24px;text-align:center">
+  <h1 style="font-family:var(--serif);font-size:32px;color:var(--navy);margin-bottom:16px">This post has moved</h1>
+  <p style="font-size:16px;font-weight:300;color:var(--navy-3);line-height:1.7">
+    Posts now live at <code>/blog/&lt;slug&gt;</code>.
+    <a id="target" href="/blog/" style="color:var(--orange)">Continue to the blog →</a>
+  </p>
+</main>
+
+<script src="../assets/duct.js" defer></script>
+<script src="../assets/duct-download.js" defer></script>
+<script>
+(function () {
+  // The slug is matched against a known list rather than interpolated, so a
+  // crafted ?slug= cannot point this link somewhere off-site.
+  var KNOWN = [
+    'why-your-seo-metrics-arent-telling-you-the-full-story',
+    'keyword-gap-analysis-without-a-spreadsheet'
+  ];
+  var slug = new URLSearchParams(window.location.search).get('slug');
+  var target = KNOWN.indexOf(slug) !== -1 ? '/blog/' + slug : '/blog/';
+  document.getElementById('target').href = target;
+  window.location.replace(target);
+})();
+</script>
+
+</body>
+</html>

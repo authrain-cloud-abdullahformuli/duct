@@ -1,0 +1,923 @@
+"use client";
+
+/**
+ * AgentChat — the left pane of every agent workspace.
+ *
+ * One transcript for three agents. It used to be two forks (AuditChat and
+ * ContentChat) that had drifted a few hundred lines apart while rendering the
+ * same thing, and a third, thinner one inside the insights workspace that had
+ * none of the fixes the first two had accumulated. What differs per agent is
+ * copy and a few slots; what is the same — phase header, todo strip, step
+ * ladder, bubbles, thinking, the pause card, send errors, reconnecting,
+ * failure, scroll behaviour, the composer — is here once.
+ *
+ * Feed it the state from `useAgentSession` and the actions it returns. The
+ * message rows are the shapes lib/agentSession.js produces (see `Row`).
+ *
+ * Slots:
+ *   renderSteps(steps)  — a richer step ladder (audit has per-step detail
+ *                         panels); default is the plain StepProgress.
+ *   headerExtra         — right-aligned header content.
+ *   footer              — rendered between the transcript and the composer.
+ *   readyHint           — shown once READY with an empty transcript.
+ */
+
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
+import { ArrowDownRight, Brain, Check, ChevronDown, ChevronRight, Copy } from "lucide-react";
+import { msg } from "@lingui/core/macro";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { Spinner } from "@/components/ui/spinner";
+import { Lightbox } from "@/components/ui/lightbox";
+import ChangeSetCard from "@/components/execution/ChangeSetCard";
+import { Phase } from "../../lib/agentPhase";
+import { StepStatus } from "../../lib/agentSteps";
+import { ErrorAction, Notice, Row, errorAction, errorText } from "../../lib/agentSession";
+import { compactNumber, formatDate, formatElapsed, formatTime, relativeTime } from "../../lib/format";
+import { useElapsed } from "../../hooks/useElapsed";
+import { groupActivityRows } from "../../lib/toolActivity";
+import { Button } from "@/components/ui/button";
+import { AttachmentStrip } from "./Attachments";
+import { AssistantMarkdown, ThinkingMarkdown } from "./ChatMarkdown";
+import ChatInput from "./ChatInput";
+import ContextRing from "./ContextRing";
+import { TIERS } from "@/lib/modelTiers";
+import { ActivityGroup } from "./ActivityRow";
+import { MemoryNote, MemoryRecall } from "./MemoryRows";
+import PauseCard from "./PauseCard";
+import StepProgress from "./StepProgress";
+import Todos from "./Todos";
+
+// ---------------------------------------------------------------------------
+// Rows
+// ---------------------------------------------------------------------------
+
+/** A turn that failed, or a message that never got out. `content` is set only
+ *  for the latter — it is what a retry resends. A failure whose code says a
+ *  retry cannot help (a rejected key, a full context) gets no retry button;
+ *  one whose code names where the fix lives gets the link there instead —
+ *  the same action the terminal failure card offers, so a failure reads the
+ *  same live and after a reload. */
+function SendErrorBubble({ text, content, code = "", onRetry, retryable = true }) {
+  const { i18n } = useLingui();
+  const action = code ? errorAction(code) : ErrorAction.RETRY;
+  const link = "block w-full text-xs text-right text-muted-foreground hover:text-foreground transition-colors pr-1";
+  return (
+    <div className="flex justify-end mb-2">
+      <div className="max-w-[85%] space-y-1">
+        <div className="rounded-2xl rounded-br-sm px-3 py-2 text-sm bg-destructive/10 border border-destructive/30 text-destructive">
+          <p className="text-xs font-medium mb-0.5">{content ? <Trans>Failed to send</Trans> : <Trans>That turn failed</Trans>}</p>
+          <p className="text-xs text-destructive/80">{errorText(i18n, text)}</p>
+        </div>
+        {action === ErrorAction.SETTINGS && <Link href="/settings/models" className={link}><Trans>Open model settings →</Trans></Link>}
+        {action === ErrorAction.CONNECTIONS && <Link href="/connections" className={link}><Trans>Open the Toolbox →</Trans></Link>}
+        {action === ErrorAction.RETRY && content && onRetry && retryable && (
+          <button type="button" onClick={() => onRetry(content)} className={link}>
+            <Trans>↺ Retry</Trans>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** A clock that ticks only while something is being timed. */
+function useNow(active) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return undefined;
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+  return now;
+}
+
+/**
+ * The reasoning, folded, with how long it took on the fold.
+ *
+ * "Thought for 6s" is measured on this client between the first reasoning
+ * token and the first token of prose — a number the reader can trust rather
+ * than a token count the client would have to estimate. While it runs the
+ * clock ticks; a row rebuilt from history has no clock and says "Reasoning".
+ * The text stays behind the fold either way: reasoning is there to be
+ * checked, not read by default.
+ */
+function ThinkingBlock({ thinking, streaming, startedAt, endedAt }) {
+  const [expanded, setExpanded] = useState(false);
+  const now = useNow(Boolean(streaming && startedAt && !endedAt));
+  if (!thinking) return null;
+  const seconds = startedAt ? Math.max(0, Math.round(((endedAt || now) - startedAt) / 1000)) : null;
+  const running = streaming && !endedAt;
+  return (
+    <div className="mb-2">
+      <button
+        type="button"
+        onClick={() => setExpanded((x) => !x)}
+        aria-expanded={expanded}
+        className="flex items-center gap-1.5 rounded-md py-0.5 pr-2 text-xs text-muted-foreground transition-colors hover:text-foreground"
+      >
+        {running && <Spinner className="size-3" />}
+        <span>
+          {running ? (
+            seconds !== null ? <Trans>Thinking · {seconds}s</Trans> : <Trans>Thinking…</Trans>
+          ) : seconds ? (
+            <Trans>Thought for {seconds}s</Trans>
+          ) : (
+            <Trans>Reasoning</Trans>
+          )}
+        </span>
+        <ChevronRight
+          className={`size-3 transition-transform ${expanded ? "rotate-90" : ""}`}
+          aria-hidden="true"
+        />
+      </button>
+      {expanded && (
+        <div className="mt-1.5 rounded-lg px-3.5 py-3 bg-muted/40 border border-border/40">
+          <ThinkingMarkdown source={thinking} />
+          {running && <span className="inline-block w-0.5 h-3 bg-muted-foreground/60 ml-0.5 animate-pulse align-middle" />}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// What the agent is doing when nothing more specific is known. Rotated, so a
+// long wait reads as work rather than a hang; generic on purpose, because a
+// verb that names a step the run is not on would be a lie the reader can
+// catch. When a step *is* running its own label takes the slot.
+const WORKING_WORDS = [
+  msg`Thinking`,
+  msg`Reading`,
+  msg`Working it through`,
+  msg`Checking the numbers`,
+  msg`Putting it together`,
+];
+const WORKING_WORD_MS = 2400;
+
+/**
+ * The wait, said in words: the house spinner and a phrase that moves.
+ *
+ * Replaces the three bouncing dots, which said only "something, eventually"
+ * and made the same wait feel longer. The phrase is the running step's label
+ * when there is one (the ladder already knows), "Compacting context" or
+ * "Reconnecting" when the harness is doing that, and otherwise one of the
+ * generic verbs, changed every couple of seconds — held still for a reader
+ * who asked for reduced motion.
+ */
+export function WorkingIndicator({ label = "" }) {
+  const { i18n } = useLingui();
+  const [index, setIndex] = useState(0);
+  const [still, setStill] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return undefined;
+    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
+    setStill(query.matches);
+    const onChange = (e) => setStill(e.matches);
+    query.addEventListener?.("change", onChange);
+    return () => query.removeEventListener?.("change", onChange);
+  }, []);
+  useEffect(() => {
+    if (label || still) return undefined;
+    const id = setInterval(() => setIndex((i) => (i + 1) % WORKING_WORDS.length), WORKING_WORD_MS);
+    return () => clearInterval(id);
+  }, [label, still]);
+  const word = label || i18n._(WORKING_WORDS[still ? 0 : index]);
+  return (
+    <div className="mb-2 flex items-center gap-2 py-1 text-xs text-muted-foreground" aria-hidden="true">
+      <Spinner className="size-3" />
+      {/* Keyed so the phrase fades in as it changes rather than snapping. */}
+      <span key={word} className="animate-in fade-in-0 duration-300">{word}…</span>
+    </div>
+  );
+}
+
+// A user message longer than this folds: the transcript is for reading the
+// reply, and a pasted page of context should not push it off the screen.
+const LONG_TEXT_CHARS = 1200;
+const LONG_TEXT_LINES = 12;
+
+function isLongText(text = "") {
+  return text.length > LONG_TEXT_CHARS || text.split("\n").length > LONG_TEXT_LINES;
+}
+
+/** The person's own words, folded past a screen's worth with a way to open
+ *  them — the whole text stays in the DOM, so find-in-page still finds it. */
+function UserText({ text }) {
+  const [expanded, setExpanded] = useState(false);
+  const long = isLongText(text);
+  return (
+    <>
+      <p className={`whitespace-pre-wrap break-words ${long && !expanded ? "line-clamp-[12]" : ""}`}>{text}</p>
+      {long && (
+        <button
+          type="button"
+          onClick={() => setExpanded((x) => !x)}
+          aria-expanded={expanded}
+          className="mt-1.5 inline-flex items-center gap-1 text-xs text-primary-foreground/80 underline-offset-2 hover:underline"
+        >
+          {expanded ? <Trans>Show less</Trans> : <Trans>Show more</Trans>}
+          <ChevronDown className={`size-3 transition-transform ${expanded ? "rotate-180" : ""}`} aria-hidden="true" />
+        </button>
+      )}
+    </>
+  );
+}
+
+/**
+ * The line under a bubble that appears on hover: when it was sent, as
+ * "5 min ago" with the full date and time behind it, and for a reply the
+ * one action worth having there, copy. Always visible where there is no
+ * hover to reveal it (touch), because a control that cannot be reached is
+ * not a control.
+ */
+function RowMeta({ at, copyText = "", align = "start" }) {
+  const { t } = useLingui();
+  const [copied, setCopied] = useState(false);
+  // "5 min ago" is measured against this browser's clock, so it is drawn
+  // only once there is one — a server render has a different now, and the
+  // mismatch would make React throw the row away and draw it again.
+  const [now, setNow] = useState(null);
+  useEffect(() => setNow(Date.now()), []);
+  if (!at && !copyText) return null;
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(copyText);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // The clipboard can refuse (an insecure context, a denied permission);
+      // the button just stays as it was.
+    }
+  }
+  const date = at ? new Date(at) : null;
+  return (
+    <div
+      className={`flex items-center gap-1 text-2xs text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100 ${
+        align === "end" ? "justify-end pr-1" : "pl-0.5"
+      }`}
+    >
+      {copyText && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          onClick={copy}
+          aria-label={copied ? t`Copied` : t`Copy response`}
+          title={copied ? t`Copied` : t`Copy response`}
+          className="text-muted-foreground hover:text-foreground"
+        >
+          {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+        </Button>
+      )}
+      {date && now && (
+        <time dateTime={date.toISOString()} title={`${formatDate(date)} · ${formatTime(date)}`}>
+          {relativeTime(date, { fallbackAfterDays: 7 })}
+        </time>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Two registers, not two bubbles. The person's message is a bubble on the
+ * right — it is the one thing in the transcript that came from outside the
+ * run, and the shape says so. The reply is prose on the page: a grey box
+ * around every paragraph of a long answer was chrome around the content,
+ * and the reader's eye had to cross it on every row.
+ */
+function ChatBubble({ role, text, thinking, streaming, queued = false, attachments = [], at, thinkingStartedAt, thinkingEndedAt }) {
+  const { t } = useLingui();
+  if (role === Row.USER) {
+    return (
+      <div className="group flex justify-end mb-4">
+        <div className="max-w-[82%] min-w-0">
+          <AttachmentStrip attachments={attachments} className="justify-end px-0 pb-1.5" />
+          {text && (
+            <div
+              className={`rounded-2xl rounded-br-sm px-4 py-2.5 text-sm leading-relaxed wrap-break-word bg-primary text-primary-foreground ${
+                queued ? "opacity-70" : ""
+              }`}
+            >
+              <UserText text={text} />
+            </div>
+          )}
+          {queued ? (
+            <p className="mt-1 pr-1 text-right text-2xs text-muted-foreground" title={t`Sent while the agent was busy; it reads this at its next step.`}>
+              <Trans>↳ Queued · picked up at the next step</Trans>
+            </p>
+          ) : (
+            <RowMeta at={at} align="end" />
+          )}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="group flex justify-start mb-4">
+      <div className="w-full min-w-0 space-y-1">
+        <ThinkingBlock
+          thinking={thinking}
+          streaming={streaming && !text}
+          startedAt={thinkingStartedAt}
+          endedAt={thinkingEndedAt}
+        />
+        {text && (
+          <div className="text-sm leading-relaxed text-foreground wrap-break-word">
+            <AssistantMarkdown source={text} streaming={streaming} />
+            {streaming && <span className="inline-block w-0.5 h-3.5 bg-current ml-0.5 animate-pulse align-middle" />}
+          </div>
+        )}
+        {text && !streaming && <RowMeta at={at} copyText={text} />}
+      </div>
+    </div>
+  );
+}
+
+/** A generated image in the transcript: the inline data URI for an instant
+ * thumbnail, the full-res URL in a lightbox on click. */
+function ImageBubble({ image, fullUrl, caption }) {
+  const { t } = useLingui();
+  const [open, setOpen] = useState(false);
+  const thumb = image || fullUrl;
+  const full = fullUrl || image;
+  if (!thumb) return null;
+  const alt = caption || t`Generated image`;
+  return (
+    <div className="flex justify-start mb-4">
+      <div className="max-w-[82%] space-y-1">
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          title={t`View full screen`}
+          className="block overflow-hidden rounded-2xl rounded-bl-sm border border-border/60 bg-muted/40 transition-opacity hover:opacity-95"
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={thumb} alt={alt} loading="lazy" className="block w-44 max-w-full object-cover" />
+        </button>
+        {caption && <p className="pl-1 text-2xs text-muted-foreground">{caption}</p>}
+      </div>
+      <Lightbox open={open} onOpenChange={setOpen} src={full} alt={alt} />
+    </div>
+  );
+}
+
+/** Compact chip for an artifact the agent just created or revised — opens the
+ * artifact viewer. The "card-in-stream" convention. */
+function ArtifactCard({ artifact }) {
+  if (!artifact) return null;
+  return (
+    <a
+      href={`/artifacts/${artifact.artifact_id}`}
+      target="_blank"
+      rel="noreferrer"
+      className="flex items-center gap-2.5 my-1.5 px-3 py-2 rounded-lg border border-input bg-muted/30 hover:bg-muted/60 transition-colors max-w-md no-underline"
+    >
+      <span aria-hidden="true" className="text-base">📄</span>
+      <span className="min-w-0">
+        <span className="block text-sm font-medium truncate">{artifact.title || artifact.slug}</span>
+        <span className="block text-xs text-muted-foreground truncate">
+          {artifact.kind} · v{artifact.version}
+          {artifact.label ? ` — ${artifact.label}` : ""}
+        </span>
+      </span>
+    </a>
+  );
+}
+
+// Exported for the preview's answer scenes, which show a question, the steps
+// and the answer without the workspace around them. The chat itself is the
+// only other caller.
+//
+// Memoised because the pane re-renders on every streamed token and every tick
+// of the status clock, and a settled reply re-parsed its markdown each time:
+// the cost of one token grew with the length of the thread. The reducer keeps
+// an unchanged row's object as it was, so only the streaming tail redraws.
+export const TranscriptRow = memo(function TranscriptRow({ msg, onRetrySend }) {
+  switch (msg.role) {
+    case Row.SEND_ERROR:
+      return <SendErrorBubble text={msg.text} content={msg.content} code={msg.code} onRetry={onRetrySend} retryable={msg.retryable} />;
+    case Row.IMAGE:
+      return <ImageBubble image={msg.image} fullUrl={msg.fullUrl} caption={msg.caption} />;
+    case Row.ARTIFACT_CARD:
+      return <ArtifactCard artifact={msg.artifact} />;
+    case Row.CHANGE_SET_CARD:
+      return <ChangeSetCard changeSet={msg.changeSet} />;
+    case Row.ACTIVITY:
+      // A single row reaching here is one the grouping pass did not fold —
+      // a preview scene, or a row between two bubbles.
+      return <ActivityGroup activities={[msg.activity]} />;
+    case Row.MEMORY_NOTE:
+      return <MemoryNote memories={msg.memories} />;
+    case Row.MEMORY_RECALL:
+      return <MemoryRecall memories={msg.memories} />;
+    case Row.NOTICE:
+      return <NoticeRow msg={msg} />;
+    default:
+      return (
+        <ChatBubble
+          role={msg.role}
+          text={msg.text}
+          thinking={msg.thinking}
+          streaming={msg.streaming}
+          queued={Boolean(msg.queued)}
+          attachments={msg.attachments}
+          at={msg.at}
+          thinkingStartedAt={msg.thinkingStartedAt}
+          thinkingEndedAt={msg.thinkingEndedAt}
+        />
+      );
+  }
+});
+
+/** The one thing worth offering under a terminal failure, decided by its
+ *  ErrorCode: a retry only when a retry can work, otherwise the place the fix
+ *  lives. A failure with no code is treated as retryable, which is what every
+ *  failure was before codes existed. */
+function FailedAction({ action, retryable, onRetry, retryLabel, onStartFresh }) {
+  const button = "mt-3 w-full rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs font-medium text-destructive hover:bg-destructive/20 transition-colors text-center";
+  switch (action) {
+    case ErrorAction.SETTINGS:
+      return <Link href="/settings/models" className={button}><Trans>Open model settings</Trans></Link>;
+    case ErrorAction.CONNECTIONS:
+      return <Link href="/connections" className={button}><Trans>Open the Toolbox</Trans></Link>;
+    case ErrorAction.FRESH:
+      if (onStartFresh) return <button type="button" onClick={onStartFresh} className={button}><Trans>Start a fresh conversation</Trans></button>;
+      return null;
+    case ErrorAction.NONE:
+      return null;
+    default:
+      if (!onRetry || !retryable) return null;
+      return <button type="button" onClick={onRetry} className={button}>{retryLabel}</button>;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Header status
+// ---------------------------------------------------------------------------
+
+/**
+ * A quiet line across the transcript. A plain notice is a centred sentence;
+ * a compaction or a model switch is a divider, because it is a fact about
+ * everything after it, not a message in the flow.
+ */
+function NoticeRow({ msg: row }) {
+  const { t, i18n } = useLingui();
+  if (row.kind === Notice.COMPACTED) {
+    const freed = row.before != null && row.after != null ? Math.max(0, row.before - row.after) : null;
+    return (
+      <CompactedDivider
+        label={
+          freed !== null
+            ? t`Compacted · ${compactNumber(freed)} tokens freed`
+            : t`Compacted · older history summarised to make room`
+        }
+        summary={row.summary}
+      />
+    );
+  }
+  if (row.kind === Notice.MODEL) {
+    return <Divider label={t`Switched to ${row.label}`} />;
+  }
+  return (
+    <p className="my-3 text-center text-2xs text-muted-foreground" role="note">
+      {errorText(i18n, row.text)}
+    </p>
+  );
+}
+
+/** The label of the step in progress, or "" when none is — the ladder's own
+ *  words, so the indicator and the status row never disagree. */
+function runningStepLabel(steps, labels = {}) {
+  const step = (steps || []).find((s) => s.status === StepStatus.RUNNING && !s.step_id?.startsWith("dispatch_subagent:"));
+  return step ? step.label || labels[step.step_id] || "" : "";
+}
+
+function Divider({ label, children, className = "my-4" }) {
+  return (
+    <div className={`${className} flex items-center gap-3 text-2xs text-muted-foreground`} role="note">
+      <span className="h-px flex-1 bg-border" aria-hidden="true" />
+      {children || <span className="shrink-0">{label}</span>}
+      <span className="h-px flex-1 bg-border" aria-hidden="true" />
+    </div>
+  );
+}
+
+/**
+ * The compaction rule, with the summary the thread now opens with behind
+ * it. Folded by default — the summary is a page of the model's own notes,
+ * and the reader came for the conversation — and set in italic when open,
+ * so it never reads as something the agent said to them.
+ */
+function CompactedDivider({ label, summary = "" }) {
+  const [open, setOpen] = useState(false);
+  if (!summary) return <Divider label={label} />;
+  return (
+    <div className="my-4">
+      <Divider className="my-0">
+        <button
+          type="button"
+          onClick={() => setOpen((x) => !x)}
+          aria-expanded={open}
+          className="inline-flex shrink-0 items-center gap-1 rounded-md py-1 text-2xs text-muted-foreground transition-colors hover:text-foreground"
+        >
+          {label}
+          <ChevronDown className={`size-3 transition-transform ${open ? "rotate-180" : ""}`} aria-hidden="true" />
+        </button>
+      </Divider>
+      {open && (
+        <div className="-mt-1 border-l-2 border-border pl-3 text-sm italic text-muted-foreground">
+          <ThinkingMarkdown source={summary} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+const PHASE_STATUS = {
+  [Phase.STARTING]:  { label: msg`Connecting…`,     pulse: true },
+  [Phase.PIPELINE]:  { label: msg`Working…`,        pulse: true },
+  [Phase.QUESTIONS]: { label: msg`Waiting for you`, pulse: false },
+  [Phase.READY]:     { label: msg`Ready`,           pulse: false },
+  [Phase.CHATTING]:  { label: msg`Thinking…`,       pulse: true },
+  [Phase.FAILED]:    { label: msg`Failed`,          pulse: false },
+};
+
+// ---------------------------------------------------------------------------
+// The pane
+// ---------------------------------------------------------------------------
+
+/**
+ * "Standard", not "standard" — and never a model id.
+ *
+ * The chip is about which of the user's own three choices ran, so it uses the
+ * word the settings page uses. `modelTiers.TIERS` is that one source; an
+ * unrecognised key falls back to itself rather than to a wrong label, because
+ * a chip that confidently names the wrong tier is worse than a scruffy one.
+ */
+function tierLabel(key, i18n) {
+  return TIERS.find((tier) => tier.key === key)?.label || key || i18n._(msg`a fallback model`);
+}
+
+export default function AgentChat({
+  title,
+  phase,
+  steps = [],
+  todos = [],
+  messages = [],
+  pending = null,
+  errorMsg = "",
+  // The failure's ErrorCode and whether a retry can help (lib/agentEvents.js).
+  errorCode = "",
+  errorRetryable = true,
+  // A model call being waited out: { attempt, max }. Shown in the status row.
+  retrying = null,
+  // The run is not on the tier its owner picked, because that tier's provider
+  // is out of quota: { ran, requested, detail, until }. A persistent chip, not
+  // part of `activity` — a step-down is true for the whole run and for what it
+  // produced, so it must not flicker away on the next token the way a retry does.
+  tierStepDown = null,
+  draft = null,
+  // The shell's session key: where ChatInput keeps the unsent text, so a
+  // reload of this thread finds this thread's draft.
+  draftKey = "",
+  // Tokens (lib/agentSession.js `usage`): the ring in the composer, the figures
+  // in its tooltip. Null until the first model call has been billed.
+  usage = null,
+  // History is being summarised to make room — the status row says so.
+  compacting = false,
+  isAgentTyping = false,
+  isStreaming = false,
+  reconnecting = false,
+  inputDisabled = false,
+  // The pause card can be on screen before the session it answers to exists
+  // (restored from the thread's state on open); keep its buttons off until then.
+  answerDisabled = false,
+  // Memory is off for this run — the header says so, quietly.
+  remembering = true,
+  onAnswer,
+  onSendMessage,
+  onRetrySend,
+  onRetry,
+  onStop,
+  onStartFresh,
+  canStartFresh = false,
+  renderSteps,
+  stepLabels,
+  questionsCopy,
+  // Onboarding only: what a guest's connector prompt needs to route through
+  // sign-in instead (see PauseCard). Null everywhere else.
+  signInToConnect = null,
+  // Where a connect started from a pause card should land once the OAuth
+  // round trip is done — this conversation, not the Connections page. Empty
+  // means the connector flow's own default.
+  connectReturnTo = "",
+  // The shell's own controls in the composer's footer: `composerTools` on
+  // the left beside attach (ComposerDials for insights), `composerAside` on
+  // the right before the ring and Send (TierDial). Null for a shell with
+  // neither.
+  composerTools = null,
+  composerAside = null,
+  inputPlaceholder,
+  inputAriaLabel,
+  inputAccept,
+  startingLabel,
+  failedTitle,
+  retryLabel,
+  readyHint = null,
+  headerExtra = null,
+  footer = null,
+}) {
+  const { t, i18n } = useLingui();
+  // The copy props default to the shell's own words, resolved here rather than
+  // in the signature so they follow the interface language.
+  const titleText = title ?? t`Agent Chat`;
+  const startingText = startingLabel ?? t`Starting session…`;
+  const failedText = failedTitle ?? t`Session failed`;
+  const retryText = retryLabel ?? t`↺ Retry`;
+  // A stable handle for the rows, so `TranscriptRow`'s memo holds even when a
+  // workspace passes a new function each render; a click still reaches the
+  // latest one.
+  const retrySendRef = useRef(onRetrySend);
+  useEffect(() => {
+    retrySendRef.current = onRetrySend;
+  });
+  const retrySend = useCallback((content) => retrySendRef.current?.(content), []);
+  const rows = useMemo(() => groupActivityRows(messages, Row.ACTIVITY), [messages]);
+  const scrollRef = useRef(null);
+  const isAtBottom = useRef(true);
+  const prevMsgLen = useRef(0);
+  const [showScrollBtn, setShowScrollBtn] = useState(false);
+
+  function handleScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    isAtBottom.current = atBottom;
+    if (atBottom) setShowScrollBtn(false);
+  }
+
+  function scrollToLatest() {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    setShowScrollBtn(false);
+  }
+
+  // Instant auto-scroll only when already near the bottom (don't hijack manual reading).
+  useEffect(() => {
+    if (isAtBottom.current) scrollToLatest();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages, steps, isAgentTyping, pending]);
+
+  // "New message" only when a new row appears while the user has scrolled up.
+  // Token updates don't change messages.length, so they don't trigger it.
+  useEffect(() => {
+    if (messages.length > prevMsgLen.current) {
+      prevMsgLen.current = messages.length;
+      if (!isAtBottom.current) setShowScrollBtn(true);
+    }
+  }, [messages.length]);
+
+  const status = PHASE_STATUS[phase] ?? PHASE_STATUS[Phase.STARTING];
+  const isFailed = phase === Phase.FAILED;
+  const waiting = phase === Phase.QUESTIONS && Boolean(pending);
+  const working = phase === Phase.PIPELINE || phase === Phase.CHATTING;
+  const elapsed = useElapsed(working);
+  // What it is doing right now, most specific first. Codex titles this row
+  // with the model's own words; we have the step it is in, which is enough.
+  const runningStep = steps.find((s) => s.status === StepStatus.RUNNING && !s.step_id?.includes(":"));
+  // The countdown re-reads the clock on every tick of the elapsed timer, so it
+  // needs no timer of its own. `until` is on this client's clock (the reducer
+  // anchors the backend's duration at receipt), so skew cannot show "in -3s".
+  const retryIn = retrying?.until ? Math.max(0, Math.ceil((retrying.until - Date.now()) / 1000)) : 0;
+  // Same anchoring as `retryIn`: the reducer put the backend's duration on this
+  // client's clock, so this is a countdown the user's own machine agrees with.
+  const stepDownIn = tierStepDown?.until
+    ? Math.max(0, Math.ceil((tierStepDown.until - Date.now()) / 1000))
+    : 0;
+  const attempt = retrying?.attempt;
+  const attempts = retrying?.max;
+  const activity = retrying
+    ? (retryIn > 0
+      ? t`Reconnecting to the model (${attempt}/${attempts}) · retry in ${retryIn}s`
+      : t`Reconnecting to the model (${attempt}/${attempts})`)
+    : compacting
+      ? t`Compacting context`
+      : runningStep?.label || "";
+  const phaseLabel = i18n._(status.label);
+  const statusLabel = reconnecting && !isFailed
+    ? t`Reconnecting…`
+    : working
+      ? [phaseLabel.replace(/…$/, ""), formatElapsed(elapsed), activity].filter(Boolean).join(" · ")
+      : phaseLabel;
+  const contextUsed = usage?.last?.window ? (usage.last.input + usage.last.output) / usage.last.window : 0;
+  // The box stays open while the agent works: say where a message goes.
+  const placeholder = inputPlaceholder
+    || (working ? t`Add a thought — it goes in at the next step`
+      : waiting ? t`Answer above, or leave a note for after`
+        : undefined);
+  // The step-down chip's tooltip: the backend's own sentence, the countdown,
+  // then where to change it — assembled from whole messages.
+  const stepDownMinutes = Math.ceil(stepDownIn / 60);
+  const stepDownTitle = tierStepDown
+    ? [
+        tierStepDown.detail + (stepDownIn > 0 ? t` — back in about ${stepDownMinutes} min` : "") + ".",
+        t`Set which model runs each job in Settings → Models & providers.`,
+      ].join(" ")
+    : "";
+  const ranTier = tierStepDown ? tierLabel(tierStepDown.ran, i18n) : "";
+  const requestedTier = tierStepDown ? tierLabel(tierStepDown.requested, i18n) : "";
+
+  return (
+    <div className="flex flex-col h-full">
+      <div
+        className={`flex items-center gap-2 border-b px-4 py-2 shrink-0 transition-colors ${
+          waiting ? "border-warning/70 bg-warning/5" : "border-border/60"
+        }`}
+      >
+        <span className="shrink-0 text-sm font-medium">{titleText}</span>
+        {waiting && (
+          <span className="relative flex size-2" aria-hidden="true">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-warning opacity-75" />
+            <span className="relative inline-flex rounded-full size-2 bg-warning" />
+          </span>
+        )}
+        {/* role="status" so a screen reader hears the agent change state —
+            "Working…", "Waiting for you", "Ready", "Failed". This is the only
+            live region in the agent shell on purpose: announcing the streaming
+            tokens themselves, or the rotating subtitle in PipelineProgress,
+            would talk over the user continuously. State changes are the signal;
+            the prose is already readable on demand. */}
+        <span
+          role="status"
+          aria-live="polite"
+          className={`min-w-0 truncate text-xs ${
+            waiting ? "text-warning font-medium" : isFailed ? "text-destructive" : "text-muted-foreground"
+          } ${status.pulse && !waiting && !working ? "animate-pulse" : ""}`}
+        >
+          {statusLabel}
+        </span>
+        <span className="ml-auto flex shrink-0 items-center gap-2">
+          {headerExtra}
+          {tierStepDown && (
+            <span
+              className="inline-flex items-center gap-1 text-xs text-muted-foreground"
+              title={stepDownTitle}
+            >
+              <ArrowDownRight size={12} aria-hidden="true" />
+              <Trans>{ranTier} · {requestedTier} is rate limited</Trans>
+            </span>
+          )}
+          {!remembering && (
+            <span
+              className="inline-flex items-center gap-1 text-xs text-muted-foreground"
+              title={t`Nothing from project memory is read into this session, and nothing it concludes is written back.`}
+            >
+              <Brain size={12} aria-hidden="true" />
+              <Trans>Not remembering</Trans>
+            </span>
+          )}
+          {onStartFresh && canStartFresh && (
+            <button
+              type="button"
+              onClick={onStartFresh}
+              title={t`Abandon this conversation and start a new one (what it produced is kept)`}
+              className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+            >
+              <Trans>↺ Start fresh</Trans>
+            </button>
+          )}
+        </span>
+      </div>
+
+      <Todos todos={todos} />
+
+      <div className="flex-1 relative min-h-0">
+        {/* Scrollbar styling is global (styles/base.css). This pane used to
+            carry its own webkit-only rules, which is how it ended up the one
+            scroll area in the app with a 3px thumb. */}
+        <div
+          ref={scrollRef}
+          onScroll={handleScroll}
+          className="absolute inset-0 overflow-y-auto px-4 py-4 [scrollbar-gutter:stable]"
+        >
+          {/* A measure for the transcript: with the right pane folded, or on a
+              wide screen, a reply otherwise ran 200+ characters to the line.
+              The gutter stops the text re-wrapping when the bar first appears. */}
+          <div className="mx-auto w-full max-w-3xl">
+            {phase === Phase.STARTING && (
+              <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
+                <Spinner className="size-3" />
+                {startingText}
+              </div>
+            )}
+
+            {steps.length > 0 && (
+              <div className="mb-2">{renderSteps ? renderSteps(steps) : <StepProgress steps={steps} labels={stepLabels} />}</div>
+            )}
+
+            {/* Grouped at render, not in the reducer: a burst of tool calls is
+                one action to a reader and still one row each to everything that
+                indexes the transcript. */}
+            {rows.map((msg, i) =>
+              msg.group ? (
+                <ActivityGroup key={msg.activities[0]?.id || i} activities={msg.activities} />
+              ) : (
+                <TranscriptRow
+                  key={msg.role === Row.CHANGE_SET_CARD ? msg.changeSet?.change_set_id || i : i}
+                  msg={msg}
+                  onRetrySend={onRetrySend ? retrySend : undefined}
+                />
+              ),
+            )}
+
+            {isAgentTyping && (
+              <WorkingIndicator
+                label={
+                  compacting
+                    ? t`Compacting context`
+                    : retrying
+                      ? t`Reconnecting to the model`
+                      : runningStepLabel(steps, stepLabels)
+                }
+              />
+            )}
+
+            {waiting && <PauseCard pause={pending} onAnswer={onAnswer} disabled={answerDisabled} questionsCopy={questionsCopy} signInToConnect={signInToConnect} returnTo={connectReturnTo} />}
+
+            {reconnecting && !isFailed && (
+              <div className="mt-3 flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/10 px-4 py-2.5 text-xs text-warning">
+                <Spinner className="size-3" />
+                <Trans>Connection dropped — reconnecting…</Trans>
+              </div>
+            )}
+
+            {isFailed && (
+              <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/8 p-4">
+                <div className="flex items-start gap-3">
+                  <span className="mt-0.5 text-destructive text-base leading-none" aria-hidden="true">✕</span>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-destructive mb-1">{failedText}</p>
+                    <p className="text-xs text-muted-foreground break-words leading-relaxed">{errorText(i18n, errorMsg)}</p>
+                  </div>
+                </div>
+                <FailedAction
+                  action={errorAction(errorCode)}
+                  retryable={errorRetryable}
+                  onRetry={onRetry}
+                  retryLabel={retryText}
+                  onStartFresh={onStartFresh}
+                />
+              </div>
+            )}
+
+            {phase === Phase.READY && messages.length === 0 && readyHint}
+          </div>
+        </div>
+
+        {showScrollBtn && (
+          <div className="absolute bottom-3 inset-x-0 flex justify-center z-10 pointer-events-none">
+            <button
+              type="button"
+              onClick={scrollToLatest}
+              className="pointer-events-auto flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium bg-primary text-primary-foreground shadow-lg hover:bg-primary/90 transition-all"
+            >
+              <Trans>↓ New message</Trans>
+            </button>
+          </div>
+        )}
+      </div>
+
+      {footer}
+
+      <ChatInput
+        onSend={onSendMessage}
+        disabled={inputDisabled}
+        isStreaming={isStreaming}
+        onStop={onStop}
+        // Opening the session or re-attaching its stream: nothing to stop yet.
+        connecting={
+          reconnecting && !isFailed ? t`Reconnecting…` : phase === Phase.STARTING ? t`Connecting…` : ""
+        }
+        draft={draft}
+        draftKey={draftKey}
+        placeholder={placeholder}
+        ariaLabel={inputAriaLabel}
+        accept={inputAccept}
+        tools={composerTools}
+        // The ring lives beside Send, where the desk composer has it, and is
+        // there from the first moment: an empty ring says "new thread" where
+        // no ring said nothing.
+        status={
+          <>
+            {composerAside}
+            {usage?.last ? (
+              <ContextRing used={contextUsed} details={usage} />
+            ) : (
+              <ContextRing used={0} label={t`New thread`} />
+            )}
+          </>
+        }
+      />
+    </div>
+  );
+}

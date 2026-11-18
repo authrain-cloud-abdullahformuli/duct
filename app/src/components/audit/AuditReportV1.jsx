@@ -1,0 +1,1024 @@
+"use client";
+import React from 'react';
+import { BarChart, Bar, XAxis, YAxis, Cell, ResponsiveContainer, LabelList } from 'recharts';
+import { AlertTriangle, CheckCircle2, Calendar, Activity, Target, BarChart2, Zap, Clock, TrendingUp, ChevronDown } from 'lucide-react';
+import {
+  computeExecutionServices,
+  ExecutionOfferBlock,
+  ExecutionClosingLine,
+  ExecutionRequestModal,
+} from './ExecutionOffer';
+import { Plural, Trans, useLingui } from "@lingui/react/macro";
+import { msg, plural } from "@lingui/core/macro";
+import { capitalize } from "@/lib/format";
+
+// ---------------------------------------------------------------------------
+// Global styles — tooltips + entrance animations
+// ---------------------------------------------------------------------------
+
+const GLOBAL_STYLE = `
+[data-tooltip] { position: relative; cursor: help; }
+[data-tooltip]::after {
+  content: attr(data-tooltip);
+  /* display:none rather than opacity alone. At rest this box was still laid
+     out — 220px wide, absolutely positioned off a cell near the right edge —
+     so it added 29px to the document's scroll width on a phone while being
+     completely invisible. The body overflow-x guard used to swallow that,
+     which is the argument for having removed it: a layout bug you cannot see
+     is a layout bug you ship. Costs the 0.15s fade, which nobody will miss. */
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1f2937;
+  color: #f9fafb;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: normal;
+  width: 220px;
+  max-width: min(220px, 60vw);
+  text-align: left;
+  pointer-events: none;
+  opacity: 0;
+  z-index: 50;
+  transition: opacity 0.15s ease;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+}
+[data-tooltip]:hover::after { display: block; opacity: 1; }
+details > summary { list-style: none; }
+details > summary::-webkit-details-marker { display: none; }
+
+body { line-height: 1.65; }
+@keyframes rise {
+  from { opacity: 0; transform: translateY(18px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.rise-0 { animation: rise .5s cubic-bezier(.2,.6,.2,1) both 0.00s; }
+.rise-1 { animation: rise .5s cubic-bezier(.2,.6,.2,1) both 0.07s; }
+.rise-2 { animation: rise .5s cubic-bezier(.2,.6,.2,1) both 0.14s; }
+.rise-3 { animation: rise .5s cubic-bezier(.2,.6,.2,1) both 0.21s; }
+.rise-4 { animation: rise .5s cubic-bezier(.2,.6,.2,1) both 0.28s; }
+.rise-5 { animation: rise .5s cubic-bezier(.2,.6,.2,1) both 0.35s; }
+.rise-6 { animation: rise .5s cubic-bezier(.2,.6,.2,1) both 0.42s; }
+.rise-7 { animation: rise .5s cubic-bezier(.2,.6,.2,1) both 0.49s; }
+.rise-8 { animation: rise .5s cubic-bezier(.2,.6,.2,1) both 0.56s; }
+`;
+
+// ---------------------------------------------------------------------------
+// Design tokens
+// ---------------------------------------------------------------------------
+
+const DUCT_ORANGE = '#ff5c00';
+const DUCT_NAVY   = '#0d0f1a';
+const DUCT_CREAM  = '#f4ece2';
+
+// ---------------------------------------------------------------------------
+// Score gauge — animated full-circle SVG
+// ---------------------------------------------------------------------------
+
+const CIRCLE_R    = 72;
+const CIRCLE_CIRC = 2 * Math.PI * CIRCLE_R;
+
+function gaugeColor(score) {
+  if (score >= 85) return '#10b981';
+  if (score >= 70) return '#f59e0b';
+  if (score >= 55) return '#f97316';
+  return '#ef4444';
+}
+
+// Module-level tables hold message descriptors; the component that renders
+// one resolves it with `i18n._`.
+const BAND_LABEL = {
+  healthy:    msg`Healthy`,
+  good:       msg`Good`,
+  needs_work: msg`Needs Work`,
+  critical:   msg`Critical`,
+};
+
+function ScoreGauge({ score, band, dark }) {
+  const { t, i18n } = useLingui();
+  const [on, setOn] = React.useState(false);
+  React.useEffect(() => {
+    const t = setTimeout(() => setOn(true), 120);
+    return () => clearTimeout(t);
+  }, []);
+
+  const filled      = on ? (score / 100) * CIRCLE_CIRC : 0;
+  const color       = gaugeColor(score);
+  const label       = BAND_LABEL[band] ? i18n._(BAND_LABEL[band]) : band;
+  const textFill    = dark ? DUCT_CREAM : 'currentColor';
+  const trackStroke = dark ? 'rgba(255,255,255,0.08)' : 'currentColor';
+
+  return (
+    <div
+      className="flex flex-col items-center shrink-0"
+      data-tooltip={t`${score}/100 — ${label}. Weighted average across all 9 SEO categories.`}
+    >
+      {/* `width`/`height` were fixed at 180, so on a phone the gauge kept its
+          size and the hero pushed past the screen — invisible until the body's
+          `overflow-x: hidden` guard came off. The viewBox does the scaling. */}
+      <svg viewBox="0 0 180 180" width="180" height="180" role="img"
+        className="h-auto max-w-full"
+        aria-label={t`Score ${score} out of 100, ${label}`}>
+        <circle cx="90" cy="90" r={CIRCLE_R} fill="none"
+          stroke={trackStroke} strokeOpacity={dark ? 1 : 0.08} strokeWidth="12" />
+        <circle cx="90" cy="90" r={CIRCLE_R} fill="none"
+          stroke={color} strokeWidth="12" strokeLinecap="round"
+          strokeDasharray={`${filled} ${CIRCLE_CIRC}`}
+          transform="rotate(-90 90 90)"
+          style={{ transition: 'stroke-dasharray 1.4s cubic-bezier(0.4,0,0.2,1)' }} />
+        <text x="90" y="100" textAnchor="middle" fontSize="42" fontWeight="400"
+          fill={textFill} fontFamily='Georgia, "Times New Roman", serif'>{score}</text>
+      </svg>
+      <span className="text-xs font-semibold mt-1" style={{ color }}>{label}</span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Issue distribution pill — stacked horizontal bar in hero
+// ---------------------------------------------------------------------------
+
+function IssuePill({ issues, warnings, opportunities, categories }) {
+  const { t } = useLingui();
+  const passCount = (categories ?? []).reduce((s, c) => s + (c.pass_count ?? 0), 0);
+  const total = issues + warnings + opportunities + passCount;
+  if (total === 0) return null;
+
+  const segs = [
+    { key: 'errors',        count: issues,        color: '#ef4444', text: plural(issues, { one: '# error', other: '# errors' }) },
+    { key: 'warnings',      count: warnings,      color: '#f59e0b', text: plural(warnings, { one: '# warning', other: '# warnings' }) },
+    { key: 'opportunities', count: opportunities, color: '#f97316', text: plural(opportunities, { one: '# opportunity', other: '# opportunities' }) },
+    { key: 'passing',       count: passCount,     color: '#10b981', text: t`${passCount} passing` },
+  ].filter(s => s.count > 0);
+
+  return (
+    <div className="flex items-center gap-2 mt-2" data-tooltip={t`Issue distribution across all findings`}>
+      <div className="flex h-1.5 rounded-full overflow-hidden" style={{ width: 120 }}>
+        {segs.map(({ key, count, color }) => (
+          <div key={key} style={{ width: `${(count / total) * 100}%`, background: color }} />
+        ))}
+      </div>
+      <span className="text-2xs tabular-nums" style={{ color: 'rgba(244,236,226,0.4)' }}>
+        {segs.map(s => s.text).join(' · ')}
+      </span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Stats strip — mono number grid
+// ---------------------------------------------------------------------------
+
+function StatsStrip({ data, dateStr, dark }) {
+  const { t } = useLingui();
+  const valStyle  = dark ? { color: 'rgba(244,236,226,0.9)' }  : {};
+  const lblStyle  = dark ? { color: 'rgba(244,236,226,0.38)' } : {};
+  const borderClr = dark ? 'rgba(255,255,255,0.1)'             : 'rgba(0,0,0,0.08)';
+
+  const stats = [
+    { value: data.pages_crawled,       label: t`pages crawled` },
+    { value: data.total_issues,        label: t`errors`,        color: dark ? (data.total_issues > 0 ? '#f87171' : '#34d399') : (data.total_issues > 0 ? '#ef4444' : '#10b981') },
+    { value: data.total_warnings,      label: t`warnings`,      color: dark ? (data.total_warnings > 0 ? '#fbbf24' : 'rgba(244,236,226,0.4)') : (data.total_warnings > 0 ? '#f59e0b' : undefined) },
+    { value: data.total_opportunities, label: t`opportunities`, color: dark ? (data.total_opportunities > 0 ? '#fb923c' : 'rgba(244,236,226,0.4)') : (data.total_opportunities > 0 ? DUCT_ORANGE : undefined) },
+    { value: dateStr,                  label: t`audit date` },
+  ];
+
+  return (
+    <div style={{ paddingTop: 12, borderTop: `1px solid ${borderClr}` }}>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-4 @sm:grid-cols-3 @xl:flex @xl:items-center @xl:gap-6 @xl:flex-wrap">
+        {stats.map(({ value, label, color }) => (
+          <div key={label} className="min-w-0">
+            <div className="font-mono text-lg font-bold leading-none tabular-nums"
+              style={{ ...(color ? { color } : valStyle) }}>{value}</div>
+            <div className="text-2xs uppercase tracking-wide mt-0.5 leading-tight" style={lblStyle}>{label}</div>
+          </div>
+        ))}
+      </div>
+      {dark && (
+        <IssuePill
+          issues={data.total_issues}
+          warnings={data.total_warnings}
+          opportunities={data.total_opportunities}
+          categories={data.categories}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Key signals strip — 3-column coach's brief (replaces executive_summary)
+// ---------------------------------------------------------------------------
+
+const SIGNAL_ICONS  = [AlertTriangle, TrendingUp, CheckCircle2];
+const SIGNAL_COLORS = [DUCT_ORANGE, '#6366f1', '#10b981'];
+
+function KeySignals({ signals }) {
+  if (!signals?.length) return null;
+  return (
+    <div className="rise-1 grid grid-cols-1 @xl:grid-cols-3 gap-3">
+      {signals.slice(0, 3).map((text, i) => {
+        const Icon  = SIGNAL_ICONS[i];
+        const color = SIGNAL_COLORS[i];
+        return (
+          <div key={i} className="flex items-start gap-3 rounded-xl px-4 py-4"
+            style={{ background: color + '0d', border: `1px solid ${color}22`, transition: 'transform 0.15s, box-shadow 0.15s' }}
+            onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.boxShadow = '0 4px 12px rgba(0,0,0,0.08)'; }}
+            onMouseLeave={e => { e.currentTarget.style.transform = ''; e.currentTarget.style.boxShadow = ''; }}>
+            {Icon && <Icon size={15} style={{ color, flexShrink: 0, marginTop: 2 }} strokeWidth={2} />}
+            <p className="text-sm leading-snug" style={{ color: 'var(--foreground)' }}>{text}</p>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Section header — orange accent bar + Lucide icon
+// ---------------------------------------------------------------------------
+
+function SectionHeader({ icon: Icon, children }) {
+  return (
+    <div className="flex items-center gap-3 mb-5">
+      <div className="w-1 h-6 rounded-full shrink-0" style={{ background: DUCT_ORANGE }} />
+      {Icon && <Icon size={16} color={DUCT_ORANGE} strokeWidth={2} />}
+      <h2 className="text-xl font-semibold tracking-tight">{children}</h2>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Severity badge config
+// ---------------------------------------------------------------------------
+
+const SEVERITY_CFG = {
+  fail:        { label: msg`FAIL`, accent: '#ef4444', pill: 'bg-red-500/15 text-red-700 dark:text-red-400 border border-red-500/30',             headerCls: 'bg-red-500/10'     },
+  warn:        { label: msg`WARN`, accent: '#f59e0b', pill: 'bg-amber-500/15 text-amber-700 dark:text-amber-400 border border-amber-500/30',       headerCls: 'bg-amber-500/10'   },
+  pass:        { label: msg`PASS`, accent: '#10b981', pill: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30', headerCls: 'bg-emerald-500/10' },
+  opportunity: { label: msg`OPP`,  accent: '#f97316', pill: 'bg-orange-500/15 text-orange-700 dark:text-orange-400 border border-orange-500/30',    headerCls: 'bg-orange-500/10'  },
+};
+
+// ---------------------------------------------------------------------------
+// Impact / effort icon chips
+// ---------------------------------------------------------------------------
+
+const IMPACT_COLOR = { critical: '#ef4444', high: '#f97316', medium: '#f59e0b', low: '#94a3b8' };
+const EFFORT_COLOR = { low: '#10b981', medium: '#f59e0b', high: '#ef4444' };
+
+const EFFORT_ESTIMATE_LABEL = {
+  under_1hr:     msg`< 1 hr`,
+  '2_to_4hrs':   msg`2–4 hrs`,
+  '1_to_3_days': msg`1–3 days`,
+  '1_to_2_wks':  msg`1–2 wks`,
+  ongoing:       msg`Ongoing`,
+};
+
+// Whole phrases per enum value, so a translator sees "High impact" and not a
+// capitalised token glued to a noun; an unknown value falls back to the token.
+const IMPACT_LABEL = {
+  critical: msg`Critical impact`,
+  high:     msg`High impact`,
+  medium:   msg`Medium impact`,
+  low:      msg`Low impact`,
+};
+const EFFORT_LABEL = {
+  low:    msg`Low effort`,
+  medium: msg`Medium effort`,
+  high:   msg`High effort`,
+};
+
+function ImpactEffortChips({ impact, effort }) {
+  const { t, i18n } = useLingui();
+  if (!impact && !effort) return null;
+  const impactWord = capitalize(impact);
+  const effortWord = capitalize(effort);
+  return (
+    <div className="flex gap-2 flex-wrap mt-2">
+      {impact && (
+        <span className="inline-flex items-center gap-1 text-2xs font-semibold px-2 py-0.5 rounded-md"
+          style={{ background: IMPACT_COLOR[impact] + '18', color: IMPACT_COLOR[impact] }}>
+          <Zap size={10} strokeWidth={2.5} />
+          {IMPACT_LABEL[impact] ? i18n._(IMPACT_LABEL[impact]) : t`${impactWord} impact`}
+        </span>
+      )}
+      {effort && (
+        <span className="inline-flex items-center gap-1 text-2xs font-semibold px-2 py-0.5 rounded-md"
+          style={{ background: EFFORT_COLOR[effort] + '18', color: EFFORT_COLOR[effort] }}>
+          <Clock size={10} strokeWidth={2.5} />
+          {EFFORT_LABEL[effort] ? i18n._(EFFORT_LABEL[effort]) : t`${effortWord} effort`}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Category bar chart
+// ---------------------------------------------------------------------------
+
+function scoreBarColor(score) {
+  if (score >= 85) return '#10b981';
+  if (score >= 70) return '#f59e0b';
+  if (score >= 55) return '#f97316';
+  return '#ef4444';
+}
+
+function CategoryBarChartCSS({ categories }) {
+  const [animated, setAnimated] = React.useState(false);
+  React.useEffect(() => { const t = setTimeout(() => setAnimated(true), 150); return () => clearTimeout(t); }, []);
+
+  const sorted = [...categories].sort((a, b) => b.score - a.score);
+  return (
+    <div className="space-y-3 py-1">
+      {sorted.map((cat, i) => {
+        const color = scoreBarColor(cat.score);
+        return (
+          <div key={cat.id} className="flex items-center gap-3" data-tooltip={cat.tooltip}>
+            <span className="text-xs @xl:text-sm text-right shrink-0 w-24 @xl:w-44 text-muted-foreground truncate">{cat.label}</span>
+            <div className="flex-1 h-2 rounded-full overflow-hidden" style={{ background: 'rgba(0,0,0,0.07)' }}>
+              <div className="h-full rounded-full"
+                style={{
+                  width: animated ? `${Math.max(cat.score, 3)}%` : '0%',
+                  background: `linear-gradient(90deg, ${color}77, ${color})`,
+                  transition: `width 0.9s cubic-bezier(0.4,0,0.2,1) ${i * 55}ms`,
+                }} />
+            </div>
+            <span className="text-xs font-semibold numeric shrink-0 w-6 text-right"
+              style={{ color }}>{cat.score}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function CategoryBarChart({ categories }) {
+  if (typeof ResponsiveContainer === 'undefined' || typeof BarChart === 'undefined') {
+    return <CategoryBarChartCSS categories={categories} />;
+  }
+
+  const sorted = [...categories].sort((a, b) => b.score - a.score);
+  const chartData = sorted.map(c => ({ name: c.label, score: c.score, color: scoreBarColor(c.score) }));
+  const chartHeight = Math.max(categories.length * 36, 180);
+
+  return (
+    <ResponsiveContainer width="100%" height={chartHeight}>
+      <BarChart data={chartData} layout="vertical" margin={{ left: 4, right: 36, top: 2, bottom: 2 }}>
+        <XAxis type="number" domain={[0, 100]} hide />
+        <YAxis type="category" dataKey="name" width={152}
+          tick={{ fontSize: 13, fill: 'currentColor', opacity: 0.65 }}
+          axisLine={false} tickLine={false} />
+        <Bar dataKey="score" radius={[0, 3, 3, 0]} barSize={8}
+          background={{ fill: 'rgba(0,0,0,0.06)', radius: [0, 3, 3, 0] }}
+          isAnimationActive animationDuration={900} animationEasing="ease-out">
+          {chartData.map((entry, i) => <Cell key={i} fill={entry.color} />)}
+          <LabelList dataKey="score" position="right"
+            style={{ fontSize: 12, fontWeight: 600, fill: 'currentColor', opacity: 0.7 }}
+            formatter={v => `${v}`} />
+        </Bar>
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Strategic narrative — competitive landscape + content opportunity analysis
+// ---------------------------------------------------------------------------
+
+function StrategicNarrative({ narrative }) {
+  if (!narrative) return null;
+  const paragraphs = narrative.split(/\n\n+/).filter(Boolean);
+  return (
+    <section className="space-y-3">
+      <SectionHeader icon={Target}><Trans>Competitive Landscape</Trans></SectionHeader>
+      <div className="rounded-xl border border-slate-700 bg-slate-950 px-6 py-5 space-y-4">
+        {paragraphs.map((p, i) => (
+          <p key={i} className="text-sm leading-relaxed text-slate-300"
+            style={{ lineHeight: '1.75' }}>{p}</p>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Impact × Effort matrix — 2×2 quadrant
+// ---------------------------------------------------------------------------
+
+const IMPACT_RANK = { critical: 3, high: 2, medium: 1, low: 0 };
+const EFFORT_RANK = { low: 0, medium: 1, high: 2 };
+
+function ImpactEffortMatrix({ categories }) {
+  const { t } = useLingui();
+  const findings = (categories ?? []).flatMap(c =>
+    (c.findings ?? []).filter(f => f.severity !== 'pass' && f.impact && f.effort)
+  );
+  if (findings.length === 0) return null;
+
+  const quadrants = [
+    { key: 'qwin',  label: t`Quick Wins`,  sub: t`High impact · Low effort`,   bg: 'rgba(16,185,129,0.06)', border: 'rgba(16,185,129,0.2)',   textColor: '#065f46' },
+    { key: 'qbet',  label: t`Big Bets`,    sub: t`High impact · More effort`,  bg: 'rgba(99,102,241,0.05)', border: 'rgba(99,102,241,0.18)',  textColor: '#3730a3' },
+    { key: 'qfil',  label: t`Fill-In`,     sub: t`Lower impact · Low effort`,  bg: 'rgba(245,158,11,0.05)', border: 'rgba(245,158,11,0.18)', textColor: '#92400e' },
+    { key: 'qskip', label: t`Later`,       sub: t`Lower impact · More effort`, bg: 'rgba(148,163,184,0.05)', border: 'rgba(148,163,184,0.15)', textColor: '#475569' },
+  ];
+
+  function assignQuadrant(f) {
+    const ir = IMPACT_RANK[f.impact] ?? 1;
+    const er = EFFORT_RANK[f.effort] ?? 1;
+    if (ir >= 2 && er === 0) return 'qwin';
+    if (ir >= 2)             return 'qbet';
+    if (er === 0)            return 'qfil';
+    return 'qskip';
+  }
+
+  const groups = {};
+  quadrants.forEach(q => { groups[q.key] = []; });
+  findings.forEach(f => { groups[assignQuadrant(f)].push(f); });
+
+  const SEVERITY_DOT = { fail: '#ef4444', warn: '#f59e0b', opportunity: '#f97316' };
+
+  return (
+    <section className="rise-5 space-y-3">
+      <SectionHeader icon={Target}><Trans>Impact × Effort</Trans></SectionHeader>
+      <div className="grid grid-cols-1 @xl:grid-cols-2 gap-3">
+        {quadrants.map(q => (
+          <div key={q.key} className="rounded-xl p-3 @xl:p-4 space-y-2"
+            style={{ background: q.bg, border: `1px solid ${q.border}` }}>
+            <div>
+              <p className="text-sm font-bold" style={{ color: q.textColor }}>{q.label}</p>
+              <p className="text-2xs text-muted-foreground">{q.sub}</p>
+            </div>
+            {groups[q.key].length === 0
+              ? <p className="text-2xs text-muted-foreground italic"><Trans>Nothing here</Trans></p>
+              : (
+                <ul className="space-y-1.5">
+                  {groups[q.key].map(f => (
+                    <li key={f.id} className="flex items-start gap-2" data-tooltip={f.description || f.title}>
+                      <span className="shrink-0 mt-1.5 size-1.5 rounded-full"
+                        style={{ background: SEVERITY_DOT[f.severity] ?? '#94a3b8' }} />
+                      <span className="text-2xs @xl:text-xs leading-snug text-foreground line-clamp-2">{f.title}</span>
+                    </li>
+                  ))}
+                </ul>
+              )
+            }
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PASS row — compact checkmark, no description card
+// ---------------------------------------------------------------------------
+
+function PassRow({ finding }) {
+  return (
+    <div className="flex items-center gap-3 py-2.5 px-4 rounded-lg"
+      style={{ background: 'rgba(16,185,129,0.04)', border: '1px solid rgba(16,185,129,0.14)' }}>
+      <CheckCircle2 size={13} color="#10b981" strokeWidth={2} className="shrink-0" />
+      <span className="text-sm text-foreground leading-snug flex-1 min-w-0">{finding.title}</span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Finding card — compact: 1-sentence description, → Fix: callout
+// ---------------------------------------------------------------------------
+
+function FindingCard({ finding }) {
+  const { i18n } = useLingui();
+  const cfg = SEVERITY_CFG[finding.severity] ?? SEVERITY_CFG.pass;
+  const recommendation = finding.recommendation;
+
+  if (finding.severity === 'pass') return <PassRow finding={finding} />;
+
+  return (
+    <div className="rounded-xl overflow-hidden"
+      style={{ boxShadow: '0 1px 3px rgba(0,0,0,0.07)', border: '1px solid ' + cfg.accent + '22', transition: 'box-shadow 0.15s, transform 0.15s' }}
+      onMouseEnter={e => { e.currentTarget.style.boxShadow = '0 4px 14px rgba(0,0,0,0.10)'; e.currentTarget.style.transform = 'translateY(-1px)'; }}
+      onMouseLeave={e => { e.currentTarget.style.boxShadow = '0 1px 3px rgba(0,0,0,0.07)'; e.currentTarget.style.transform = ''; }}>
+
+      {/* 3px top stripe */}
+      <div style={{ height: 3, background: cfg.accent }} />
+
+      {/* Colored header row: badge + title */}
+      <div className={`flex items-start gap-3 px-3 @xl:px-5 pt-3 pb-3 ${cfg.headerCls}`}>
+        <span className={`text-2xs font-bold uppercase tracking-widest px-2.5 py-1 rounded-md shrink-0 mt-0.5 ${cfg.pill}`}>
+          {i18n._(cfg.label)}
+        </span>
+        <p className="text-base font-semibold leading-snug text-foreground flex-1 min-w-0">
+          {finding.title}
+        </p>
+      </div>
+
+      {/* Body */}
+      <div className="px-5 pt-3 pb-4 space-y-3 bg-card">
+
+        {finding.description && (
+          <p className="text-sm text-muted-foreground leading-relaxed">
+            {finding.description}
+          </p>
+        )}
+
+        {finding.affected_urls?.length > 0 && (
+          <div className="rounded-lg overflow-hidden" style={{ border: '1px solid var(--border)' }}>
+            <div className="flex px-4 py-2 bg-muted/40 border-b border-border/60">
+              <span className="flex-1 text-2xs font-bold uppercase tracking-widest text-muted-foreground">URL</span>
+              <span className="w-48 shrink-0 text-2xs font-bold uppercase tracking-widest text-muted-foreground"><Trans>Measured</Trans></span>
+            </div>
+            {finding.affected_urls.map((u, i) => (
+              <div key={i} className={`flex items-start px-4 py-2.5 bg-card${i > 0 ? ' border-t border-border/40' : ''}`}>
+                <code className="flex-1 text-xs font-mono text-muted-foreground break-all pr-3">{u.url}</code>
+                <span className="w-48 shrink-0 text-sm font-semibold text-foreground/80">{u.issue_value}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {finding.recommendation && (
+          <div className="rounded-lg px-4 py-3 bg-blue-500/10">
+            <p className="text-sm leading-relaxed text-foreground/80">
+              <Trans><span className="font-semibold text-blue-600 dark:text-blue-400">Fix: </span>{recommendation}</Trans>
+            </p>
+          </div>
+        )}
+
+        <ImpactEffortChips impact={finding.impact} effort={finding.effort} />
+
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Findings accordion per category
+// ---------------------------------------------------------------------------
+
+const SEVERITY_ORDER = { fail: 0, warn: 1, opportunity: 2, pass: 3 };
+
+function CategoryAccordion({ category, isLast }) {
+  const failCount = category.fail_count;
+  const warnCount = category.warn_count;
+  const oppCount = category.opp_count;
+  const ordered = [...(category.findings ?? [])].sort(
+    (a, b) => (SEVERITY_ORDER[a.severity] ?? 4) - (SEVERITY_ORDER[b.severity] ?? 4),
+  );
+  const hasBad         = category.fail_count > 0 || category.warn_count > 0;
+  const color          = scoreBarColor(category.score);
+  const passFindings   = ordered.filter(f => f.severity === 'pass');
+  const nonPassFindings = ordered.filter(f => f.severity !== 'pass');
+  const passCount      = passFindings.length;
+
+  return (
+    <details className={`group${!isLast ? ' border-b border-border/60' : ''}`} open={hasBad || undefined}>
+      <summary className="flex items-center justify-between gap-3 px-5 py-4 cursor-pointer hover:bg-muted/40 transition-colors select-none">
+        <div className="flex items-center gap-3 min-w-0 flex-wrap">
+          <div className="size-8 rounded-lg flex items-center justify-center text-xs font-bold shrink-0"
+            style={{ background: color + '1a', color }}>{category.score}</div>
+          <span className="text-base font-semibold">{category.label}</span>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {category.fail_count > 0 && (
+              <span className="text-2xs font-bold px-2 py-0.5 rounded-full bg-red-500/15 text-red-700 dark:text-red-400">
+                <Plural value={failCount} one="# Error" other="# Errors" />
+              </span>
+            )}
+            {category.warn_count > 0 && (
+              <span className="text-2xs font-bold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-400">
+                <Plural value={warnCount} one="# Warning" other="# Warnings" />
+              </span>
+            )}
+            {!hasBad && category.opp_count > 0 && (
+              <span className="text-2xs font-bold px-2 py-0.5 rounded-full bg-orange-500/15 text-orange-700 dark:text-orange-400">
+                <Trans>{oppCount} Opp</Trans>
+              </span>
+            )}
+            {!hasBad && !category.opp_count && (
+              <span className="text-2xs font-bold px-2 py-0.5 rounded-full bg-green-500/15 text-green-700 dark:text-green-400 hidden @xl:inline">
+                <Trans>All clear</Trans>
+              </span>
+            )}
+          </div>
+        </div>
+        <ChevronDown size={15} className="text-muted-foreground shrink-0 transition-transform duration-200 group-open:rotate-180" />
+      </summary>
+      <div className="px-3 @xl:px-5 pb-4 pt-3 space-y-3" style={{ background: 'rgba(0,0,0,0.02)' }}>
+        {ordered.length === 0 && (
+          <p className="text-sm text-muted-foreground py-2"><Trans>No findings for this category.</Trans></p>
+        )}
+
+        {/* Non-pass findings rendered as full cards */}
+        {nonPassFindings.map(f => <FindingCard key={f.id} finding={f} />)}
+
+        {/* PASS findings collapsed into a single expandable summary row */}
+        {passFindings.length > 0 && (
+          <details className="group/pass">
+            <summary className="flex items-center gap-2 cursor-pointer select-none py-1.5">
+              <CheckCircle2 size={13} color="#10b981" strokeWidth={2} className="shrink-0" />
+              <span className="text-sm text-emerald-700 dark:text-emerald-400 font-medium">
+                <Plural value={passCount} one="# check passing" other="# checks passing" />
+              </span>
+              <ChevronDown size={12} className="text-muted-foreground ml-0.5 transition-transform group-open/pass:rotate-180" />
+            </summary>
+            <div className="ml-5 mt-2 space-y-1.5">
+              {passFindings.map(f => <PassRow key={f.id} finding={f} />)}
+            </div>
+          </details>
+        )}
+      </div>
+    </details>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Priority card — compact: rank + title + effort chip (no why_it_matters)
+// ---------------------------------------------------------------------------
+
+const PRIORITY_STYLE = {
+  fail:        { accent: '#ef4444', rankBg: 'rgba(239,68,68,0.1)',   rankColor: '#ef4444', badgeCls: 'bg-red-500/15 text-red-700 dark:text-red-400 border border-red-500/30',         label: msg`Error`       },
+  warn:        { accent: '#f59e0b', rankBg: 'rgba(245,158,11,0.1)',  rankColor: '#b45309', badgeCls: 'bg-amber-500/15 text-amber-700 dark:text-amber-400 border border-amber-500/30',   label: msg`Warning`     },
+  opportunity: { accent: '#f97316', rankBg: 'rgba(249,115,22,0.1)',  rankColor: '#c2410c', badgeCls: 'bg-orange-500/15 text-orange-700 dark:text-orange-400 border border-orange-500/30', label: msg`Opportunity` },
+};
+
+function PriorityCard({ priority }) {
+  const { i18n } = useLingui();
+  const s = PRIORITY_STYLE[priority.severity] ?? { accent: '#94a3b8', rankBg: 'rgba(148,163,184,0.1)', rankColor: '#64748b', badgeCls: 'bg-slate-100 text-slate-600 border border-slate-200', label: msg`Note` };
+  const effortLabel = priority.effort_estimate
+    ? (EFFORT_ESTIMATE_LABEL[priority.effort_estimate] ? i18n._(EFFORT_ESTIMATE_LABEL[priority.effort_estimate]) : priority.effort_estimate)
+    : null;
+
+  return (
+    <div className="rounded-xl overflow-hidden bg-card"
+      style={{ border: '1px solid var(--border)', boxShadow: '0 1px 3px rgba(0,0,0,0.07)', transition: 'box-shadow 0.15s, transform 0.15s' }}
+      onMouseEnter={e => { e.currentTarget.style.boxShadow = '0 4px 16px rgba(0,0,0,0.1)'; e.currentTarget.style.transform = 'translateY(-1px)'; }}
+      onMouseLeave={e => { e.currentTarget.style.boxShadow = '0 1px 3px rgba(0,0,0,0.07)'; e.currentTarget.style.transform = ''; }}>
+      <div style={{ height: 3, background: s.accent }} />
+      <div className="flex items-center gap-3 @xl:gap-4 px-3 @xl:px-5 py-4">
+        <div className="shrink-0 w-9 h-9 rounded-xl flex items-center justify-center text-sm font-bold tabular-nums"
+          style={{ background: s.rankBg, color: s.rankColor }}>
+          {String(priority.rank).padStart(2, '0')}
+        </div>
+        <p className="flex-1 min-w-0 text-base font-semibold leading-snug text-foreground">
+          {priority.title}
+        </p>
+        <div className="flex items-center gap-2 shrink-0">
+          <span className={`text-2xs font-bold uppercase tracking-wide px-2.5 py-1 rounded-md ${s.badgeCls}`}>
+            {i18n._(s.label)}
+          </span>
+          {effortLabel && (
+            <span className="inline-flex items-center gap-1 text-2xs font-semibold px-2.5 py-1 rounded-md border border-border bg-muted/40 text-muted-foreground">
+              <Clock size={10} strokeWidth={2} />
+              {effortLabel}
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Crawl health summary strip
+// ---------------------------------------------------------------------------
+
+function statColor(value, thresholds) {
+  if (thresholds.fail != null && value >= thresholds.fail) return { text: 'text-red-600 dark:text-red-400' };
+  if (thresholds.warn != null && value >= thresholds.warn) return { text: 'text-amber-600 dark:text-amber-400' };
+  return { text: 'text-green-600 dark:text-green-400' };
+}
+
+const NEUTRAL_COLOR = { text: 'text-muted-foreground' };
+
+const CRAWL_STATS = [
+  { key: 'avg_ttfb_ms',          label: msg`Avg TTFB`,  format: v => `${Math.round(v)}ms`, thresholds: { warn: 800, fail: 2000 }, tooltip: msg`Time to first byte. Google de-prioritises slow sites for recrawl.` },
+  { key: 'pages_with_redirects', label: msg`Redirects`, format: v => String(v),            thresholds: { warn: 1, fail: null },   tooltip: msg`Each redirect hop bleeds crawl budget and PageRank.` },
+  { key: 'spa_pages_count',      label: msg`SPA pages`, format: v => String(v),            thresholds: { warn: 1, fail: null },   tooltip: msg`Client-rendered pages — Google Wave 1 may see empty content.` },
+  { key: 'pages_noindex',        label: msg`Noindex`,   format: v => String(v),            thresholds: null,                      tooltip: msg`Pages excluded from the index. Verify these are intentional.` },
+  { key: 'pages_missing_title',  label: msg`No title`,  format: v => String(v),            thresholds: { warn: 1, fail: 1 },      tooltip: msg`Missing title tags are a direct ranking signal failure.` },
+  { key: 'pages_missing_h1',     label: msg`No H1`,     format: v => String(v),            thresholds: { warn: 1, fail: null },   tooltip: msg`Pages without an H1 miss the primary on-page relevance signal.` },
+];
+
+function CrawlSummaryStrip({ summary }) {
+  const { i18n } = useLingui();
+  return (
+    <div className="grid grid-cols-3 @2xl:grid-cols-6 gap-2">
+      {CRAWL_STATS.map(({ key, label, format, thresholds, tooltip }) => {
+        const value = summary[key] ?? 0;
+        const color = thresholds ? statColor(value, thresholds) : NEUTRAL_COLOR;
+        const isFail  = thresholds?.fail != null && value >= thresholds.fail;
+        const isWarn  = !isFail && thresholds?.warn != null && value >= thresholds.warn;
+        const isGood  = thresholds && !isFail && !isWarn;
+        const cellBg  = isFail ? 'rgba(239,68,68,0.05)' : isWarn ? 'rgba(245,158,11,0.05)' : isGood ? 'rgba(16,185,129,0.05)' : 'white';
+        const cellBdr = isFail ? 'rgba(239,68,68,0.25)' : isWarn ? 'rgba(245,158,11,0.22)' : isGood ? 'rgba(16,185,129,0.22)' : undefined;
+        return (
+          <div key={key}
+            className="rounded-xl px-4 py-4 flex flex-col gap-1"
+            style={{ background: cellBg, border: `1px solid ${cellBdr ?? '#e5e7eb'}`, boxShadow: '0 1px 2px rgba(13,15,26,0.04)' }}
+            data-tooltip={i18n._(tooltip)}>
+            <span className="text-xs text-muted-foreground font-medium uppercase tracking-wide leading-none">{i18n._(label)}</span>
+            <span className={`text-xl font-bold tabular-nums leading-tight ${color.text}`}>{format(value)}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Wins strip — 2-col compact cards
+// ---------------------------------------------------------------------------
+
+function WinsStrip({ wins }) {
+  return (
+    <section className="rise-4 rounded-xl overflow-hidden"
+      style={{ background: 'rgba(16,185,129,0.04)', border: '1px solid rgba(16,185,129,0.18)' }}>
+      <div className="px-5 py-5 @xl:px-6 @xl:py-5">
+        <div className="flex items-center gap-3 mb-3">
+          <div className="w-1 h-6 rounded-full shrink-0" style={{ background: '#16a34a' }} />
+          <CheckCircle2 size={16} color="#16a34a" strokeWidth={2} />
+          <h2 className="text-xl font-semibold tracking-tight"><Trans>What’s Going Right</Trans></h2>
+        </div>
+        <div className="grid grid-cols-1 @xl:grid-cols-2 gap-2">
+          {wins.map((w, i) => (
+            <div key={i} className="flex items-center gap-2.5 rounded-lg border border-green-100 bg-card px-4 py-2.5"
+              style={{ transition: 'box-shadow 0.15s' }}
+              onMouseEnter={e => { e.currentTarget.style.boxShadow = '0 2px 8px rgba(16,185,129,0.12)'; }}
+              onMouseLeave={e => { e.currentTarget.style.boxShadow = ''; }}>
+              <CheckCircle2 size={13} color="#16a34a" className="shrink-0" />
+              <span className="text-sm leading-snug">{w}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Roadmap section — effort_estimate chips instead of verbose notes
+// ---------------------------------------------------------------------------
+
+const PHASE_THEME_COLOR = {
+  'Unblock':  { text: DUCT_ORANGE, bg: 'rgba(255,92,0,0.08)',    border: 'rgba(255,92,0,0.2)' },
+  'Structure': { text: '#b45309',  bg: 'rgba(245,158,11,0.08)',  border: 'rgba(245,158,11,0.25)' },
+  'Compound':  { text: '#166534',  bg: 'rgba(16,185,129,0.08)',  border: 'rgba(16,185,129,0.2)' },
+};
+
+function RoadmapSection({ roadmap }) {
+  const { i18n } = useLingui();
+  return (
+    <section className="rise-8 space-y-3">
+      <SectionHeader icon={Calendar}><Trans>Action Plan</Trans></SectionHeader>
+      <div className="space-y-3">
+        {roadmap.map((phase, i) => {
+          const cfg = PHASE_THEME_COLOR[phase.theme] ?? { text: '#6b7280', bg: 'rgba(107,114,128,0.08)', border: 'rgba(107,114,128,0.2)' };
+          return (
+            <div key={i} className="rounded-xl bg-card p-5 @xl:p-6 space-y-3"
+              style={{ border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(13,15,26,0.04)' }}>
+              <div className="flex items-center gap-3">
+                <span className="text-xs font-mono font-semibold px-2.5 py-1 rounded-full border"
+                  style={{ color: cfg.text, background: cfg.bg, borderColor: cfg.border }}>
+                  {phase.label}
+                </span>
+                <span className="text-base font-semibold" style={{ color: cfg.text }}>{phase.theme}</span>
+              </div>
+              <ul className="space-y-0 divide-y divide-[#e5e7eb]/20">
+                {phase.tasks.map((t, j) => {
+                  const effortLabel = t.effort_estimate
+                    ? (EFFORT_ESTIMATE_LABEL[t.effort_estimate] ? i18n._(EFFORT_ESTIMATE_LABEL[t.effort_estimate]) : t.effort_estimate)
+                    : t.note || null;
+                  return (
+                    <li key={j} className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
+                      <span className="shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-2xs font-bold tabular-nums"
+                        style={{ background: cfg.text + '18', color: cfg.text }}>
+                        {String(j + 1).padStart(2, '0')}
+                      </span>
+                      <p className="flex-1 text-base leading-relaxed min-w-0">{t.task}</p>
+                      {effortLabel && (
+                        <span className="shrink-0 inline-flex items-center gap-1 text-2xs font-semibold px-2 py-0.5 rounded-md border border-border bg-muted/40 text-muted-foreground">
+                          <Clock size={10} strokeWidth={2} />
+                          {effortLabel}
+                        </span>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
+
+export default function AuditReportV1({ data, leadToken = null, email = null }) {
+  const { t, i18n } = useLingui();
+  const showExecutionOffer = Boolean(leadToken) && Boolean(data);
+  const execServices = React.useMemo(
+    () => (showExecutionOffer ? computeExecutionServices(data) : []),
+    [showExecutionOffer, data],
+  );
+  const [execOpen, setExecOpen] = React.useState(false);
+  const openExec = React.useCallback((source) => {
+    setExecOpen(true);
+  }, []);
+
+  if (!data) return null;
+
+  const showCoverageBanner =
+    data.total_sitemap_urls > 0 &&
+    data.pages_crawled / data.total_sitemap_urls < 0.3;
+
+  const dateStr = data.generated_at
+    ? new Date(data.generated_at).toLocaleDateString(i18n.locale, {
+        day: 'numeric', month: 'short', year: 'numeric',
+      })
+    : '';
+
+  const pagesCrawled = data.pages_crawled;
+  const sitemapUrls = data.total_sitemap_urls;
+
+  // Support both new key_signals (array) and old executive_summary (string fallback)
+  const keySignals = Array.isArray(data.key_signals) && data.key_signals.length
+    ? data.key_signals
+    : data.executive_summary
+      ? [data.executive_summary.slice(0, 120)]
+      : [];
+
+  return (
+    <div
+      className="min-h-full"
+      style={{
+        // This is a printed thing, and it says so. It used to take its ground
+        // and its ink from the app's tokens while painting sixty fixed hexes
+        // inside them, which is the exact half-way the contrast review named:
+        // in dark mode the chrome inverted and the content did not, so the
+        // finding titles landed at 1.11:1 and the KPI tables stayed white
+        // islands. Declaring `color-scheme: light` makes the report a document
+        // the way the insights brief and every other generated artifact is one
+        // — consistent in both themes, and legible because it is only ever
+        // asked to be legible once. Its container (ArtifactRenderer, the audit
+        // workspace) owns the surrounding surface and sets it off with a
+        // border, rather than this pretending to be part of the page.
+        colorScheme: "light",
+        // Redefining the semantic tokens for this subtree is what makes the
+        // decision hold: the ~30 places inside that already say
+        // `text-foreground` or `var(--border)` keep saying it and now resolve
+        // to the document's palette in BOTH themes, instead of inverting away
+        // from the hexes beside them. Nothing below needs to know.
+        "--background": "#ffffff",
+        "--foreground": "#1a1a1a",
+        "--card": "#ffffff",
+        "--card-foreground": "#1a1a1a",
+        "--muted-foreground": "#5b6072",
+        "--border": "#e5e7eb",
+        "--input": "#e5e7eb",
+        color: "var(--foreground)",
+        background: `
+          radial-gradient(900px 500px at 90% 0%, rgba(255,92,0,0.07), transparent 60%),
+          radial-gradient(700px 600px at -5% 30%, rgba(255,92,0,0.04), transparent 55%),
+          #ffffff
+        `,
+      }}
+    >
+      <style>{GLOBAL_STYLE}</style>
+
+      <div className="max-w-4xl mx-auto px-4 py-10 @xl:py-14 space-y-8">
+
+        {/* ── Dark hero card ───────────────────────────────────────────── */}
+        <div className="rise-0 rounded-2xl overflow-hidden shadow-xl"
+          style={{ background: DUCT_NAVY }}>
+          <div className="px-5 pt-6 pb-6 @xl:px-8 @xl:pt-8 @xl:pb-7 flex flex-col-reverse @xl:flex-row @xl:items-start @xl:justify-between gap-5 @xl:gap-6">
+            <div className="flex-1 min-w-0 space-y-4">
+              <p className="text-xs font-medium tracking-wide truncate"
+                style={{ color: DUCT_ORANGE }}>{data.url}</p>
+              <h1 style={{
+                fontFamily: 'Georgia, "Times New Roman", serif',
+                color: DUCT_CREAM,
+                fontSize: 'clamp(1.35rem, 5vw, 2.5rem)',
+                fontWeight: 700,
+                lineHeight: 1.2,
+                letterSpacing: '-0.02em',
+                margin: 0,
+              }}>
+                {data.headline || t`SEO Audit Report`}
+              </h1>
+              <StatsStrip data={data} dateStr={dateStr} dark />
+            </div>
+            <div className="shrink-0 self-start @xl:self-auto">
+              <ScoreGauge score={data.overall_score} band={data.score_band} dark />
+            </div>
+          </div>
+          <div style={{ height: 3, background: 'linear-gradient(90deg, #ff5c00, #ff8c42 60%, transparent)' }} />
+        </div>
+
+        {/* ── Key signals — 3-column brief (replaces paragraph summary) ─ */}
+        {keySignals.length > 0 && <KeySignals signals={keySignals} />}
+
+        {/* ── Coverage banner ──────────────────────────────────────────── */}
+        {showCoverageBanner && (
+          <div className="rise-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-300"
+            data-tooltip={t`Only a sample of your sitemap was scanned.`}>
+            <Trans><span className="font-semibold">Limited scan: </span>Based on {pagesCrawled} of {sitemapUrls} sitemap pages.</Trans>
+          </div>
+        )}
+
+        {/* ── Crawl health ─────────────────────────────────────────────── */}
+        {data.crawl_summary && (
+          <section className="rise-3 space-y-3">
+            <SectionHeader icon={Activity}><Trans>Crawl Health</Trans></SectionHeader>
+            <CrawlSummaryStrip summary={data.crawl_summary} />
+          </section>
+        )}
+
+        {/* ── What's going right ───────────────────────────────────────── */}
+        {data.wins?.length > 0 && <WinsStrip wins={data.wins} />}
+
+        {/* ── Competitive landscape / strategic narrative ───────────────── */}
+        {data.strategic_narrative && <StrategicNarrative narrative={data.strategic_narrative} />}
+
+        {/* ── Fix these first ──────────────────────────────────────────── */}
+        {data.top_priorities?.length > 0 && (
+          <section className="rise-5 space-y-3">
+            <SectionHeader icon={AlertTriangle}><Trans>Fix These First</Trans></SectionHeader>
+            <div className="space-y-2">
+              {data.top_priorities.map(p => <PriorityCard key={p.rank} priority={p} />)}
+            </div>
+          </section>
+        )}
+
+        {/* ── Execution upsell (public lead reports only) ──────────────── */}
+        {showExecutionOffer && (
+          <ExecutionOfferBlock services={execServices} onOpen={openExec} />
+        )}
+
+        {/* ── Impact × Effort matrix ───────────────────────────────────── */}
+        {data.categories?.length > 0 && (
+          <ImpactEffortMatrix categories={data.categories} />
+        )}
+
+        {/* ── Category scores ──────────────────────────────────────────── */}
+        {data.categories?.length > 0 && (
+          <section className="rise-6 space-y-3">
+            <SectionHeader icon={BarChart2}><Trans>Category Scores</Trans></SectionHeader>
+            <div className="rounded-xl bg-card px-5 py-5"
+              style={{ border: '1px solid var(--border)', boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}>
+              <CategoryBarChart categories={data.categories} />
+            </div>
+          </section>
+        )}
+
+        {/* ── Findings accordion ───────────────────────────────────────── */}
+        {data.categories?.length > 0 && (
+          <section className="rise-7 space-y-3">
+            <SectionHeader icon={Target}><Trans>Findings by Category</Trans></SectionHeader>
+            <div className="rounded-xl overflow-hidden bg-card"
+              style={{ border: '1px solid var(--border)', boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}>
+              {data.categories.map((cat, i) => (
+                <CategoryAccordion
+                  key={cat.id}
+                  category={cat}
+                  isLast={i === data.categories.length - 1}
+                />
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* ── Action plan roadmap ──────────────────────────────────────── */}
+        {data.roadmap?.length > 0 && <RoadmapSection roadmap={data.roadmap} />}
+
+        {/* ── Soft closing execution CTA (public lead reports only) ────── */}
+        {showExecutionOffer && <ExecutionClosingLine onOpen={openExec} />}
+
+        {/* ── Footer ───────────────────────────────────────────────────── */}
+        <footer className="text-center text-xs pt-4 border-t border-[#e5e7eb]/40"
+          style={{ color: 'rgba(13,15,26,0.62)' }}>
+          <Trans>Generated by <span style={{ color: DUCT_ORANGE, fontWeight: 600 }}>Duct</span> · getduct.ai</Trans>
+        </footer>
+
+      </div>
+
+      {showExecutionOffer && (
+        <ExecutionRequestModal
+          open={execOpen}
+          onClose={() => setExecOpen(false)}
+          services={execServices}
+          leadToken={leadToken}
+          email={email}
+        />
+      )}
+    </div>
+  );
+}

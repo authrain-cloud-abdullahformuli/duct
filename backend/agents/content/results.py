@@ -1,0 +1,86 @@
+"""Typed result models for content MCP tools.
+
+Tool handlers return JSON text blocks the model reads and feeds back (e.g.
+``asset_ids`` → ``input_asset_ids``, ``attached_to``, ``asset_url``). Modeling
+those results makes the contract explicit and validated instead of hand-built
+``json.dumps`` dicts scattered across handlers. Serialize via
+``tools._ok_model`` (text-only) or ``tools._ok_with_images`` (image + text).
+
+Relational preconditions ("slide_id exists on THIS post") are enforced by the
+``_require_*`` runtime guards in ``tools.py`` — those are about live state, which
+a static schema can't express; these models are the *shape* contract.
+"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel
+
+
+class GenerateImageResult(BaseModel):
+    asset_ids: list[str]
+    asset_urls: list[str]
+    model: str
+    attached_to: str | None = None  # slide_id the image was attached to, or null
+
+
+class GenerateVideoResult(BaseModel):
+    asset_id: str
+    url: str
+    model: str
+    duration_seconds: int
+    aspect_ratio: str
+    resolution: str
+    cost_usd: float | None = None     # None when the provider reported nothing and the table has no row
+    attached_to_post: str | None = None
+    notes: list[str] = []             # what fit_request changed to suit the model
+
+
+class EditImageResult(BaseModel):
+    asset_ids: list[str]
+    asset_urls: list[str]
+    model: str
+
+
+class RenderSlideResult(BaseModel):
+    slide_id: str
+    asset_url: str
+    width: int = 1080
+    height: int = 1920
+    note: str = ""
+
+
+class EditSlideResult(BaseModel):
+    post_id: str
+    slide_id: str
+    updated: list[str]  # the patched field names
+
+
+class SubmitPlanResult(BaseModel):
+    # "proposed" until the person accepts it in the viewport; plan_id is then
+    # the live plan's and "" before, because a proposal is not a row.
+    status: str = "proposed"
+    plan_id: str = ""
+    replaces_plan_id: str = ""
+    days: int
+    # Day indexes left as they were because a post was already drafted for
+    # them; the plan's chat says so rather than claiming the change landed.
+    kept_days: list[int] = []
+
+
+class SubmitPostResult(BaseModel):
+    post_id: str
+    post_dir_slug: str
+    slide_count: int
+    images_generated: int
+
+
+class MarkPostedResult(BaseModel):
+    post_id: str
+    status: str
+
+
+class LogMetricsResult(BaseModel):
+    post_id: str
+    view_count: int
+    like_count: int
+    snapshots: int

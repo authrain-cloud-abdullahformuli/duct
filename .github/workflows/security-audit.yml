@@ -1,0 +1,104 @@
+name: Security Audit
+
+permissions:
+  contents: read
+
+on:
+  # No `paths` filter, deliberately: this one is repo-wide. A committed secret
+  # or an f-string SQL construction can arrive in any directory, and the check
+  # costs minutes rather than the tens of minutes the build jobs do.
+  # `edited` dropped for the same reason as everywhere else — a retitled PR is
+  # not a new security posture.
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+jobs:
+  security-audit:
+    name: Local policy parity security scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Blocking. scripts/security/audit.py only returns non-zero on CRITICAL
+    # findings — everything lower is reported and passes — so a red run here
+    # means something worth stopping for. Suppress a known-safe critical by
+    # fingerprinting it into .security-audit-baseline.json (`--write-baseline`)
+    # with a note, rather than by making this advisory again.
+    continue-on-error: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: stable
+
+      # The previous version of this step installed the scanners with
+      # `npm install -g @semgrep/semgrep gitleaks osv-scanner trivy || true`.
+      # Three of those four are not npm packages — they 404 — and npm resolves
+      # every spec before installing, so the whole command failed and `|| true`
+      # swallowed it. gitleaks never landed either, which meant the only check
+      # in audit.py that raises CRITICAL had never actually run in CI.
+      #
+      # Each tool is now installed from where it is really published, and there
+      # is no `|| true`: a scanner that cannot be installed should fail the job,
+      # not silently downgrade the audit.
+      - name: Install security scanners
+        env:
+          OPENGREP_VERSION: v1.33.1
+          BETTERLEAKS_VERSION: v1.10.0
+          TRIVY_VERSION: v0.76.2
+          OSV_SCANNER_VERSION: v2.7.0
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pip-audit bandit checkov
+          # Opengrep, not Semgrep: the LGPL-2.1 community fork restores the
+          # taint analysis and interprocedural scanning that Semgrep moved
+          # behind its commercial tier, and is governed by a consortium rather
+          # than a single vendor. Same flags, same JSON schema.
+          # Versions are pinned because every one of these installers otherwise
+          # asks GitHub for "latest" first, over an API that runners share an
+          # unauthenticated rate limit on and that GitHub degrades first. On
+          # 2026-11-08 that lookup failed six runs in a row and held every
+          # merge to main for two hours. Dependabot cannot see a pin inside a
+          # shell line, so bumping these is a deliberate edit here.
+          curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh \
+            | bash -s -- -v "$OPENGREP_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # betterleaks is the maintained successor to gitleaks by its original
+          # author, and the only scanner whose findings audit.py treats as
+          # CRITICAL. It reads .betterleaks.toml, which carries Duct's own rules.
+          go install "github.com/betterleaks/betterleaks@$BETTERLEAKS_VERSION"
+          # osv-scanner 2.x lives under the /v2 module path. The old path's
+          # "latest" was v1.9.2 from 2024, which has no `scan source` command,
+          # so every run until now logged an execution issue instead of a scan.
+          go install "github.com/google/osv-scanner/v2/cmd/osv-scanner@$OSV_SCANNER_VERSION"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin "$TRIVY_VERSION"
+
+      # Runs over every tracked file, not just the diff: a credential added
+      # before the hook existed is just as public as one added today.
+      # --require so a missing binary fails the job. Locally the same script
+      # warns and passes, so a contributor without betterleaks is not blocked.
+      - name: Leak scan (betterleaks, tracked files)
+        run: python3 scripts/security/leak_scan.py --all --require
+
+      - name: Run security audit (deep)
+        run: |
+          python3 scripts/security/audit.py --mode deep

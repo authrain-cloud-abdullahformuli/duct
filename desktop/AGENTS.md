@@ -1,0 +1,733 @@
+# Duct Desktop — agent instructions
+
+Tauri v2 shell that loads the hosted Duct web app, plus an OS-keychain store for
+bring-your-own provider API keys. Design:
+`docs/engineering/2026-06-18-tauri-desktop-byo-keys-plan.md`.
+
+**Two build shapes, one binary.** The official build is a thin client
+that talks to the hosted API. A self-host build restores `bundle.resources` and
+ships the FastAPI backend frozen by PyInstaller (~470 MB), which the shell then
+supervises on a loopback port. The difference is one config entry — the Rust is
+identical, and `sidecar::is_available` probes at runtime for what actually
+shipped rather than being compiled two ways. Never gate this on a cargo
+feature: that would mean two binaries and two capability sets to keep honest.
+
+**If a build ships the sidecar, everything under `backend/` is on the user's
+disk** — routes, models, agents, prompts. Neither shape carries a credential
+(the sidecar mints its own local secrets on first run), but a sidecar build
+carries all the code.
+
+## Stack
+
+- **Tauri v2** (Rust core) + the system webview. The main window loads the
+  hosted URL (`app.getduct.ai`, set in `src-tauri/tauri.conf.json`). GA may
+  switch to a bundled static export.
+- **The main window starts hidden, behind a splash.** Loading a remote URL
+  means an empty frame for as long as the network takes — measured at 0.3–2.3 s
+  just to return the document, and 5.5 s to finish loading on a busy machine.
+  So `main` is `"visible": false` in all three configs, `desktop/src/` holds a
+  splash that paints with no network at all, and `on_page_load` shows the real
+  window and closes the splash once the app has loaded — once, on the first
+  load. Later loads (a reload, a navigation) leave focus where the user put it;
+  `MAIN_REVEALED` is the flag.
+
+  Three things here are load bearing:
+  - **The splash window is built in Rust (`open_splash`), not declared in
+    config.** Tauri *replaces* `app.windows` when merging a `--config` overlay,
+    and the dev and self-host configs each carry their own copy of that array —
+    a window declared only in the base config vanishes from both, silently.
+  - **`"visible": false` must be set in every config that defines `windows`**,
+    for the same reason. All four do (`local` was missing it, which opened
+    a blank window beside the splash).
+  - **`SPLASH_DEADLINE` reveals the window regardless after 30 s.**
+    `on_page_load` never fires if the hosted app is unreachable, and a hidden
+    main window behind a splash that never dismisses is an app with no way in
+    and no way out but Force Quit. Keep the deadline well clear of a real slow
+    load or it reveals a half-rendered window; the splash itself explains the
+    wait after six seconds.
+
+  `desktop/src/` is the `frontendDist`, and until this it was still the
+  unmodified `create-tauri-app` scaffold — a "Welcome to Tauri" page with a
+  greet form calling a command that does not exist. It shipped in every bundle
+  and was never shown.
+
+  **The splash has no subresources, and that is the design.** It exists to
+  paint before the network resolves, so it must render from one document: no
+  stylesheet request, no script file, no web font. The brand tokens are copied
+  from `site/assets/duct.css` by hand rather than imported, for that reason —
+  there are four, keep them in step. `salve.webp` is the single exception and
+  is loaded only on a first run (below).
+
+  **What fills the wait.** The status line under the bar holds a rotating
+  one-line aqueduct remark, and at `SLOW_AFTER_MS` (8 s) it stops and is
+  replaced by "Still connecting. Check your network." Two constraints on
+  anything added here:
+  - **One line at 380 px.** The row is a fixed 16 px so nothing shifts when the
+    slow message arrives; a wrapping line breaks that and a line nobody can
+    finish reading in a glance makes the wait feel *longer*, which is the
+    opposite of the point. The widest current line measures 291 px of 340 px
+    available.
+  - **It stops being funny at 8 s.** Past that something is actually wrong, and
+    a quip sitting on top of a real failure is the part users resent.
+
+  These strings are **English only and deliberately not translated.** The
+  splash has no i18n catalogue and cannot get one without adding the
+  subresource the window exists to avoid; it is pre-authentication, so there is
+  no `interface_language` to read yet either. A non-English user sees English
+  for two seconds. If that ever stops being acceptable, the fix is to drop the
+  line entirely for non-English locales, not to fetch a catalogue here.
+
+- **The main window is built in Rust too (`open_main_window`), from its
+  config entry.** Every config marks `main` `"create": false`, because a
+  navigation guard can only be attached while a window is being built and
+  Tauri builds config windows before `setup` runs. `on_navigation` is that
+  guard (`navigation_policy`): the app's origin loads, any other web URL is
+  opened in the system browser instead, and every other scheme is dropped.
+  The window is the product; a page from somewhere else inside it wears
+  Duct's frame with no address bar to say so. Two things to know before
+  touching it:
+  - **The origin comes from `app.windows[0].url`**, the same place the
+    sidecar's `FRONTEND_ORIGIN` and a deep link's destination read it, so the
+    three cannot disagree. A config whose window has no remote URL fails
+    setup rather than running unguarded.
+  - **On macOS and Linux the webview asks the guard about frames too** (wry
+    passes no frame information), so an `<iframe src>` on another origin is
+    not blocked but bounced: cancelled in the window and opened in the
+    browser. Every iframe the app renders is `srcdoc`, which navigates to
+    `about:srcdoc` and passes; so do `about:blank` and a `blob:` the app's
+    own origin created, and the one foreign frame the app embeds: Cloudflare
+    Turnstile's challenge, listed in `EMBEDDED_FRAME_ORIGINS`. Nothing else
+    (`data:` and a foreign blob are a foreign page without the request).
+    **A new `<iframe src>` in `app/` adds its origin to that list in the same
+    change**, with its case in the test beside it. 0.7.2 shipped without
+    Turnstile's: every official build talks to the hosted API, which requires
+    the challenge, so on macOS the sign-in page opened Safari on the
+    challenge URL and said "Security check failed to load". No dev build
+    caught it because a sidecar build skips Turnstile.
+- **The first launch is greeted once.** `claim_first_run` looks for a `greeted`
+  marker in the app data dir; if it is absent it writes one and returns true,
+  and `open_splash` then builds a 380×330 window (instead of 380×150) and
+  injects `window.__DUCT_FIRST_RUN__`, which makes the page show the `salve`
+  mosaic and the product line in place of the rotating remark.
+
+  - **Rust decides, not the page.** The window size is fixed when the window is
+    built, before a webview exists, so `localStorage` cannot be what answers
+    this. The injected global is used rather than a query string because
+    `WebviewUrl::App` takes a path and a `?` in a path is an encoding question
+    worth not asking. `?first=1` does the same thing when the file is opened
+    directly in a browser, which is the only way to review it without a build.
+  - **The marker is written up front, not on success.** A greeting missed after
+    a crash on the very first launch costs nothing; a greeting repeating every
+    launch until one succeeds is a bug the user watches happen. Every failure
+    path — no data dir, unwritable directory — answers "not a first run" for
+    the same reason: if the marker cannot be recorded, greeting now means
+    greeting again next time.
+  - **`desktop/src/salve.webp` is a copy of `app/public/art/mosaic/salve.webp`**
+    and can drift from it. It is duplicated because `frontendDist` is bundled
+    from `desktop/src/` alone. Re-copy it if the panel is regenerated.
+  - Why only here: `app/DESIGN.md` puts panels *where someone arrives*, and
+    says the rarer the surface the more it can afford. A splash is the least
+    rare surface in the product, so it earns the least — but a first launch is
+    the arrival `salve` was drawn for, and showing it every time would both
+    cost a 118 KB decode on the one surface that cannot afford it and wear out
+    an illustration whose whole meaning is "first run".
+- **Keychain** via the `keyring` crate; commands in `src-tauri/src/lib.rs`
+  (`get_provider_key` / `set_provider_key` / `delete_provider_key`). The web app
+  calls them through `window.__TAURI__.core.invoke` (`app/src/lib/providerKeys.js`).
+- **Browser-based OAuth**: *every* OAuth flow runs in the system browser, because
+  Google refuses it inside an embedded webview and a user in one has none of
+  their browser's sessions, passwords or passkeys. The web app probes
+  `get_shell_info` and calls `open_external` (http/https only) to launch the
+  authorize URL; the backend redirects back via a
+  `ai.getduct.desktop://` deep link (tauri-plugin-deep-link) that the shell
+  forwards into the webview. Two routes, same shape:
+  - `//auth?auth_code=` → `/?auth_code=` — signing in to Duct
+    (`capabilities.browserAuth`, `backend/routes/signin.py`).
+  - `//connector?connector=&auth_code=` → `/connections?connector=&auth_code=`
+    — connecting a data source (`capabilities.browserConnectors`,
+    `backend/routes/auth.py`, started by `app/src/lib/connectorAuth.js`).
+
+  **No credential ever rides in a deep link.** Any app on the machine can claim
+  the scheme, so both routes carry only a single-use, short-lived code. For
+  sign-in the webview redeems it for the session JWT (`/auth/exchange`). For a
+  connector it is a claim ticket: the webview's signed-in Connections page
+  claims the grant (`POST /api/user/connectors/claim`), the backend stores the
+  refresh token for the user who started the connect, and the token never
+  reaches the webview or the browser at all (issue #456). The code is
+  delivered to the *configured* window URL, never to `window.url()`: a window
+  the page had sent elsewhere would otherwise receive it. The deep-link shape
+  (`connector` + `auth_code`, both required by `deep_link_target`) is a
+  contract with released shells; change the backend's redirect, never it.
+
+  Both flows also route their failures to the app's `/desktop-auth` relay page
+  rather than raising. The system browser renders whatever the loopback sidecar
+  returns, so an `HTTPException` there is a bare `{"detail": ...}` on a white
+  page — a dead end reached *after* the user already approved at Google.
+
+  New shell-dependent web flows must be gated on a `get_shell_info` capability
+  flag, never on version sniffing — old shells keep the legacy path.
+
+- **"Continue with ChatGPT"** (`src-tauri/src/chatgpt.rs`,
+  `capabilities.chatgptAuth`) is the one OAuth the shell runs *itself* rather
+  than relaying to the backend: OpenAI's ChatGPT client accepts exactly one
+  redirect, `http://localhost:1455/auth/callback`, which only a process on the
+  user's machine can serve. PKCE in the system browser, a hand-rolled
+  one-request loopback listener, the token exchange over reqwest, and the whole
+  bundle in the keychain under its own service (`ai.getduct.desktop.chatgpt`).
+  **The refresh token never leaves the machine.** `chatgpt_credential` hands
+  the web app an hour-long access token plus the account id, refreshing first
+  when needed; the web app sends those as the OpenAI request headers
+  (`app/src/lib/chatgpt.js`, `backend/agents/core/codex.py`). It is not
+  `~/.codex/auth.json` on purpose — rotating a refresh token there signs the
+  user out of the Codex CLI. Whether the path is *allowed* is the backend's
+  `CHATGPT_AUTH_ENABLED`; the shell only says whether it *can*. One sign-in
+  waits on the port at a time: a new `chatgpt_login` replaces a pending one
+  rather than reporting "address in use" — a closed browser tab tells the
+  shell nothing — and `chatgpt_login_cancel` ends it without waiting out the
+  five-minute timeout. The listener is bound *before* the browser opens, so
+  a bind failure never leaves a tab open with nowhere to land, and a
+  callback carrying someone else's `state` is answered and ignored rather
+  than ending the wait.
+
+  **A dev rebuild loses every keychain item, and looks like a bug in the
+  feature.** macOS grants keychain access per application *signature*. A debug
+  bundle is ad-hoc signed, so its identity is derived from the binary and
+  changes with every build — yesterday's item is unreadable today, and the
+  error is a bare OSStatus. Worse, replacing the bundle while the app is
+  running leaves a process whose on-disk identity no longer matches what it
+  saved under, so a sign-in stores fine and then reads back as "not signed in"
+  on the very next read. `scripts/install-dev-app.mjs` now refuses to install
+  over a running copy for exactly this reason, and `describe_keyring_error`
+  names the cause on macOS instead of returning the OSStatus. The real fix, if
+  this ever becomes more than a dev annoyance, is signing debug builds with a
+  stable identity rather than ad-hoc.
+
+  **Why released builds do not have that problem.** `keyring` 3.x on macOS uses
+  the legacy file-keychain API (`SecKeychainAddGenericPassword`), so each item
+  carries an ACL naming the app that wrote it, matched by code-signing
+  *designated requirement*. For a Developer ID build that requirement is the
+  bundle identifier plus the team OU — both stable across versions — so an
+  update, a reinstall, or a self-update keeps every saved credential readable
+  with no prompt. Exactly three things break it, and all three are permanent
+  for every existing install: changing `identifier` in `tauri.conf.json`,
+  changing the Apple Team ID the release is signed under, and renaming a
+  keychain service constant. `check-shell-contract.py` pins the identifier and
+  all three service names for that reason; a change there needs a migration
+  that reads the old name and rewrites it, not just a new constant.
+
+  **Multi-user machines are already isolated, by construction.** The crate asks
+  for `SecPreferencesDomain::User`, which is `~/Library/Keychains/login.keychain-db`
+  — one per macOS account, unlocked by that account's login password, and not
+  readable by another logged-in user. The sidecar's data directory is the
+  per-user `~/Library/Application Support/<identifier>` created `0o700`
+  (`backend/utils/appdirs.py`), and the webview's `localStorage` lives in the
+  app's per-user WebKit store. Nothing is written to `/Library` or a shared
+  temporary path. Windows (Credential Manager) and Linux (Secret Service) are
+  per-user in the same way. **Keep it that way**: a credential written anywhere
+  system-wide would be readable by every account on the machine.
+
+  **Sign-in is the one exception, and deliberately so.** A shell without
+  `browserAuth` has no legacy path worth keeping: navigating the webview to
+  Google is refused outright on some platforms, and where it loads, the request
+  carries no `client=desktop`, so `signin.py` records the plain web flow and the
+  callback hands the session to the hosted app. The shell never gets a token and
+  the user is left staring at the web app inside their desktop window. The sign-in
+  page therefore stops and says the app needs updating rather than degrading into
+  a flow that cannot complete.
+- **`target="_blank"` links are dead in the webview** (no tabs, no window
+  opening) and are rerouted to the system browser by
+  `installExternalLinkHandler` in `app/src/lib/shell.js`, mounted once by
+  `LocalBackendGate`. It deliberately only touches anchors that already asked
+  for a new tab; a link meant to navigate this window still does.
+- macOS registers the custom scheme from the built bundle's Info.plist, so the
+  deep-link leg only works from a bundled app (`tauri build`), not `tauri dev`.
+  A link that *launched* the app is read from `get_current` in `setup`;
+  `on_open_url` only hears the ones that arrive afterwards. Both go through
+  `route_deep_link`, so the two paths cannot drift.
+- **Local backend ("sidecar")** — *not in the official build*: a sidecar build ships the FastAPI backend frozen by
+  PyInstaller (`backend/duct_sidecar.spec`), supervised by
+  `src-tauri/src/sidecar.rs`. It binds a loopback port the OS picks, persists to
+  SQLite in the per-user data dir, and prints one JSON handshake line the shell
+  reads. The web app gets it via `get_sidecar_info` and repoints its API base
+  (`app/src/lib/localBackend.js`), gated on the `localSidecar` capability.
+  Build it with `npm --prefix desktop run sidecar`, because `bundle.resources`
+  copies `backend/dist/duct-sidecar/` verbatim and a stale or missing build
+  ships a broken app. After the first one you rarely will:
+  `scripts/ensure-sidecar-fresh.mjs` is a `pre*` hook on every
+  sidecar-shipping script and refreezes in the same command whenever the
+  backend has moved ahead; `DUCT_SKIP_SIDECAR_CHECK=1` opts out. It refuses
+  while an app is running from the freeze, because a frozen app finds its files
+  by the path it started from and a swap breaks whatever it imports next. Quit
+  the app first; a second launch only hands off to the running one. The freeze is
+  **onedir, never onefile**: a onefile binary unpacks to a temp dir at startup
+  and does not survive signing + notarization.
+
+  **A dev build runs any freeze it finds**, through the working-copy fallback
+  in `sidecar_path`, and the web app then talks to it instead of the API it
+  was configured for. That is the self-host shape, not the one users get, and
+  it costs the refreeze above on every backend change. `DUCT_NO_DEV_SIDECAR=1`
+  in the app's environment switches the fallback off (a bundled sidecar is
+  unaffected), which is how the "Desktop + API" launches run the thin client
+  against the local API. It reaches a bundle only through `open --env`.
+
+  **Never run `pyinstaller duct_sidecar.spec` at this directory directly.** It
+  deletes its output directory before rebuilding, and a dev build ships no
+  sidecar of its own — `tauri.dev.conf.json` sets no `bundle.resources`, so
+  `sidecar.rs` resolves `backend/dist/duct-sidecar/` at *runtime*. Freezing in
+  place therefore strips the binary and every dylib out from under a sidecar a
+  running app is executing. It presents as "Duct's local backend stopped
+  responding", which reads as an app bug and is not one. The script freezes to
+  `dist/.staging` and renames it into place, so the displaced directory stays
+  whole for whatever is still running from it and is swept on the next
+  refreeze.
+
+  **E0463 "can't find crate" for a macro crate is macOS refusing its library,
+  not a stale cache.** rustc swallows the loader's reason, so ask for it:
+  `python3 -c "import ctypes,sys; ctypes.CDLL(sys.argv[1])" <path to the .dylib>`,
+  with the path from `cargo build --verbose`'s `--extern`. "mis-aligned LINKEDIT
+  string pool" is rust-objcopy's strip dropping the padding after an odd number
+  of indirect symbols, refused once a library is built against SDK 27, which is
+  why `[profile.dev.package."*"]` sets `strip = "none"`. It looked intermittent
+  because `tauri dev` and `tauri build` use different features, so each loads
+  its own copy of the library.
+
+  **Stop what you started.** `open` hands the dev bundle to launchd, so no
+  debug session owns it, VS Code's Stop cannot close it, and no `postDebugTask`
+  can attach — every launch outlives the thing that launched it. The
+  `Duct: stop everything` task in `.vscode/tasks.json` is the one command that
+  clears all of it. The sidecar ends with the shell however the shell ends:
+  it runs with `--exit-on-stdin-eof` on a pipe only the shell holds, so a
+  crash, a `kill -9` or a relaunch for an update closes the pipe and the
+  sidecar stops itself (SIGTERM to uvicorn, then a hard exit two seconds
+  later). A graceful quit reaches `RunEvent::Exit`, which closes the pipe
+  deliberately and gives it the same two seconds before killing it. The
+  `Child` in `SidecarState` holds the pipe's write end; take `stdin` out of
+  it anywhere but `shutdown` and the sidecar exits on the spot.
+
+  **The same pipe carries the secrets in.** The shell's keychain copies (the
+  local API key, the JWT secret, the credentials encryption key) and the
+  baked-in Google client secret go to the sidecar as one JSON line on stdin
+  (`secrets_line` in `sidecar.rs`, flag `--secrets-on-stdin`), written right
+  after spawn and before the handshake is read. They used to be child
+  environment variables, which every process the user runs can read and every
+  subprocess inherits; the sidecar scrubs the names from its own environment
+  once its settings object has read them. Which secret to send is decided
+  exactly as before — the keychain fallbacks, the pinned-env-file guard, the
+  "never overwrite what someone chose" checks — only the channel changed. A
+  new secret goes on the line, never in `command.env`, and its name joins
+  `SECRET_ENV_NAMES` in `local_server.py` so the scrub covers it.
+- **Windows and Linux** ship from the same pipeline: NSIS on Windows, deb +
+  AppImage on Linux. They still need their own runners even without the sidecar
+  — Tauri bundles are not cross-compiled — and a *sidecar* build additionally
+  needs its own PyInstaller freeze per OS. Two platform differences are load
+  bearing and easy to regress:
+  `tauri-plugin-single-instance` (registered **first**, before every other
+  plugin) — macOS hands a deep link to the running app, but Windows and Linux
+  start a *second* process with the URL in argv, which for this app means a
+  second window and a second sidecar with the auth code in the wrong one; and
+  `CREATE_NO_WINDOW` in `sidecar.rs`, without which every Windows launch pops a
+  console window (the sidecar must stay a console binary — its stdout is the
+  handshake). Windows builds are **not** Authenticode-signed yet, so SmartScreen
+  warns on first run.
+- **System notifications** go through the `notify` command
+  (`tauri-plugin-notification` — the same "our command reaches the plugin from
+  Rust" shape as the updater, for the same remote-origin reason). Registering
+  the plugin still injects a `window.Notification` polyfill into the webview,
+  which invokes `is_permission_granted` on load, so `capabilities/*.json` must
+  permit `notification:allow-is-permission-granted`,
+  `allow-request-permission` and `allow-notify` — the three the polyfill calls.
+  Omitting them does not disable an unused API, it throws a runtime error on
+  every page load.
+  The web app decides *when* (`app/src/lib/notify.js`: only while the window is
+  not focused) and gates on the `notifications` flag from `get_shell_info`; the
+  shell only decides *how*.
+
+  The shell cannot report whether the user has notifications **enabled**: the
+  plugin's desktop `permission_state` returns `Granted` no matter what System
+  Settings says. So the sidebar's row does not assert a state — it offers
+  `open_notification_settings`, which opens the OS page (macOS
+  `x-apple.systempreferences:`, Windows `ms-settings:`) where the real switch
+  is. Gated on `capabilities.notificationSettings`, false on Linux because
+  GNOME, KDE and the rest have no shared page. The command takes no URL, unlike
+  `open_external`: a page that could name the settings URL could name any
+  URL-scheme handler on the machine.
+- **The application menu is built, not defaulted** (`install_app_menu`).
+  `Menu::default` is only a starting point, and two of its choices bite:
+  - Its Help submenu holds a single About item marked
+    `#[cfg(not(target_os = "macos"))]`, so **on macOS Help is empty** — it opens
+    onto nothing and eats the click. Apple expects Help to work and an empty one
+    is a documented App Store rejection (tauri-apps/tauri#9371), which matters
+    because this app is bound for TestFlight. Ours holds the home page, the
+    changelog, the two GitHub destinations the in-app drawer offers, and the
+    privacy policy, and is registered with `set_as_help_menu_for_nsapp` so macOS
+    puts its search field on top.
+  - It also grows a **View submenu of its own** (Toggle Full Screen) — it did
+    not when the reload item was written, and nothing failed when it appeared:
+    the app simply shipped two menus called View. The existing one is removed
+    before ours is inserted, and ours carries Toggle Full Screen so nothing is
+    lost. It is matched by title, because that submenu has no id constant.
+
+  Help items open in the **system browser**, never this webview: the window is
+  the product, and navigating it to a privacy policy strands the user with no
+  back button and no tabs.
+- **The About panel is only as good as `AboutMetadata`.** `Menu::default` fills
+  it from `bundle.copyright` and `bundle.publisher` alone, and `publisher` lands
+  in `authors`, which **macOS does not render** — so the panel was a name, a
+  version and nothing else. `about_metadata()` sets a description twice, from
+  one constant, because the platforms disagree about where it goes: macOS reads
+  `credits` and ignores `comments`, Windows and Linux do the reverse. Setting
+  only one is how a panel ends up blank on half the platforms. Off macOS the
+  About item lives at the foot of our Help menu: replacing the default Help
+  had removed it there, so the `comments` line was never shown.
+- **Off macOS the menu is a bar inside each window**, and `set_menu` attaches it
+  to every window without one — the splash included. `setup` removes it from
+  the splash right after installing it.
+- **View carries zoom** (Actual Size, Zoom In, Zoom Out, on the browser's
+  50–200% ladder) through `set_zoom`, because no system webview binds zoom keys
+  inside an app window and `zoomHotkeysEnabled` needs a webview permission the
+  capabilities deliberately withhold. The shell remembers the level it set
+  (`MAIN_ZOOM`); not every webview reports one back.
+- **The window must fit the screen it opens on.** Every config's `main` sets
+  `center` and `preventOverflow`: at 1200×800 it otherwise ran under the
+  taskbar on 1366×768 and 1280×800 screens.
+- **Linux on NVIDIA:** `run()` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` when
+  the proprietary driver is loaded and the user has not chosen, before any
+  thread starts (`set_var` is not thread-safe). WebKitGTK's DMA-BUF renderer
+  draws a blank window there. Deep-link registration runs on its own thread,
+  because on Linux it waits on two subprocesses and `setup` is the UI thread.
+- **Self-update** is wired: `tauri-plugin-updater` behind a default-on `updater`
+  cargo feature, driven from the web app through `check_for_update` /
+  `install_update` (not the plugin's JS bindings — the window loads a remote
+  origin and cannot import them, which is also why no `updater:*` permission is
+  needed: those gate the plugin's JS API, and our commands reach it from Rust).
+  The manifest is `latest.json` on the GitHub release, assembled by
+  `.github/scripts/build-updater-manifest.mjs`. `--no-default-features` removes
+  the plugin and flips `get_shell_info`'s `autoUpdate` to false; the two commands
+  stay compiled as inert stubs so the capability files are identical across
+  builds. That escape hatch existed for the App Store and now **has no
+  consumer** — either delete the `updater` feature or give it a real one, since
+  a configuration nothing builds is one that silently rots. **The minisign
+  private key is not recoverable** — losing it means no installed copy will ever
+  accept another update.
+- **macOS distribution** is Developer ID + a notarized DMG, and nothing else.
+  The App Store sandbox cannot host a PyInstaller sidecar and embedded
+  interpreters draw rejections — see the engine consolidation review
+  (duct-cloud, private) §8.2 — so that channel could only ship the pre-sidecar
+  thin client. **Retired 2026-09-06**: `tauri.appstore.conf.json`,
+  `Entitlements.appstore.plist` and `desktop-testflight.yml` are deleted. Config
+  is now just `src-tauri/tauri.conf.json` (`bundle.macOS`) +
+  `src-tauri/Entitlements.developerid.plist`. Do not revive it without solving
+  the sandbox problem first — it is not a config gap, it is structural.
+- **Notarization uses the App Store Connect API key** — the three secrets
+  `DUCT_ASC_API_KEY_ID`, `DUCT_ASC_API_ISSUER_ID` and `DUCT_ASC_API_KEY_P8` —
+  rather than an Apple ID paired with an app-specific credential. The name
+  misleads: that key is Apple's developer API
+  credential, not an App Store submission token, and notarization is what lets
+  Gatekeeper open a download that did *not* come from the store. Duct notarizes
+  because it ships outside the App Store, not despite it.
+- **`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is intentionally not set.** The
+  updater key was generated with an empty passphrase, and an undefined secret
+  renders as the empty string, which is the correct value. Do not read the
+  key's scrypt KDF bytes as proof of a passphrase — minisign writes those
+  whether or not one was set. The only test that answers it is signing
+  something: `tauri signer sign` with an empty password succeeds on this key.
+- **The App Store certificates cannot sign the DMG.** Worth stating because the
+  account holds `MAC_APP_DISTRIBUTION` and `MAC_INSTALLER_DISTRIBUTION` from the
+  TestFlight era and they look like the right thing. They are not: Gatekeeper
+  trusts an App Store build because *Apple re-signed it on delivery*, and a
+  download from getduct.ai has no such provenance, so it needs
+  `DEVELOPER_ID_APPLICATION` — which Apple's notary service also requires,
+  rejecting anything else outright. Reusing the old certificate fails twice.
+- **Every installer is published twice**, once under Tauri's versioned name and
+  once under a fixed one (`Duct-macOS-universal.dmg`,
+  `Duct-Windows-x64-setup.exe`, `Duct-Linux-x86_64.AppImage`,
+  `Duct-Linux-amd64.deb`). GitHub redirects
+  `releases/latest/download/<name>` to the newest release only when the name
+  does not change, and Tauri puts the version in every filename — so those four
+  are what getduct.ai links to, and the site needs no JavaScript, no API call
+  and no edit when a version ships. Renaming one breaks the site silently: the
+  link 404s and nothing in this repo fails. Add a platform here and it needs a
+  copy in the publish job and a card on the download page.
+- **Windows installs per user, and the first update moves old installs.**
+  `bundle.windows.nsis.installMode` is `currentUser`: %LOCALAPPDATA%, no admin
+  rights, so a self-update never raises UAC. Up to 0.7.1 it was `perMachine`,
+  which made every update ask for admin under an unsigned publisher name. An
+  update to one of those installs lands beside it, and
+  `src-tauri/windows/installer-hooks.nsh` (`NSIS_HOOK_POSTINSTALL`) runs the
+  old uninstaller silently: one last UAC prompt, then none, with the user's
+  data untouched because it was always per user. Declined, both copies keep
+  working and the old one is offered again at its next update. The hook can
+  only be compiled, not run, off Windows: `makensis` (Homebrew) with a stub
+  harness defining `UNINSTKEY` catches syntax; a real check is a 0.7.1 install
+  updated on a Windows machine.
+- **Windows self-update is easy to lose.** Tauri signs the installer directly
+  (`*-setup.exe.sig`); it used to zip it first (`*-setup.nsis.zip.sig`). v0.4.0
+  shipped with no `windows-x86_64` entry in `latest.json` because the upload
+  still asked for the zip. `if-no-files-found: error` did not catch it — it asks
+  whether *any* pattern matched, and the `.exe` did. The Windows job now checks
+  for a signature explicitly, and `build-updater-manifest.mjs` accepts either
+  name.
+- **Staging the release secrets:** put them in the gitignored
+  `desktop/.env.test` (template: `desktop/.env.example`) and run
+  `scripts/push_env_to_github.py`. A runner cannot read a dotenv, so these only
+  ever reach a build as GitHub secrets; the file is a staging area, not a source
+  of truth. `TAURI_SIGNING_PRIVATE_KEY` and its password are worth pushing
+  first and alone — Linux and Windows bundle successfully without any Apple
+  credential and fail only on the updater signature, so those two turn two of
+  the three platforms green on their own.
+
+## Forkability
+
+Four things identify *Duct's* build rather than the app, and each is
+configuration a fork overrides without editing code. Keep it that way — a new
+Duct-specific constant belongs in one of these places, not inline:
+
+- **Whether a backend ships** — `bundle.resources`. Empty in `tauri.conf.json`
+  (thin client, hosted API); restored by `tauri.selfhost.conf.json` (local
+  sidecar). Probed at runtime, never compiled in.
+
+- **Window URL and bundle identity** — a `--config` overlay
+  (`tauri.selfhost.conf.json` is the template; `dev` and `local` use the same
+  mechanism).
+- **The origin allowed to `invoke`** — `capabilities/selfhost.json`. Changing
+  the window URL without this produces a window that renders and then fails
+  every command with "not allowed. Plugin not found".
+- **The Google desktop OAuth client** — `GOOGLE_DESKTOP_OAUTH_CLIENT_ID` and
+  `…_SECRET`, both `option_env!` in `sidecar.rs` and both baked from
+  `backend/.env.local` by `build.rs`. They are halves of one credential; a
+  change to either without the other fails at the token exchange, not at build.
+
+Code signing is deliberately *not* on that list: those secrets are Duct's legal
+identity and a fork builds unsigned. See "Build your own" in `README.md`.
+
+## Crash reporting
+
+`src/telemetry/` is split on purpose: `mod.rs` holds the policy — the
+preference file, the build default, who is allowed to report — and names no
+vendor. `reporter.rs` holds the vendor, behind the `crash-reporting` Cargo
+feature, with a complete no-op arm for builds without it.
+
+**`crash-reporting` is not a default feature.** The builds we distribute pass
+`--features crash-reporting`; everyone else gets a shell with no reporting code
+compiled in at all. Someone self-hosting Duct did not sign up to run
+our observability, and a default they have to discover in order to remove is not
+a real choice. Swapping PostHog for something else means a third arm in
+`reporter.rs` against its four functions — `is_available`, `init`,
+`capture_message`, `sidecar_env` — and no change anywhere else. Pointing
+`POSTHOG_HOST` at the EU cloud or a self-hosted PostHog needs no code change at
+all.
+
+Three processes, one consent decision:
+
+- **The shell** sends PostHog `$exception` events itself: a panic hook (chained
+  to the previous one) and `capture_message`. No SDK — each report is one JSON
+  POST over the reqwest client the shell already links, with the `blocking`
+  front end added only by the feature, because a panicking thread has to wait
+  for its own request before it dies (five seconds at most). Before this, a
+  Rust panic or a sidecar that would not start left no trace anywhere — the
+  webview's reporter only ever sees JavaScript.
+- **The sidecar** stays silent by default. `local_server.py` blanks
+  `POSTHOG_API_KEY` on purpose ("a user's laptop is not a deployment"), and
+  `sidecar.rs` passes the token and host through *only* when the user has
+  opted in. They go in the environment, not the secrets line: the token is
+  public.
+- **The webview** reports on its own through posthog-js (`app/`) and reads the
+  same switch through `get_telemetry_settings`. Keep that command's shape; the
+  web layer depends on it.
+
+What a native report carries, and what it does not:
+
+- **Anonymous.** `distinct_id` is a random UUID in `telemetry-id` beside
+  `telemetry.json`, made on the first report; events are personless
+  (`$process_person_profile: false`). The user's home directory is replaced
+  with `~` in the message and in every frame path.
+- **Tagged** `$lib: duct-desktop-native`, `surface: desktop-native`,
+  `shell_version`, `$os`, `platform` (`mac`/`windows`/`linux`) and `arch`.
+- **Bounded.** Ten reports per run at most, and the switch is read again before
+  each send, so turning it off stops the shell at once rather than at the next
+  launch.
+- **Not a native crash handler.** A segfault, an abort or an Objective-C
+  exception is not a panic and is not reported. Sentry's Rust SDK did not
+  catch those either.
+
+The preference is `telemetry.json` in the per-user data dir — a preference, not
+a secret, so not the keychain. The builds we distribute set
+`DUCT_TELEMETRY_DEFAULT_ON=1` at build time and report unless the user turns it
+off; a self-host build sets nothing and stays opt-in. *Absent* file means nobody
+chose, so the build default applies; an *unreadable or malformed* file means
+off, because it may be an explicit refusal we are one step from overriding.
+Once the user touches the switch their answer is recorded and no default applies
+again.
+The destination is compiled in: `POSTHOG_PROJECT_TOKEN` (the public `phc_`
+token) and, optionally, `POSTHOG_HOST`, both read by `option_env!` and passed
+by the release workflow as repository variables. With no token the whole path
+is inert and the settings card hides itself rather than offering a switch that
+changes nothing.
+
+The data-dir path is duplicated between `telemetry/mod.rs` and `utils/appdirs.py`
+by necessity — the shell must resolve it *before* the sidecar exists to ask.
+Change one, change the other.
+
+**Crash reports are named from the binary's own symbols, in process.** Nothing
+in `desktop-release.yml` uploads debug symbols to PostHog, so the shipped
+binary's symbol table is the only place frame names exist. That makes
+`strip = true` in `[profile.release]` a silent trap: it breaks no build and no
+test, and turns every report from a release into frames with no names.
+`src-tauri/Cargo.toml` carries the same warning at the place someone would add
+it. If you want stripping — and it is worth roughly 30 MB of bundle — upload
+symbols with `posthog-cli` and send instruction addresses in the same change,
+never before it. Windows already ships no PDB, so its reports carry the panic's
+file and line (compiled in by `#[track_caller]`) and little or no stack.
+
+Frames come from parsing `std::backtrace::Backtrace`'s text, not the
+`backtrace` crate, which would link a second copy of the symbolizer std already
+has. `a_real_backtrace_parses_into_named_frames` is the guard: a toolchain that
+changes the format fails it. Two naming facts it already absorbs: rustc 1.97
+prints v0-style names (`{closure#0}`, `<Type>::method`), and a dev build's
+line tables name this crate's functions bare, so in-app is decided by name
+*or* by file.
+
+## Rules
+
+- Keep this shell thin: no agent code, prompts, or secrets in `desktop/`. The
+  official build ships nothing but the Rust shell; a sidecar build ships
+  `backend/` wholesale, which is a property of that config, not licence to put
+  anything here.
+- Provider keys live only in the OS keychain — never write them to disk or logs.
+- **A command that blocks runs off the main thread.** A plain
+  `#[tauri::command]` runs on the main thread, which is the UI thread; the
+  keyring crate sat on it behind a macOS keychain prompt and the window
+  stopped painting. Keychain, file and bundle-probing commands are
+  `#[tauri::command(async)]`; an `async fn` that needs the keychain wraps the
+  call in `spawn_blocking` (`off_runtime` in `chatgpt.rs`), because a blocked
+  runtime worker stalls every other command in flight. `get_shell_info` is
+  cached in a `OnceLock` for the same reason. `check-shell-contract.py`
+  recognises both spellings of the attribute.
+- Any origin the webview loads must be listed under `remote.urls` in
+  `src-tauri/capabilities/default.json` for `invoke` to work, and it gets the
+  shell's own `allow-*` commands plus the three `notification:*` entries,
+  nothing else. `core:default` and `opener:default` were granted once and
+  reached further than the page needs: path resolution, window and webview
+  enumeration, the devtools toggle, `reveal_item_in_dir`, and `open_url` for
+  any http(s)/mailto/tel address around `open_external`'s rule. The page only
+  ever calls `invoke`; what the shell itself opens (Help links, the
+  notification settings page, the ChatGPT sign-in) goes through Rust and
+  needs no capability. The three capability files keep identical permission
+  lists, so a build shape can never be the one that is wider.
+- **A new `#[tauri::command]` needs three edits, not one.** Add it to
+  `generate_handler!` in `src/lib.rs`, to `AppManifest::commands` in `build.rs`,
+  and as `allow-<kebab-command>` in every capability that needs it. App commands
+  are allowed by default only for *local* content — this window loads a remote
+  origin, and a capability can only grant permissions that exist, so skipping
+  `build.rs` makes the command unreachable with
+  `<command> not allowed. Plugin not found`. The JS side swallows that
+  (`getShellInfo()` returns null, `providerKeys.js` degrades), so it fails
+  silently rather than loudly. An installed build was found in exactly that
+  state — the string literals from inside `get_shell_info` were in the binary
+  while the command name appeared nowhere in the bundle, so every capability
+  probe returned null and the web app treated a current shell as an ancient one.
+  `.github/scripts/check-shell-contract.py` now fails CI on a command missing any
+  of the three, and also guards the version rules below.
+- Local dev origins live in `capabilities/dev-localhost.json`, kept out of
+  release builds by `app.security.capabilities` in `tauri.conf.json` (unset
+  means *all* capability files ship). Only `tauri.dev.conf.json` opts it in.
+- `app.security.capabilities` selects which files are *loaded*, but `tauri-build`
+  **validates every file in `capabilities/`** regardless. So a capability naming
+  a permission from a conditionally-compiled plugin fails the build for
+  configurations that never load that file — which is what a separate `updater`
+  capability once did to a `--no-default-features` build. Keep permissions
+  from optional plugins out of `capabilities/` entirely.
+- Building needs platform webview libraries (see `README.md`); it does not build
+  in the Claude-on-the-web container — build, sign, and release locally or in CI.
+- `Cargo.lock` is committed; refresh it with `cargo generate-lockfile` (or a
+  build) when dependencies change, and commit the result.
+- The desktop sidecar runs **Alembic**, not `create_all` (`backend/db/migrate.py`).
+  Every new migration must therefore be SQLite-safe — JSON columns via
+  `sa.JSON().with_variant(JSONB, 'postgresql')`, `alter_column` inside
+  `op.batch_alter_table`. The pre-baseline revisions are Postgres-only and are
+  never replayed; `backend/tests/test_desktop_migrations.py` guards the path
+  that is.
+- **Entitlements are per build, because the two builds need opposite things.**
+  `Entitlements.developerid.plist` (official, thin) is an empty `<dict/>`;
+  `Entitlements.selfhost.plist` carries the four hardened-runtime exceptions the
+  embedded CPython needs, and `tauri.selfhost.conf.json` selects it. Neither
+  file carries an `app-sandbox` key.
+
+  This used to be one file holding all four, and the note here warned against
+  trimming it: the official build has no interpreter and *would* survive a
+  trimmed file, so stripping the keys leaves thin builds green while every
+  self-host build breaks at launch. That trap is real — the resolution is to
+  split the file, never to delete the keys.
+
+  Trimming the official one matters because those keys are not free. The
+  hardened runtime is what notarization buys; each entitlement is a hole back
+  through it, and `disable-library-validation` — which permits any unsigned
+  dylib to load into the process — cancels much of what signing is for. The
+  official build carried all four for an interpreter it stopped shipping when
+  it became a thin client.
+
+  So: an entitlement goes in the official file only alongside a named binary
+  that fails without it. If an official build ever embeds an interpreter again,
+  copy the keys from the self-host file rather than writing them from memory.
+- The whole `bundle` config uses `deny_unknown_fields`, not just `bundle.macOS`
+  — a mistyped key fails the build rather than being ignored, and JSON has no
+  comments, so there is nowhere to explain a setting *in* the config. An
+  explanatory `"comment"` key fails with `Additional properties are not allowed`.
+  Explain overlay settings here or in `README.md` instead. Key names are
+  camelCase (`minimumSystemVersion`, `hardenedRuntime`, `entitlements`).
+- `bundle.createUpdaterArtifacts` applies to the macOS `app` target too, so
+  `--bundles app` does not opt out of it. `tauri.dev.conf.json` therefore turns
+  it off explicitly — a dev build has no signing key and would otherwise fail
+  *after* writing the `.app`. On this app that archive is a ~160 MB gzip of the
+  470 MB bundle — about 85 seconds per build.
+- **`app` must be in `--bundles` on macOS, next to `dmg`.** Updater archives
+  are only emitted for `app`, `appimage`, `msi` and `nsis` — `dmg` is not one of
+  them, and a `.app` the bundler built merely as an input to the DMG is deleted
+  once packaged. So `--bundles dmg,updater` produces a signed, notarized,
+  stapled DMG and *no* `Duct.app.tar.gz`, which is not an error: the build warns
+  and exits 0. The release then publishes with macOS missing from `latest.json`,
+  and every installed Mac polls forever without ever being offered an update.
+  Linux and Windows are immune only because `appimage` and `nsis` are
+  themselves updater-enabled targets.
+- **The macOS executable is named `desktop`, not `Duct`** — Tauri names it for
+  the Cargo package, and `productName` only names the `.app`. Anything reaching
+  into `Contents/MacOS/` should read `CFBundleExecutable` out of `Info.plist`
+  rather than hardcode either name; setting `mainBinaryName` would rename it
+  again and break a hardcoded path silently.
+
+## Versioning
+
+The shell is the monorepo's only versioned installable — `app/` and `backend/`
+deploy continuously and have no version ritual. The shell version is
+`MAJOR.MINOR.PATCH`, digits and dots only (Apple rejects suffixes like
+`-beta`), and lives in **two files that must always match**:
+`src-tauri/tauri.conf.json` `version` and `src-tauri/Cargo.toml` `version`.
+Refresh `Cargo.lock` after changing Cargo.toml; `get_shell_info` reports the
+Cargo value to the web app.
+
+SemVer here is measured against the **shell↔web contract**: the invoke
+commands, the `get_shell_info` capability flags, the `ai.getduct.desktop://`
+deep-link scheme, the keychain service/format, and the origins allowed to
+invoke. Bump in the same PR as the change, at most one bump per PR:
+
+- **MAJOR** — a capable web app or existing user data breaks against the new
+  shell: removing or renaming an invoke command or capability flag, changing
+  the deep-link scheme or keychain service name, raising
+  `minimumSystemVersion`. `1.0.0` itself is reserved for the first public
+  release.
+- **MINOR** — new capability, backwards compatible: a new invoke command, a
+  new capability flag, a new deep-link route, a new entitlement.
+- **PATCH** — behaviour fixes with no contract change: bug fixes, security
+  fixes, UI/icon polish, dependency bumps.
+- **No bump** — nothing that ships in the bundle changed: CI workflow edits,
+  docs, comments. Markdown-only changes under `desktop/` are excluded from the
+  release workflow's path filter for the same reason. Rebuilds of the same
+  version are already distinguished by the CI-stamped build number.
+
+While the version is `0.y.z` (pre-GA), contract-breaking changes bump MINOR
+instead of MAJOR — but must still be called out in the PR description.
+
+Never set the build number by hand — CI stamps the GitHub run number as
+`CFBundleVersion`, which keeps it monotonic across rebuilds of one version — and
+never gate web-app behaviour on the version string; probe
+`get_shell_info().capabilities` instead.

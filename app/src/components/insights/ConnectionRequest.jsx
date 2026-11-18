@@ -1,0 +1,153 @@
+"use client";
+
+// The agent has decided it needs a data source this project has not connected,
+// and has paused to ask. Rendered inline in the transcript, not as a modal:
+// the reason it gives is part of the conversation, and a modal would imply the
+// run is blocked on the user rather than politely waiting.
+//
+// Declining is a real button, not a dismissal. The agent is told the user
+// skipped, continues with what it has, and says in its output what that left
+// unverified — so "Skip" has to look like a choice, not an escape.
+//
+// One variant: on the onboarding audit a guest is asked for Search Console.
+// A guest has no account for a connection to live on, so the button there is
+// the Google sign-in that also asks for the Search Console and Analytics read
+// scopes — one consent, back into this conversation signed in and connected.
+// That route exists only on that prompt (lib/signInSources.js); every other
+// prompt, and every other sign-in, is unchanged.
+
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { LogIn } from "lucide-react";
+import { Trans } from "@lingui/react/macro";
+import { Button } from "@/components/ui/button";
+import { AnalyticsEvent, AnalyticsParam, trackEvent } from "@/lib/analytics";
+import {
+  KICKOFF_SOURCES,
+  armSignInSources,
+  canSignInToConnect,
+  parkPostSignInRedirect,
+  resumeAuditPath,
+} from "@/lib/signInSources";
+import { consumeConnectorConnected, startConnectorOAuth } from "../../lib/connectorAuth";
+
+export default function ConnectionRequest({ request, onAnswer, disabled, signInToConnect = null, returnTo = "" }) {
+  const router = useRouter();
+  // "" | "starting" | "browser" — "browser" is the desktop shell waiting on the
+  // system browser, where this window never navigates and the state is the only
+  // thing telling the user anything happened. Mirrors OAuthConnectorCard.
+  const [phase, setPhase] = useState("");
+
+  const { connector_id: connectorId, label, reason, auth_kind: authKind, authorize_path: authorizePath } = request;
+  const isManual = authKind === "manual" || !authorizePath;
+  const viaSignIn = Boolean(signInToConnect?.conversationId) && !isManual && canSignInToConnect(connectorId);
+
+  // The connect left this page (browser redirect) or this window (desktop
+  // shell), and the Connections page sent the user back here with the
+  // connector flagged as adopted. The card is on screen again because the
+  // thread re-raised its pause; answer it, once the session can take an
+  // answer, rather than making the user press "I've connected it" for a
+  // thing the app already knows happened.
+  const autoAnswered = useRef(false);
+  useEffect(() => {
+    if (disabled || autoAnswered.current) return;
+    if (!consumeConnectorConnected(connectorId)) return;
+    autoAnswered.current = true;
+    onAnswer({ connected: true });
+  }, [connectorId, disabled, onAnswer]);
+
+  async function connect() {
+    if (phase === "starting") return;
+    setPhase("starting");
+    try {
+      // `authorize_path` says this connector signs in; the URL itself is
+      // built with a link naming this session's user (lib/connectorAuth.js).
+      const mode = await startConnectorOAuth(connectorId, { returnTo });
+      setPhase(mode === "browser" ? "browser" : "starting");
+    } catch {
+      setPhase("");
+    }
+  }
+
+  function signInAndConnect() {
+    if (phase === "starting") return;
+    setPhase("starting");
+    trackEvent(AnalyticsEvent.SignInToConnect, { [AnalyticsParam.Provider]: connectorId });
+    // Back to this conversation afterwards, opening with a check of what the
+    // consent actually connected — the resume, not a new run.
+    parkPostSignInRedirect(resumeAuditPath({ ...signInToConnect, kickoff: KICKOFF_SOURCES }));
+    armSignInSources();
+    router.push("/");
+  }
+
+  return (
+    <div className="my-3 space-y-3 rounded-xl border border-info/30 bg-info/5 p-4">
+      <div className="space-y-0.5">
+        <p className="text-sm font-semibold"><Trans>Connect {label}?</Trans></p>
+        {reason && <p className="text-xs text-muted-foreground">{reason}</p>}
+      </div>
+
+      {isManual ? (
+        <p className="text-xs text-muted-foreground">
+          <Trans>
+            {label} needs an API key rather than a sign-in. Add it in the{" "}
+            <a href="/connections" className="underline underline-offset-2 hover:text-foreground">
+              Toolbox
+            </a>
+            , then tell Duct to carry on.
+          </Trans>
+        </p>
+      ) : null}
+
+      {viaSignIn && (
+        <p className="text-xs text-muted-foreground">
+          <Trans>
+            One Google sign-in does both: it saves this project to an account and lets Duct read
+            Search Console and Analytics. Read-only, and you can untick either at Google.
+          </Trans>
+        </p>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        {viaSignIn ? (
+          <Button size="sm" onClick={signInAndConnect} disabled={disabled || phase === "starting"}>
+            <LogIn className="size-4" aria-hidden />
+            {phase === "starting" ? <Trans>Opening…</Trans> : <Trans>Sign in with Google to connect</Trans>}
+          </Button>
+        ) : (
+          !isManual && (
+            <Button size="sm" onClick={connect} disabled={disabled || phase === "starting"}>
+              {phase === "starting" ? <Trans>Opening…</Trans> : <Trans>Connect {label}</Trans>}
+            </Button>
+          )
+        )}
+        {/* Once the sign-in is done the agent is still parked: it re-reads the
+            database rather than trusting the browser, so the user has to say
+            they finished. Not offered on the sign-in route — that one leaves
+            the page and comes back through a resume. */}
+        {!viaSignIn && (phase === "browser" || phase === "starting") && (
+          <Button size="sm" variant="secondary" onClick={() => onAnswer({ connected: true })} disabled={disabled}>
+            <Trans>I’ve connected it</Trans>
+          </Button>
+        )}
+        <button
+          type="button"
+          onClick={() => onAnswer({ skipped: true })}
+          disabled={disabled}
+          className="text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
+        >
+          <Trans>Skip — carry on without it</Trans>
+        </button>
+      </div>
+
+      {phase === "browser" && (
+        <p className="text-xs text-muted-foreground">
+          <Trans>Finish signing in in your browser, then come back and press “I’ve connected it”.</Trans>
+        </p>
+      )}
+      <p className="text-2xs text-muted-foreground">
+        <Trans>Skipping is fine — Duct will say what it couldn’t check.</Trans>
+      </p>
+    </div>
+  );
+}

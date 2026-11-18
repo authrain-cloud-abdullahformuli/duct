@@ -1,0 +1,383 @@
+"""Google Analytics 4 connector + supplementary fetch functions."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from google.oauth2.credentials import Credentials
+
+from config import get_configs
+from service.connectors import (
+    CAP_ACCOUNTS,
+    ConnectorAuthContext,
+    ConnectorMeta,
+    entity_facts,
+    register_connector,
+)
+from service.google.constants import (
+    GA4_CONNECTOR_ID,
+    GA4_READ_SCOPE,
+    GOOGLE_SERVER_ONLY_KEYS,
+)
+
+_GA4_SCOPE = GA4_READ_SCOPE
+# Requested on top of readonly at consent time so stored GA4 tokens can also
+# drive the staged-execution GA4 admin executors (key events, audiences —
+# service/execution/ga4_exec.py). Tokens minted before this change stay
+# read-only until the user reconnects.
+_GA4_EDIT_SCOPE = "https://www.googleapis.com/auth/analytics.edit"
+_TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+# GA4 renamed "conversions" to "key events" in 2024 and the Data API followed;
+# the old metric name is the deprecated alias. The rows still carry the
+# figure as ``conversions`` — that is the catalog's field, and the knowledge
+# pack explains the rename to the model rather than making it learn two names.
+KEY_EVENTS_METRIC = "keyEvents"
+
+LANDING_PAGE_ROWS = 250
+# A year of weeks: enough history for "best week yet" to mean something.
+WEEKLY_USER_ROWS = 60
+
+# What GA4 says it left out of a report, or estimated. It withholds low-count
+# rows under its privacy thresholds, samples a large query, rolls
+# high-cardinality combinations into "(other)" and cuts dates its retention
+# rules do not serve, all without an error: the rows that come back simply
+# add up to less than the property saw, and a brief quoted them as the whole
+# window. Said in words, like Search Console's ``data_state``, so the model
+# repeats the caveat instead of decoding a flag.
+_THRESHOLDED = (
+    "thresholded: GA4 withheld rows below its privacy thresholds, so small counts "
+    "are missing rather than zero and totals are a floor"
+)
+_OTHER_ROW = (
+    "other_row: GA4 rolled some dimension combinations into an '(other)' row, so a "
+    "page or source missing from the rows may still have traffic"
+)
+_TRUNCATION_TYPE_PREFIX = "DATA_TRUNCATION_TYPE_"
+
+
+def _data_quality(metadata: Any) -> list[str]:
+    """GA4's own caveats on one report (``RunReportResponse.metadata``), empty
+    when it raised none. v1beta fields; ``data_truncation_reasons`` needs
+    google-analytics-data 0.23.1."""
+    if metadata is None:
+        return []
+    notes: list[str] = []
+    if metadata.subject_to_thresholding:
+        notes.append(_THRESHOLDED)
+    for sampling in metadata.sampling_metadatas:
+        read, space = int(sampling.samples_read_count), int(sampling.sampling_space_size)
+        if space:
+            notes.append(
+                f"sampled: GA4 read {read / space:.1%} of events ({read:,} of {space:,}), "
+                "so every figure is an estimate"
+            )
+    if metadata.data_loss_from_other_row:
+        notes.append(_OTHER_ROW)
+    for reason in metadata.data_truncation_reasons:
+        what = reason.data_truncation_message or (
+            reason.data_truncation_type.name.removeprefix(_TRUNCATION_TYPE_PREFIX).lower().replace("_", " ")
+        )
+        spans = [f"before {reason.data_truncation_date}"] if reason.data_truncation_date else []
+        spans += [f"{r.start_date} to {r.end_date}" for r in reason.data_truncation_date_ranges]
+        where = f" (missing: {', '.join(spans)})" if spans else ""
+        notes.append(f"date_truncated: {what}{where}; totals for the window are a floor")
+    return notes
+
+
+def _build_credentials(*, refresh_token: str, client_id: str, client_secret: str) -> Credentials:
+    return Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri=_TOKEN_URI,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=[_GA4_SCOPE],
+    )
+
+
+class GA4Connector:
+    """Interactive GA4 operations (property listing for account picker)."""
+
+    def list_accounts(self, auth: ConnectorAuthContext) -> list[dict[str, Any]]:
+        cfg = get_configs()
+        refresh_token = (auth.refresh_token or "").strip()
+        client_id = cfg.google_oauth_client_id or cfg.google_ads_client_id
+        client_secret = cfg.google_oauth_client_secret or cfg.google_ads_client_secret
+
+        gaps: list[str] = []
+        if not refresh_token:
+            gaps.append("refresh_token")
+        if not client_id:
+            gaps.append("GOOGLE_OAUTH_CLIENT_ID or GOOGLE_ADS_CLIENT_ID")
+        if not client_secret:
+            gaps.append("GOOGLE_OAUTH_CLIENT_SECRET or GOOGLE_ADS_CLIENT_SECRET")
+        if gaps:
+            raise ValueError("Missing GA4 credentials: " + "; ".join(gaps))
+
+        credentials = _build_credentials(
+            refresh_token=refresh_token,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+        from googleapiclient.discovery import build
+
+        admin_service = build("analyticsadmin", "v1beta", credentials=credentials, cache_discovery=False)
+        resp = admin_service.accountSummaries().list(pageSize=200).execute()
+
+        rows: list[dict[str, Any]] = []
+        for account in resp.get("accountSummaries", []):
+            account_name = account.get("displayName") or account.get("name", "")
+            for prop in account.get("propertySummaries", []):
+                prop_name = prop.get("displayName") or prop.get("property", "")
+                property_resource = prop.get("property", "")
+                property_id = property_resource.split("/")[-1] if property_resource else ""
+                if not property_id:
+                    continue
+                rows.append(
+                    {
+                        # The canonical pair names the thing being *picked* —
+                        # for GA4 that is the property. This used to put the
+                        # parent GA account in `account_name`, which is a
+                        # different object entirely: several properties share
+                        # one, so a picker showing it listed the same label
+                        # repeatedly and gave no way to tell them apart.
+                        "account_id": property_id,
+                        "account_name": prop_name,
+                        # Kept, under a name that says what it is. Useful as a
+                        # subtitle when one user has properties across accounts.
+                        "parent_account_name": account_name,
+                        # Which GA account it hangs off — the thing that tells
+                        # two identically named "Website" properties apart.
+                        "entity_detail": account_name,
+                        # The number you paste into a GA4 URL, and the one
+                        # support threads ask for.
+                        "entity_meta": entity_facts(("Property ID", property_id)),
+                        "property_id": property_id,
+                        "property_name": prop_name,
+                    }
+                )
+        rows.sort(key=lambda row: (row["parent_account_name"].lower(), row["account_name"].lower()))
+        return rows
+
+
+def fetch_ga4_landing_pages(
+    property_id: str,
+    date_from: str,
+    date_to: str,
+    *,
+    refresh_token: str,
+    client_id: str,
+    client_secret: str,
+) -> dict[str, Any]:
+    """Landing-page behaviour from GA4, one row per page and channel.
+
+    This was filtered to ``sessionSourceMedium CONTAINS "google / cpc"``, so
+    the organic goals, whose analysis guide reads "ANALYZE GA4 organic landing
+    page data", were only ever handed paid traffic. Every channel now comes
+    back tagged with GA4's default channel group; the paid and organic guides
+    each read the rows for their own channel, and Bing and Meta paid traffic
+    stop being invisible to the paid one too.
+    """
+    from google.analytics.data_v1beta import BetaAnalyticsDataClient
+    from google.analytics.data_v1beta.types import (
+        DateRange,
+        Dimension,
+        Metric,
+        OrderBy,
+        RunReportRequest,
+    )
+
+    credentials = _build_credentials(
+        refresh_token=refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+    )
+    client = BetaAnalyticsDataClient(credentials=credentials)
+    req = RunReportRequest(
+        property=f"properties/{property_id.strip()}",
+        date_ranges=[DateRange(start_date=date_from, end_date=date_to)],
+        dimensions=[
+            Dimension(name="pagePath"),
+            Dimension(name="sessionDefaultChannelGroup"),
+            Dimension(name="sessionSourceMedium"),
+        ],
+        metrics=[
+            Metric(name="sessions"),
+            Metric(name="bounceRate"),
+            Metric(name="engagementRate"),
+            Metric(name="averageSessionDuration"),
+            Metric(name=KEY_EVENTS_METRIC),
+            Metric(name="totalRevenue"),
+        ],
+        order_bys=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name="sessions"), desc=True)],
+        # Wider than the other reports: the channel split multiplies rows per
+        # page, and 100 was already the cut when there was only one channel.
+        limit=LANDING_PAGE_ROWS,
+    )
+    resp = client.run_report(req)
+
+    rows: list[dict[str, Any]] = []
+    for row in resp.rows:
+        dims = row.dimension_values
+        metrics = row.metric_values
+        sessions = int(float(metrics[0].value or 0))
+        bounce_rate = float(metrics[1].value or 0)
+        engagement_rate = float(metrics[2].value or 0)
+        avg_session_duration = float(metrics[3].value or 0)
+        conversions = float(metrics[4].value or 0)
+        total_revenue = float(metrics[5].value or 0)
+        rows.append(
+            {
+                "page_path": dims[0].value,
+                "channel": dims[1].value,
+                "session_source_medium": dims[2].value,
+                "sessions": sessions,
+                "bounce_rate": bounce_rate,
+                "engagement_rate": engagement_rate,
+                "average_session_duration": avg_session_duration,
+                "conversions": conversions,
+                "total_revenue": total_revenue,
+            }
+        )
+
+    notes = _data_quality(getattr(resp, "metadata", None))
+    return {
+        "report_type": "ga4_landing_pages",
+        "date_range": f"{date_from} to {date_to}",
+        "row_count": len(rows),
+        # GA4 reports the full row count even when ``limit`` cuts the list.
+        "truncated": int(getattr(resp, "row_count", 0) or 0) > len(rows),
+        # Before the rows, so a payload cut for size keeps it.
+        **({"data_quality": notes} if notes else {}),
+        "rows": rows,
+    }
+
+
+def fetch_ga4_weekly_users(
+    property_id: str,
+    date_from: str,
+    date_to: str,
+    *,
+    refresh_token: str,
+    client_id: str,
+    client_secret: str,
+) -> dict[str, Any]:
+    """Active users per ISO week, oldest first: the series a "best week yet"
+    milestone is read from (#564). Users are not additive across weeks, so the
+    catalog gives the metric no ``agg`` and nothing sums it."""
+    from google.analytics.data_v1beta import BetaAnalyticsDataClient
+    from google.analytics.data_v1beta.types import (
+        DateRange,
+        Dimension,
+        Metric,
+        OrderBy,
+        RunReportRequest,
+    )
+
+    credentials = _build_credentials(
+        refresh_token=refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+    )
+    client = BetaAnalyticsDataClient(credentials=credentials)
+    req = RunReportRequest(
+        property=f"properties/{property_id.strip()}",
+        date_ranges=[DateRange(start_date=date_from, end_date=date_to)],
+        dimensions=[Dimension(name="isoYearIsoWeek")],
+        metrics=[Metric(name="activeUsers")],
+        order_bys=[OrderBy(dimension=OrderBy.DimensionOrderBy(dimension_name="isoYearIsoWeek"))],
+        limit=WEEKLY_USER_ROWS,
+    )
+    resp = client.run_report(req)
+    rows = [
+        {"iso_week": row.dimension_values[0].value, "active_users": int(float(row.metric_values[0].value or 0))}
+        for row in resp.rows
+    ]
+    notes = _data_quality(getattr(resp, "metadata", None))
+    return {
+        "report_type": "ga4_weekly_users",
+        "date_range": f"{date_from} to {date_to}",
+        "row_count": len(rows),
+        **({"data_quality": notes} if notes else {}),
+        "rows": rows,
+    }
+
+
+def fetch_ga4_conversion_paths(
+    property_id: str,
+    date_from: str,
+    date_to: str,
+    *,
+    refresh_token: str,
+    client_id: str,
+    client_secret: str,
+) -> dict[str, Any]:
+    """Fetch channel-level conversion context from GA4."""
+    from google.analytics.data_v1beta import BetaAnalyticsDataClient
+    from google.analytics.data_v1beta.types import DateRange, Dimension, Metric, OrderBy, RunReportRequest
+
+    credentials = _build_credentials(
+        refresh_token=refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+    )
+    client = BetaAnalyticsDataClient(credentials=credentials)
+    req = RunReportRequest(
+        property=f"properties/{property_id.strip()}",
+        date_ranges=[DateRange(start_date=date_from, end_date=date_to)],
+        dimensions=[
+            Dimension(name="sessionSourceMedium"),
+            Dimension(name="sessionDefaultChannelGroup"),
+        ],
+        metrics=[
+            Metric(name=KEY_EVENTS_METRIC),
+            Metric(name="totalRevenue"),
+            Metric(name="sessions"),
+            Metric(name="engagedSessions"),
+        ],
+        order_bys=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name=KEY_EVENTS_METRIC), desc=True)],
+        limit=100,
+    )
+    resp = client.run_report(req)
+
+    rows: list[dict[str, Any]] = []
+    for row in resp.rows:
+        dims = row.dimension_values
+        metrics = row.metric_values
+        conversions = float(metrics[0].value or 0)
+        total_revenue = float(metrics[1].value or 0)
+        sessions = int(float(metrics[2].value or 0))
+        engaged_sessions = int(float(metrics[3].value or 0))
+        rows.append(
+            {
+                "session_source_medium": dims[0].value,
+                "session_default_channel_group": dims[1].value,
+                "conversions": conversions,
+                "total_revenue": total_revenue,
+                "sessions": sessions,
+                "engaged_sessions": engaged_sessions,
+            }
+        )
+
+    notes = _data_quality(getattr(resp, "metadata", None))
+    return {
+        "report_type": "ga4_conversion_paths",
+        "date_range": f"{date_from} to {date_to}",
+        "row_count": len(rows),
+        **({"data_quality": notes} if notes else {}),
+        "rows": rows,
+    }
+
+
+GA4_META = ConnectorMeta(
+    id=GA4_CONNECTOR_ID,
+    label="Google Analytics 4",
+    oauth_scope=f"{_GA4_SCOPE} {_GA4_EDIT_SCOPE}",
+    capabilities=frozenset({CAP_ACCOUNTS}),
+    entity_noun="property",
+    entity_noun_plural="properties",
+    server_only_keys=GOOGLE_SERVER_ONLY_KEYS,
+)
+
+register_connector(GA4_META, GA4Connector())

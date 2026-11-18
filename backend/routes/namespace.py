@@ -1,0 +1,157 @@
+"""Assemble all API routers for the FastAPI app."""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends
+
+from routes import (
+    activity, agents, artifacts, audit, audit_prefetch, auth, chat, connectors, content, content_reports, engines,
+    execution,
+    generate, health, lead_magnet, mcp_oauth, mcp_server, mcp_servers, mcp_tokens, memory, model_settings,
+    profile,
+    project_connectors,
+    project_members, projects,
+    providers,
+    reports, schedules, signin, usage, user_connectors, user_contexts, user_projects,
+)
+from service.auth import get_current_user, validate_api_key
+
+router = APIRouter()
+
+# The two gates, and why most routers need both.
+#
+# `validate_api_key` checks X-API-Key, which ships to the browser as
+# NEXT_PUBLIC_DUCT_API_KEY. It says "this request came from the Duct app" and
+# nothing more — anyone who views source has it, so on its own it is not a
+# boundary. `get_current_user` is the one that identifies a person.
+#
+# Every router below that spends model tokens, reaches a vendor API with the
+# server's own credentials, or touches a user's data therefore lists both.
+# The exceptions are deliberate and marked at their include: health, the OAuth
+# entry points (a browser redirect carries no headers), the lead-magnet capture
+# (Turnstile on submit, the lead token after it), and invitation preview (the
+# token is the secret). The ones that spend — a row, a crawl, an outbound
+# request — carry a per-address limit from `service/ratelimit.py` instead.
+APP_AND_USER = [Depends(validate_api_key), Depends(get_current_user)]
+
+router.include_router(health.router)
+router.include_router(auth.router)
+router.include_router(signin.router)
+# The MCP sign-in's browser half: the vendor's redirect back, and the client
+# metadata document an authorization server fetches. Neither carries headers.
+router.include_router(mcp_servers.oauth_router)
+# Crawls a site the caller names, on Duct's bandwidth, before any sign-in — a
+# guest's token is a user here, and the route rate-limits per user on top.
+router.include_router(
+    audit_prefetch.router,
+    prefix="/api",
+    dependencies=APP_AND_USER,
+)
+# Lists a vendor's accounts for keys the caller is pasting. Reaching a vendor
+# on someone's behalf is not something an anonymous caller does.
+router.include_router(
+    connectors.router,
+    prefix="/api/connectors",
+    dependencies=APP_AND_USER,
+)
+router.include_router(
+    generate.router,
+    prefix="/api",
+    dependencies=[Depends(validate_api_key)],
+)
+router.include_router(
+    engines.router,
+    prefix="/api",
+    dependencies=[Depends(validate_api_key)],
+)
+# Reads the caller's own X-Provider-* headers and reports only presence, never
+# a key — the same public-catalogue gate the engine status endpoint uses.
+router.include_router(
+    providers.router,
+    prefix="/api",
+    dependencies=[Depends(validate_api_key)],
+)
+router.include_router(
+    reports.router,
+    prefix="/api/insights",
+    dependencies=APP_AND_USER,
+)
+# Streams a caller-supplied prompt on the caller's own provider key
+# (routes/chat.py). Before that it was the server's key, which made this gate
+# the only thing between a guest and a free model on Duct's account.
+router.include_router(
+    chat.router,
+    prefix="/api/insights",
+    dependencies=APP_AND_USER,
+)
+router.include_router(
+    projects.router,
+    prefix="/api/projects",
+    dependencies=[Depends(validate_api_key)],
+)
+# The pre-/api/agents audit entry points. No client calls them any more; they
+# run a full agent pipeline, so they are signed-in-only until they are removed.
+router.include_router(
+    audit.router,
+    prefix="/api",
+    dependencies=APP_AND_USER,
+)
+router.include_router(
+    content.router,
+    prefix="/api",
+    dependencies=APP_AND_USER,
+)
+# The Analytics tab's report: the insights agent over the project's sources,
+# stored for a day (routes/content_reports.py).
+router.include_router(
+    content_reports.router,
+    prefix="/api",
+    dependencies=APP_AND_USER,
+)
+# Unified agent session API — all new agent types go here
+router.include_router(
+    agents.router,
+    prefix="/api/agents",
+    dependencies=[Depends(validate_api_key)],
+)
+# Lead magnet capture — public endpoints: Turnstile and the lead token, plus a
+# per-address limit on the router itself; no API key.
+router.include_router(lead_magnet.router, prefix="/api/lead-magnet")
+# User-scoped endpoints — authenticated via Bearer JWT
+router.include_router(execution.router, prefix="/api/execute")
+router.include_router(artifacts.router, prefix="/api/user/artifacts")
+router.include_router(activity.router, prefix="/api/user/activity")
+router.include_router(usage.router, prefix="/api/user/usage")
+router.include_router(model_settings.router, prefix="/api/user/model-settings")
+router.include_router(profile.router, prefix="/api/user/profile")
+router.include_router(user_projects.router, prefix="/api/user/projects")
+router.include_router(user_contexts.router, prefix="/api/user/projects")
+router.include_router(memory.router, prefix="/api/user/projects")
+router.include_router(memory.user_router, prefix="/api/user/memory")
+router.include_router(project_members.router, prefix="/api/user/projects")
+router.include_router(project_connectors.router, prefix="/api/user/projects")
+router.include_router(user_connectors.router, prefix="/api/user/connectors")
+router.include_router(mcp_tokens.router, prefix="/api/user/mcp-tokens")
+# Scheduled runs: a project member's, and each fires on the backend that owns it.
+router.include_router(schedules.router, prefix="/api/user/schedules", dependencies=APP_AND_USER)
+# Duct's MCP server, for agents outside Duct. Its own credential: an MCP
+# token, never X-API-Key or a sign-in JWT (routes/mcp_server.py).
+router.include_router(mcp_server.router)
+# How an agent signs in to it: OAuth discovery, registration, authorize and
+# token. An agent and a bare browser navigation carry no headers.
+router.include_router(mcp_oauth.router)
+# The app's consent page. Reading or declining a parked request needs only
+# the request's own code; allowing one needs the signed-in person, per route.
+router.include_router(
+    mcp_oauth.consent_router, prefix="/api/oauth/requests", dependencies=[Depends(validate_api_key)]
+)
+# MCP servers a user connects. Starting one reaches an address the caller
+# chose, so it is never anonymous.
+router.include_router(mcp_servers.router, prefix="/api/user/mcp", dependencies=APP_AND_USER)
+# Invitation redemption. GET is unauthenticated (the recipient has not signed in
+# yet and the token is the secret); POST /accept requires a Bearer JWT.
+router.include_router(
+    project_members.invitation_router,
+    prefix="/api/invitations",
+    dependencies=[Depends(validate_api_key)],
+)

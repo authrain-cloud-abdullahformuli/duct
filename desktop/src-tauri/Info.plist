@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Extra Info.plist keys merged into the generated macOS bundle by Tauri.
+
+  This used to also carry ITSAppUsesNonExemptEncryption, which only ever meant
+  anything to App Store Connect (it skipped the per-build export-compliance
+  prompt on a TestFlight upload). That channel is gone; the key did nothing for
+  a Developer ID DMG and is not worth carrying for a submission we will not make.
+
+  CFBundleVersion is NOT set here: Tauri derives it from `version` in
+  tauri.conf.json.
+-->
+<plist version="1.0">
+<dict>
+    <!-- How Finder and Launchpad file the app. Apple recommends it for every
+         macOS app, App Store or not. -->
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.business</string>
+</dict>
+</plist>

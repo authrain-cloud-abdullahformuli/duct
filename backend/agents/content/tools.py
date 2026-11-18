@@ -1,0 +1,2956 @@
+"""The Content Studio agent's tools, bound for the LangChain (V1) harness.
+
+Four groups:
+  - Writers: submit_plan, revise_plan_days, submit_post_draft, edit_slide — validate Pydantic,
+    upsert DB rows, emit SSE events (PLAN_GENERATED / POST_DRAFT_UPDATED).
+  - Readers: fetch_brand_context, fetch_topic_bank, fetch_format_library,
+    fetch_avatar_library, fetch_content_history, fetch_content_assets,
+    fetch_discovered_references, fetch_post, fetch_slide_context.
+  - Media + publishing: render_slide, generate_image, edit_image,
+    publish_post, mark_posted, log_metrics.
+  - Review: submit_assessment — persists the pre-publish review the
+    review_post sub-agent scored; the checks and the weights are the server's
+    (agents/content/assessment.py).
+
+This file was the Claude Agent SDK's in-process MCP server until content
+moved to V1. The tool *bodies* are what survived the port unchanged — the
+ownership guards, the per-post write lock, the image-prompt lock, the
+staleness bookkeeping. What changed is only the binding: typed Pydantic
+arguments instead of ``args: dict`` against a hand-written JSON schema, and
+a JSON string (or a list of content blocks, for images) instead of an MCP
+result envelope.
+
+Every handler:
+  1. Opens a short-lived DB session, never binding one to the agent lifetime.
+  2. Wraps the body in try/except — an uncaught exception propagates out of
+     the tool node and ends the run, whereas an error *payload* lets the
+     model read the problem and correct course. So failures are returned.
+  3. Where appropriate, calls emit(...) to push events into the SSE queue.
+
+``build_content_tools_lc`` is the binder (``agents/core/ports``: a
+``ToolBinder``); ``project_id`` is captured in every closure so a tool call
+can never reach another project's rows.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from uuid import UUID, uuid4
+
+from langchain_core.tools import StructuredTool
+from langgraph.errors import GraphBubbleUp
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from agents.content.results import (
+    EditImageResult,
+    EditSlideResult,
+    GenerateImageResult,
+    GenerateVideoResult,
+    LogMetricsResult,
+    MarkPostedResult,
+    RenderSlideResult,
+    SubmitPlanResult,
+    SubmitPostResult,
+)
+from sqlmodel import Session, select
+
+from agents.models import (
+    DEFAULT_IMAGE_MODEL,
+    AspectRatio,
+    ImageModel,
+    Provider,
+    VideoModel,
+    image_model_for,
+    video_cost_usd,
+    video_model_for,
+)
+from agents.core.events import AgentEvent
+from agents.core.mcp_tools import APPROVAL_TIMEOUT
+from agents.core.memory_tools import build_memory_tools_lc
+from agents.core.session import PauseFn
+from agents.content.assessment import assess, reassess_post
+from agents.content.channels import (
+    Platform,
+    channel_payload,
+    copy_problems,
+    primary_channel,
+    resolve as resolve_channel,
+)
+from agents.content.channel_mix import mix_snapshot, overreaching_hooks
+from agents.content.feed import resolve_sources, source_problems
+from agents.content.channel_config import linked_pairs, load_channel_config
+from agents.content.plan_period import MAX_PLAN_DAYS, PlanPeriod, link_post_to_day, plan_end
+from agents.content.persistence import link_artifact
+from agents.content.plan_proposal import (
+    DRAFTED,
+    OUTSIDE,
+    PAST,
+    PROPOSED,
+    build_proposal,
+    change_days,
+    hold_proposal,
+    propose_day_changes,
+    revise_held_proposal,
+)
+from agents.content.publishing import (
+    SLIDE_RENDER,
+    MediaUnreadable,
+    PostAlreadyOut,
+    chosen_publisher,
+    default_account,
+    is_queued_at_publisher,
+    is_text_only,
+    linked_accounts,
+    load_media,
+    metrics_sync,
+    no_sync_message,
+    not_synced_yet,
+    pick_media,
+    project_publishing,
+    publish_blockers,
+    publish_card,
+    publish_failure,
+    pull_metrics,
+    push_edit,
+    record_published,
+    send_post,
+    unpublished_replies,
+    went_out,
+    words_changed,
+)
+from agents.content.voice_rules import banned_words_in, voice_rules_of
+from agents.content.events import ContentEvent
+from agents.content.schema import (
+    ContentSession,
+    ContentStatus,
+    ContentTool,
+    Day,
+    MarkerScore,
+    PlanDayChange,
+    PlanDraft,
+    PostDraft,
+    ReviewMarker,
+    Slide,
+    TEXT_POST_TYPE,
+    clone_source,
+)
+from agents.content.templates import derive_image_prompts, render_slides_html
+from agents.content.video import VIDEO_POST_TYPE, cut_of, video_takes
+from service import storage
+from service.content_metrics import metric_value
+from service.publishers import PublisherError, Target
+from service.publishers.registry import publisher_for, spec_for
+from service.vendor_keys import VendorNotConnected
+from db.session import get_engine
+from models.content import (
+    ContentAsset,
+    ContentAvatar,
+    ContentFormat,
+    ContentPlan,
+    ContentPost,
+)
+from models.project import Project
+from utils.dates import now_iso, parse_iso, utcnow
+
+logger = logging.getLogger(__name__)
+
+EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+# Per-post write serialization. submit_post_draft / edit_slide / generate_image
+# attach all read-modify-write content_posts.slides; without this, an agent
+# generating images in parallel (or an attach racing an edit) can lose updates.
+# Process-local asyncio locks keyed by post id — covers the agent's concurrent
+# tool calls within one worker; a multi-worker deploy would also want a DB guard.
+_POST_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+# The image tools' one refusal. Names every provider that would unblock the
+# user, because "get a Gemini key" was the old answer and it sent people on an
+# OpenAI key to Google for something their own key already does.
+_NO_IMAGE_KEY = (
+    "Image {verb} needs an API key from a provider with an image model \u2014 "
+    "Google Gemini, OpenAI, xAI or OpenRouter. Add one in Settings \u2192 Providers, "
+    "then try again."
+)
+
+# The video tool's refusal, on the same principle: every key that would work.
+_NO_VIDEO_KEY = (
+    "Video needs an API key from a provider with a video model \u2014 Google Gemini "
+    "(Veo) or OpenRouter (Seedance). Add one in Settings \u2192 Providers, then try again."
+)
+
+_PROVIDER_NAMES = {Provider.GOOGLE_GENAI: "Gemini", Provider.OPENROUTER: "OpenRouter"}
+
+
+def _video_failure(exc: Any, provider: Provider) -> str:
+    """The sentence the agent gets for a failed clip, by error code — each one
+    asks for something different, and "try again" fits only two of them."""
+    from service.videos import VideoErrorCode
+
+    name = _PROVIDER_NAMES.get(provider, provider.value)
+    detail = str(getattr(exc, "detail", "") or "")[:300]
+    code = getattr(exc, "code", VideoErrorCode.PROVIDER)
+    if code is VideoErrorCode.SAFETY:
+        return (
+            "The video service's safety filter refused this clip"
+            + (f" ({detail})" if detail else "")
+            + ". Change what the prompt or the frame shows rather than retrying it as it is."
+        )
+    if code is VideoErrorCode.PERSON:
+        return (
+            "This model won't animate a first frame that shows a realistic person. Use a frame "
+            "without a realistic face (the product, hands, a stylised character) or make the clip "
+            "from the prompt alone; a Gemini key's Veo models do take such frames."
+        )
+    if code is VideoErrorCode.TIMEOUT:
+        return "The clip wasn't ready after ten minutes, so it was abandoned. Try again, or a shorter clip."
+    if code is VideoErrorCode.AUTH:
+        return f"The {name} key was refused for video. Check it in Settings \u2192 Providers."
+    if code is VideoErrorCode.BILLING:
+        return f"The {name} account behind this key is out of credit for video. Top it up, then try again."
+    if code is VideoErrorCode.INVALID:
+        return f"The video service rejected the request: {detail or 'no reason given'}."
+    return "The video service had a problem making this clip. Try again in a moment."
+
+
+def _post_lock(key: str) -> asyncio.Lock:
+    """Get-or-create the lock for a post key. Safe under single-threaded asyncio
+    (no await between the get and the set)."""
+    lock = _POST_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _POST_LOCKS[key] = lock
+    return lock
+
+
+def _ok(payload: dict | list | str) -> str:
+    return payload if isinstance(payload, str) else json.dumps(payload, default=str)
+
+
+def _err(message: str) -> str:
+    """Error result the model can react to.
+
+    Returned, not raised: an exception propagates out of the tool node and
+    ends the run, whereas a payload lets the model read the problem and retry.
+    The shape matches the audit tools' so a transcript reads the same across
+    agents.
+    """
+    return json.dumps({"status": "error", "message": message})
+
+
+def _open_db() -> Session:
+    engine = get_engine()
+    if engine is None:
+        raise RuntimeError("DATABASE_URL is not configured.")
+    return Session(engine)
+
+
+# --- Typed result serializers -------------------------------------------------
+# Tool results the model reads back are modeled (see results.py) instead of
+# hand-built dicts, so field names like `attached_to` / `asset_ids` are typed.
+
+def _ok_model(m: BaseModel) -> str:
+    """Success result from a typed model (text-only)."""
+    return _ok(m.model_dump(mode="json"))
+
+
+def _image_block(b64: str, mime: str) -> dict:
+    """One image as a LangChain standard content block. ChatAnthropic turns it
+    into a base64 image source inside the tool_result; that is how the model
+    gets to *see* what it generated."""
+    return {"type": "image", "base64": b64, "mime_type": mime}
+
+
+# --- Relational precondition guards -------------------------------------------
+# "post/slide/cell exists on THIS project" is an invariant against live state the
+# input schema can't express — so it's a runtime guard returning a hard _err, not
+# prose for the model. Shared here to replace the copies that had drifted across
+# tools (ownership check ×6, "find slide or list valid ids" ×3). Each returns the
+# resolved entity OR an _err-shaped dict; callers use:  x, err = guard(...); if err: return err
+
+def _require_post(db: Session, project_id, post_id) -> tuple[ContentPost | None, str | None]:
+    """Resolve the current post for this project, or an _err result."""
+    if post_id is None:
+        return None, _err("No current post in this session.")
+    row = db.get(ContentPost, post_id)
+    if row is None or row.project_id != project_id:
+        return None, _err(f"Post {post_id} not found for this project.")
+    return row, None
+
+
+def _require_slide(post: ContentPost, slide_id: str) -> tuple[dict | None, int, str | None]:
+    """Find a slide on the post by id, or an _err listing the valid ids.
+
+    Returns (slide_dict, index, None) on hit; (None, -1, err) on miss.
+    """
+    slides = list(post.slides or [])
+    for i, s in enumerate(slides):
+        if isinstance(s, dict) and str(s.get("slide_id")) == str(slide_id):
+            return s, i, None
+    valid = [str(s.get("slide_id")) for s in slides if isinstance(s, dict)]
+    return None, -1, _err(f"slide_id {slide_id!r} isn't on this post. Use one of: {valid}.")
+
+
+def _require_item(slide: dict, item_index: int | None) -> str | None:
+    """Range-check item_index against a slide's image cells. None = ok, else _err."""
+    if item_index is None:
+        return None
+    n = len(slide.get("items") or [])
+    if n and not (0 <= item_index < n):
+        return _err(
+            f"item_index {item_index} is out of range for {slide.get('slide_id')!r} "
+            f"— it has {n} image cell(s) (use 0–{n - 1}), or omit it for a single image."
+        )
+    return None
+
+
+def _arc_line_for_slide(emotional_arc: str, slide_id: str, idx: int) -> str:
+    """Pull THIS slide's line out of the emotional_arc blob ("01: ...\\n02: ...").
+
+    Matches by the slide's trailing number (slide-03 -> "3"); falls back to the
+    idx-th line. Returns "" when the arc is empty or has no matching line.
+    """
+    arc = (emotional_arc or "").strip()
+    if not arc:
+        return ""
+    lines = [ln.strip() for ln in arc.splitlines() if ln.strip()]
+    num = ("".join(ch for ch in str(slide_id) if ch.isdigit()).lstrip("0")) or "0"
+    for ln in lines:
+        head = (ln.split(":", 1)[0].strip().lstrip("0")) or "0"
+        if head == num:
+            return ln
+    return lines[idx] if 0 <= idx < len(lines) else ""
+
+
+def _resolve_camera_refs(db: Session, project_id, pool: str) -> list[dict]:
+    """Resolve cameraRef candidates for a pool (selfie-talking / lifestyle /
+    closeup). Primary source is the repo-bundled GLOBAL camera library for that
+    pool — its `asset_id` is a /static/references/... URL that generate_image
+    resolves from disk. Also includes any per-project DB references. Returns up
+    to 5, role-ready (the same shape fetch_content_assets emits)."""
+    key = (pool or "").strip().lower()
+    refs: list[dict] = []
+    # Global library (camera axis, pool subtype) — where the curated refs live.
+    try:
+        from service.content_references import global_reference_asset_dicts
+        for d in global_reference_asset_dicts(axis="camera", subtype=key or None):
+            refs.append({"asset_id": d["id"], "url": d["url"], "filename": d.get("slug", "")})
+    except Exception:
+        logger.debug("global camera refs unavailable", exc_info=True)
+    # Per-project DB references (a project may have uploaded its own).
+    rows = db.exec(
+        select(ContentAsset).where(
+            ContentAsset.project_id == project_id,
+            ContentAsset.asset_type == "reference",
+        )
+    ).all()
+    db_matched = [a for a in rows if key and key in f"{a.filename} {a.url} {a.prompt}".lower()]
+    for a in (db_matched or rows):
+        refs.append({"asset_id": str(a.id), "url": a.url, "filename": a.filename})
+    return refs[:5]
+
+
+def _resolve_format_id(db: Session, project_id, format_slug: str):
+    """Resolve a format slug (e.g. 'format-d') to the project's ContentFormat id.
+
+    Returns None when the project has no format with that slug (link stays NULL).
+    """
+    slug = (format_slug or "").strip().lower()
+    if not slug:
+        return None
+    row = db.exec(
+        select(ContentFormat).where(
+            ContentFormat.project_id == project_id,
+            ContentFormat.slug == slug,
+        )
+    ).first()
+    return row.id if row else None
+
+
+def _resolved_image_prompt(incoming: str, prev_prompt: str, prev_has_image: bool) -> str:
+    """Decide a slide/cell image_prompt on the bulk re-emit (submit_post_draft)
+    path. NO length heuristics — purely structural.
+
+    Once a slide has a GENERATED IMAGE, its image_prompt is the provenance of
+    that image and is LOCKED here: a whole-post resubmit is copy/structure work
+    and must not rewrite it. This is what stops a rich prompt from silently
+    collapsing into a stub across successive submits (2170 → 956 → … → 75 chars)
+    and producing plastic output. Deliberate scene changes go through edit_slide
+    (which IS allowed to shorten — a real edit, including a more concise rewrite).
+    Independently, an omitted/empty incoming prompt never deletes a stored one.
+    Before an image exists the slide is still being drafted, so refinements
+    (shorter or longer) are accepted as-is.
+    """
+    inc = (incoming or "").strip()
+    prev = (prev_prompt or "").strip()
+    if not prev:
+        return incoming            # nothing stored to protect
+    if prev_has_image or not inc:  # locked to its image, or an omission
+        return prev_prompt
+    return incoming                # still drafting → accept the refinement
+
+
+def _merge_slide_images(incoming: list[Slide], existing_row: ContentPost | None) -> list[Slide]:
+    """Carry already-generated images forward across copy/prompt edits.
+
+    The orchestrator authors copy + image prompts; it does NOT re-send the
+    generated `image_url` on every edit. So when a slide already has an image
+    on the persisted row, we backfill image_url / image_asset_id /
+    image_prompt_used onto the incoming slide (keyed by slide_id) UNLESS the
+    incoming slide explicitly carries its own image_url.
+
+    We ALSO guard image_prompt against degradation (see _keep_richer_prompt):
+    the bulk re-emit may only enhance a stored prompt, never shorten or drop it.
+    This makes it safe for the agent to omit/abbreviate image_prompt on re-emit
+    — the richer stored prompt is preserved.
+
+    Staleness falls out naturally: a copy-only edit keeps the old
+    image_prompt_used, so if the prompt changed the slide reads as stale
+    (is_image_stale True) and the UI can offer a regenerate. A pure caption
+    edit leaves prompt == prompt_used, so the image stays valid.
+    """
+    if existing_row is None or not getattr(existing_row, "slides", None):
+        return incoming
+    prev_by_id: dict[str, dict] = {}
+    for s in existing_row.slides or []:
+        if isinstance(s, dict) and s.get("slide_id"):
+            prev_by_id[str(s["slide_id"])] = s
+    merged: list[Slide] = []
+    for slide in incoming:
+        prev = prev_by_id.get(slide.slide_id)
+        if not prev:
+            merged.append(slide)
+            continue
+        update: dict = {}
+        prev_has_image = bool(prev.get("image_url"))
+        # A generated slide's image_prompt is locked on the bulk re-emit path —
+        # only edit_slide may change it. (Structural, no length compare.)
+        kept_prompt = _resolved_image_prompt(slide.image_prompt, prev.get("image_prompt", ""), prev_has_image)
+        if kept_prompt != slide.image_prompt:
+            update["image_prompt"] = kept_prompt
+            if prev_has_image and (slide.image_prompt or "").strip():
+                logger.info(
+                    "content: kept locked image_prompt for generated slide %s on bulk re-emit "
+                    "(use edit_slide to change a generated slide's prompt)", slide.slide_id,
+                )
+        if not slide.image_url and prev_has_image:
+            update.update({
+                "image_url":         prev.get("image_url", ""),
+                "image_asset_id":    prev.get("image_asset_id"),
+                "image_prompt_used": prev.get("image_prompt_used", ""),
+            })
+        # Carry generated cell images forward (collage / before-after), matched
+        # by position within the slide. Cell prompts get the same structural lock.
+        if slide.items:
+            prev_items = prev.get("items") or []
+            new_items = list(slide.items)
+            touched = False
+            for j, it in enumerate(slide.items):
+                pit = prev_items[j] if j < len(prev_items) else None
+                if not pit:
+                    continue
+                cell_update: dict = {}
+                pit_has_image = bool(pit.get("image_url"))
+                kept_cell_prompt = _resolved_image_prompt(it.image_prompt, pit.get("image_prompt", ""), pit_has_image)
+                if kept_cell_prompt != it.image_prompt:
+                    cell_update["image_prompt"] = kept_cell_prompt
+                if not it.image_url and pit_has_image:
+                    cell_update.update({
+                        "image_url":         pit.get("image_url", ""),
+                        "image_asset_id":    pit.get("image_asset_id"),
+                        "image_prompt_used": pit.get("image_prompt_used", ""),
+                    })
+                if cell_update:
+                    new_items[j] = it.model_copy(update=cell_update)
+                    touched = True
+            if touched:
+                update["items"] = new_items
+        if update:
+            slide = slide.model_copy(update=update)
+        merged.append(slide)
+    return merged
+
+
+def _post_spec(db: Session, row: ContentPost):
+    """The scheduler a post goes through (publishing.ProjectPublishing)."""
+    proj = db.get(Project, row.project_id)
+    if proj is None:
+        return spec_for(row.publisher)
+    return project_publishing(db, proj.id, proj.user_id).for_post(row)
+
+
+def _build_post_payload(row: ContentPost, db: Session) -> dict:
+    """The POST_DRAFT_UPDATED payload — shared by submit_post_draft, the
+    per-slide image attach path and the video attach, so the frontend always
+    gets the same shape. ``post_type`` and the clip ride on it because the
+    viewport decides between the slide carousel and the player from them."""
+    return {
+        "id":              str(row.id),
+        "post_type":       row.post_type,
+        "video":           row.video,
+        "video_takes":     video_takes(db, row) if row.video else [],
+        "post_dir_slug":   row.post_dir_slug,
+        "pillar":          row.pillar,
+        "topic":           row.topic,
+        "layout":          row.layout,
+        "slide_count":     row.slide_count,
+        "slides":          row.slides,
+        "slides_html":     row.slides_html,
+        "caption":         row.caption,
+        "replies":         row.replies or [],
+        "hashtags":        row.hashtags,
+        "title":           row.title,
+        "hook_type":       row.hook_type,
+        "hook_text":       row.hook_text,
+        "hook_emotion":    row.hook_emotion,
+        "save_cta":        row.save_cta,
+        "image_prompts":   row.image_prompts,
+        "audio_note":      row.audio_note,
+        "bridge_text":     row.bridge_text,
+        "strategic_note":  row.strategic_note,
+        "visual_brief":    row.visual_brief,
+        "emotional_arc":   row.emotional_arc,
+        "camera_ref_pool": row.camera_ref_pool,
+        "platforms":       row.platforms,
+        "channel":         channel_payload(primary_channel(row.platforms), _post_spec(db, row)),
+        "status":          row.status,
+        "clone_source":    row.clone_source,
+        # Recomputed on every emit, so the panel's checks follow each edit and
+        # a score from before the edit says it is stale.
+        "assessment":      reassess_post(row).model_dump(mode="json"),
+    }
+
+
+def _attach_image_to_slide(
+    db: Session,
+    row: ContentPost,
+    slide_id: str,
+    *,
+    asset_id: str,
+    url: str,
+    item_index: int | None = None,
+    prompt_used: str | None = None,
+) -> bool:
+    """Write a generated image onto one slide (or one cell of a multi-image
+    slide) of a post + re-render the HTML.
+
+    Sets image_url / image_asset_id. When ``prompt_used`` is given (the
+    descriptive prompt the image was generated from, before any reference
+    prefix), it is recorded as BOTH ``image_prompt`` and ``image_prompt_used``:
+    generating an image is a deliberate act that defines what the slide depicts,
+    so the slide's prompt and its provenance stay in sync — the slide does NOT
+    read as falsely stale right after a successful (re)generation. (The accidental
+    degradation path — a bulk submit_post_draft re-emit — is still guarded
+    separately in _merge_slide_images; a later deliberate edit_slide that changes
+    image_prompt correctly marks the image stale.) When ``prompt_used`` is omitted
+    we only anchor image_prompt_used to the slide's current image_prompt (legacy).
+    item_index targets a collage/before-after cell when the slide has cells; a
+    stray item_index on a single-image slide falls through to a plain attach
+    (the model routinely passes item_index=0 for ordinary photo slides). Returns
+    True if the target was found + updated. The caller commits.
+    """
+    slides = list(row.slides or [])
+    found = False
+    for i, s in enumerate(slides):
+        if not (isinstance(s, dict) and str(s.get("slide_id")) == str(slide_id)):
+            continue
+        s = dict(s)
+        items = list(s.get("items") or [])
+        # item_index only applies to multi-image slides. On a single-image slide
+        # (no cells) the model's stray item_index=0 must NOT fail the attach —
+        # fall through to the single-image path.
+        if item_index is not None and items:
+            if not (0 <= item_index < len(items)):
+                return False
+            cell = dict(items[item_index])
+            cell["image_url"] = url
+            cell["image_asset_id"] = asset_id
+            if prompt_used is not None:
+                cell["image_prompt"] = prompt_used       # keep prompt + provenance in sync
+                cell["image_prompt_used"] = prompt_used
+            else:
+                cell["image_prompt_used"] = cell.get("image_prompt", "")
+            items[item_index] = cell
+            s["items"] = items
+        else:
+            s["image_url"] = url
+            s["image_asset_id"] = asset_id
+            if prompt_used is not None:
+                s["image_prompt"] = prompt_used          # keep prompt + provenance in sync
+                s["image_prompt_used"] = prompt_used
+            else:
+                s["image_prompt_used"] = s.get("image_prompt", "")
+        slides[i] = s
+        found = True
+        break
+    if not found:
+        return False
+    row.slides = slides
+    parsed = [Slide.model_validate(s) for s in slides]
+    row.slides_html = render_slides_html(row.layout, parsed)
+    row.image_prompts = derive_image_prompts(parsed)
+    row.updated_at = datetime.now(timezone.utc)
+    db.add(row)
+    return True
+
+
+def _downscale_png_b64(png: bytes, max_w: int = 600) -> str:
+    """Return a base64 PNG downscaled to max_w wide — the agent only needs enough
+    detail to judge composition/legibility, and a full 1080×1920 PNG is a heavy
+    vision input. Full-res is persisted separately for publishing. Falls back to
+    the original bytes if Pillow can't process them."""
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        img = Image.open(BytesIO(png))
+        if img.width > max_w:
+            img = img.resize((max_w, max(1, round(img.height * max_w / img.width))))
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return base64.b64encode(png).decode("ascii")
+
+
+def _downscale_for_vision(data: bytes, mime: str, max_edge: int = 1536) -> tuple[str, str]:
+    """Prepare a generated image for the agent's critique view: cap the long edge
+    at ~max_edge and re-encode (JPEG for opaque photos). Claude resizes to
+    ≤1568px on the long edge server-side anyway, so this only trims the
+    backend→model upload with no fidelity loss. The full-res original is what we
+    persist to storage and reference in the slide. Returns (base64, mimeType);
+    falls back to the original bytes on any error."""
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        img = Image.open(BytesIO(data))
+        long_edge = max(img.width, img.height)
+        if long_edge > max_edge:
+            scale = max_edge / long_edge
+            img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))))
+        buf = BytesIO()
+        if img.mode in ("RGBA", "LA", "P"):
+            img.save(buf, format="PNG")
+            return base64.b64encode(buf.getvalue()).decode("ascii"), "image/png"
+        img.convert("RGB").save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode("ascii"), "image/jpeg"
+    except Exception:
+        return base64.b64encode(data).decode("ascii"), mime
+
+
+def _persist_slide_render(project_id: UUID, post_id: UUID, slide_id: str, png: bytes) -> str:
+    """Best-effort: write a rasterized slide PNG to object storage + a
+    ContentAsset row (asset_type='slide_render'). These composed renders are what
+    both publish paths upload (publishing.pick_media). Returns the public url."""
+    fname = f"{slide_id}-{uuid4().hex[:8]}.png"
+    key = f"projects/{project_id}/renders/{fname}"
+    url = storage.put_image(key, png, "image/png")
+    with _open_db() as db:
+        db.add(ContentAsset(
+            project_id=project_id,
+            post_id=post_id,
+            asset_type=SLIDE_RENDER,
+            source="render",
+            url=url,
+            filename=fname,
+            mime_type="image/png",
+            params={"slide_id": slide_id, "width": 1080, "height": 1920},
+        ))
+        db.commit()
+    return url
+
+
+def _load_asset_bytes(asset: ContentAsset) -> bytes | None:
+    """Resolve a ContentAsset to its raw bytes from the configured object store.
+
+    Delegates to service.storage.get_bytes, which handles every URL family we
+    emit: absolute R2/CDN URLs (HTTP GET), local '/uploads/...' (disk), and
+    repo-bundled '/static/references/...'. Returns None when unavailable —
+    callers surface a friendly error.
+    """
+    return storage.get_bytes(asset.url)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------------
+
+
+def build_content_tools_lc(
+    project_id: UUID,
+    emit: EmitFn,
+    session: ContentSession,
+    *,
+    vision: bool = True,
+    remember: bool = True,
+    pause: PauseFn | None = None,
+) -> list[StructuredTool]:
+    """Build the content tools scoped to this session, for ``create_deep_agent``.
+
+    project_id is captured in closures so every tool call is implicitly
+    scoped to the user's project — the model cannot leak across projects.
+    emit pushes events to the SSE consumer; session lets writers stash IDs
+    (e.g. session.plan_id after submit_plan).
+
+    ``vision`` says whether the run's provider accepts image blocks inside a
+    tool result. Anthropic does, and the image phase is built on the model
+    looking at what it generated; a provider that does not gets the asset
+    URL and a note instead of a request its API would reject.
+
+    ``remember=False`` is a session the user asked not to be remembered: it
+    gets no memory tools at all, so the agent cannot write what it cannot
+    reach.
+
+    ``pause`` is how ``publish_post`` asks the person before anything goes
+    out. Without one there is nobody to ask, and publishing answers
+    ``needs_approval`` instead of sending.
+    """
+    # Typed input models for the image tools — the tool's argument schema and
+    # the field constraints the model sees in one place (enums from StrEnum so
+    # an invalid id can't be passed; ranges via Field). Defined here, not at
+    # module top, to keep the image package off the import path of every
+    # other tool; service.images is imported lazily at session-build time.
+    from service.images.schema import EditMode, MaskMode, SubjectType
+
+    class GenerateImageInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        prompt: str = Field(description="Image prompt — the scene description for this slide.")
+        slide_id: str | None = Field(
+            None,
+            description=(
+                "The slide this image is for (e.g. 'slide-01'). When set, the result is "
+                "attached to that slide of the current post: image_url is filled, the preview "
+                "re-renders, and POST_DRAFT_UPDATED fires — no separate submit_post_draft "
+                "needed. Always pass this during the image phase."
+            ),
+        )
+        item_index: int | None = Field(
+            None, ge=0,
+            description=(
+                "For multi-image slides (collage / before-after), the 0-based cell to attach "
+                "this image to. Omit for single-image slides."
+            ),
+        )
+        model: ImageModel = Field(
+            DEFAULT_IMAGE_MODEL,
+            description=(
+                "Optional image model id. The run uses its own provider's image "
+                "model when this names one it cannot reach, so leaving the default "
+                "is always safe."
+            ),
+        )
+        aspect_ratio: AspectRatio = Field(
+            AspectRatio.PORTRAIT_9_16, description="Optional aspect ratio. Defaults to 9:16 portrait.",
+        )
+        number_of_images: int = Field(1, ge=1, le=4, description="How many images to generate. Default 1, max 4.")
+        negative_prompt: str | None = Field(None, description="Accepted but inert — no current image model supports negative prompting. Put the constraint in the prompt instead.")
+        input_asset_id: str | None = Field(
+            None, description="Single reference asset UUID (legacy; prefer input_asset_ids).",
+        )
+        input_asset_ids: list[str] = Field(
+            default_factory=list,
+            description=(
+                "Multiple reference assets. Up to 3 UUIDs in role-order (xAI uses the first only): "
+                "[character_ref, camera_or_style_ref, optional_third]. For slides 2-5 the common "
+                "pattern is [slide-01 character image, cameraRef from the reference library] — "
+                "first image locks face/skin/hair, second imitates TikTok framing. A role-explanation "
+                "prefix is auto-prepended to your prompt when 2+ ids are passed."
+            ),
+        )
+
+    class EditImageInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        prompt: str = Field(description="Edit instruction.")
+        input_asset_id: str = Field(description="UUID of the source asset to edit.")
+        model: ImageModel | None = Field(None, description="Optional image model id.")
+        edit_mode: EditMode | None = Field(None, description="Accepted but inert — masked/mode-based editing retired with Imagen.")
+        mask_asset_id: str | None = Field(None, description="Optional mask asset UUID.")
+        mask_mode: MaskMode | None = Field(None, description="Optional mask mode.")
+        style_asset_id: str | None = Field(None, description="Optional style reference asset UUID.")
+        subject_asset_id: str | None = Field(None, description="Optional subject reference asset UUID.")
+        subject_type: SubjectType | None = Field(None, description="Optional subject type.")
+        aspect_ratio: AspectRatio | None = Field(None, description="Optional aspect ratio override.")
+        number_of_images: int = Field(1, ge=1, le=4, description="How many images to generate (1-4).")
+        negative_prompt: str | None = Field(None, description="Accepted but inert — see generate_image.")
+
+    from service.videos.schema import VideoAspectRatio, VideoResolution
+
+    class GenerateVideoInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        prompt: str = Field(
+            description=(
+                "What happens in the clip, as one continuous shot: the subject and its action, the "
+                "camera (shot size, angle, movement), the setting and light, the look, and the sound. "
+                "Spoken lines go in double quotes. Sent to the video model as written."
+            ),
+        )
+        duration_seconds: int = Field(
+            8, ge=4, le=30,
+            description=(
+                "Clip length. Veo makes 4, 6 or 8 s; Seedance 2.0 Mini 4-15 s; Seedance 2.5 4-30 s. "
+                "Anything else is fitted to the nearest length the model makes, and the result says so."
+            ),
+        )
+        aspect_ratio: VideoAspectRatio = Field(
+            VideoAspectRatio.PORTRAIT_9_16, description="Default 9:16 portrait (TikTok, Reels, Shorts).",
+        )
+        resolution: VideoResolution = Field(
+            VideoResolution.P720,
+            description="720p by default. 1080p only on Veo, and only for an 8 s clip.",
+        )
+        first_frame_asset_id: str | None = Field(
+            None,
+            description=(
+                "An image asset the clip opens on (image-to-video): one generate_image returned, or an "
+                "upload from fetch_content_assets. The best way to keep the brand's look, product or "
+                "character exact. Omit to make the clip from the prompt alone."
+            ),
+        )
+        last_frame_asset_id: str | None = Field(
+            None,
+            description="An image the clip ends on — a before-to-after. Needs first_frame_asset_id.",
+        )
+        model: VideoModel | None = Field(
+            None,
+            description=(
+                "Leave empty: the run's video model follows the user's keys and settings. Name one "
+                "only when the user asked for it by name."
+            ),
+        )
+        negative_prompt: str | None = Field(
+            None, description="What to keep out of the clip (Veo only), e.g. 'text, warped hands'.",
+        )
+
+    def _image_result(image_blocks: list[dict], m: BaseModel) -> str | list[dict]:
+        """Success result for an image tool: the pictures plus the typed
+        payload where the provider can look, the payload alone where it
+        cannot."""
+        if not vision:
+            return _ok({**m.model_dump(mode="json"), "preview": "not shown — this model cannot view images in tool results"})
+        return [*image_blocks, {"type": "text", "text": m.model_dump_json()}]
+
+    # ----------------------- Argument schemas -----------------------
+    # What the model sees. Descriptions live here rather than beside the
+    # bodies so a field's meaning is stated once, next to its type.
+
+    # The writers take the real models, not ``dict``: the argument schema is
+    # then the contract every provider's model sees in the tool definition
+    # and validates against before the body runs. With ``dict`` and a
+    # description that only *named* the schema, a model without Claude's
+    # prior knowledge of it went looking — grep and ls over the scratch
+    # filesystem, then probes at the tool to read the shape off validation
+    # errors, two of which persisted as plans.
+    class SubmitPlanArgs(BaseModel):
+        plan: PlanDraft = Field(description="The plan — the same object emitted in <duct_artifact>.")
+
+    class RevisePlanDaysArgs(BaseModel):
+        changes: list[PlanDayChange] = Field(
+            min_length=1,
+            max_length=MAX_PLAN_DAYS,
+            description="One entry per day to change: its date and only the fields that change.",
+        )
+
+    class SubmitPostDraftArgs(BaseModel):
+        post: PostDraft = Field(description="The post — the same object emitted in <duct_artifact>.")
+
+    class EditSlideArgs(BaseModel):
+        slide_id: str = Field(description="The slide to edit, e.g. 'slide-03'.")
+        patch: dict = Field(description="Partial Slide fields to merge (only what changes).")
+
+    class HistoryArgs(BaseModel):
+        limit: int = Field(30, ge=1, le=100, description="Max rows to return. Default 30, max 100.")
+
+    class FormatArgs(BaseModel):
+        media: str = Field(
+            "",
+            description="Keep only formats for this media kind: video, slideshow, image, text or article. Empty = all.",
+        )
+        channel: str = Field(
+            "",
+            description="Keep only formats that apply on this channel (tiktok, linkedin, twitter, ...). Empty = all.",
+        )
+
+    class AnalyticsArgs(BaseModel):
+        days: int = Field(30, ge=1, le=365, description="How many days back to read, from today.")
+
+    class DiscoveredReferencesArgs(BaseModel):
+        min_play_count: int = Field(
+            10000, ge=0,
+            description="Skip posts with fewer plays. Default 10000 (filters out outliers).",
+        )
+        limit: int = Field(30, ge=1, le=100, description="Max rows to return. Default 30, max 100.")
+
+    class ContentAssetsArgs(BaseModel):
+        limit: int = Field(
+            50, ge=1, le=200,
+            description="Newest first. Default 50, max 200; narrow with asset_type to reach older ones.",
+        )
+        asset_type: str = Field(
+            "",
+            description="Optional asset_type filter (e.g. 'generated', 'reference', 'slide_render'). Omit for all types.",
+        )
+        axis: str = Field(
+            "",
+            description="Optional reference-axis filter: 'camera' | 'layouts' | 'captions'. Only affects global library references.",
+        )
+        subtype: str = Field(
+            "",
+            description="Optional reference-subtype filter (e.g. 'selfie-talking', 'lifestyle', 'closeup'). Only affects global library references.",
+        )
+
+    class PublishPostArgs(BaseModel):
+        post_id: str = Field(description="UUID of the content_posts row to publish.")
+        social_account_ids: list[str] = Field(
+            default_factory=list,
+            description=(
+                "Account ids at the project's scheduler, as the error lists them. Omit to post from "
+                "the account this project linked for the post's platform; if there is none, or more "
+                "than one, the error names them."
+            ),
+        )
+
+        @field_validator("social_account_ids", mode="before")
+        @classmethod
+        def _ids_as_text(cls, value):
+            # PostBridge's ids are numbers, and a model passes them as such.
+            return [str(v) for v in value] if isinstance(value, list) else value
+        scheduled_at: str | None = Field(
+            None,
+            description=(
+                "Optional ISO 8601 time WITH the user's UTC offset, e.g. 2026-10-02T09:00:00+02:00 "
+                "(a time without one is read as UTC); omit to post now."
+            ),
+        )
+        tiktok_draft: bool = Field(False, description="If true, post lands as a TikTok draft instead of scheduling.")
+        allow_uncomposed: bool = Field(
+            False,
+            description=(
+                "Escape hatch: publish single-image slides as their RAW photo when no composed "
+                "render exists (captions won't appear). Multi-image slides still require a render. "
+                "Default false."
+            ),
+        )
+
+    class MarkPostedArgs(BaseModel):
+        post_id: str = Field(description="UUID of the content_posts row.")
+        url: str | None = Field(None, description="Optional link to the live post, on whichever platform.")
+
+    class PostIdArgs(BaseModel):
+        post_id: str = Field(description="UUID of the content_posts row.")
+
+    class SlideIdArgs(BaseModel):
+        slide_id: str = Field(description="The slide, e.g. 'slide-01'.")
+
+    class FetchPostArgs(BaseModel):
+        post_dir_slug: str = Field("", description="Post slug, e.g. '2026-06-08-001'.")
+        post_id: str = Field("", description="Post UUID.")
+
+    class SubmitAssessmentArgs(BaseModel):
+        markers: list[MarkerScore] = Field(
+            description="One score per marker, all six, as the review_post sub-agent returned them.",
+        )
+        notes: str = Field("", description="Optional one-sentence overall summary.")
+
+    # ----------------------- Writers -----------------------
+
+    def _overreach_error(overreach) -> str:
+        return _err(" ".join(
+            f"{o.hook} is on {o.days} of {o.channel}'s {o.channel_days} days, and {o.channel}'s history "
+            f"backs it with {o.record}: a hint, not proof. Give it at most {o.cap} of those days."
+            for o in overreach
+        ) + " Spread the rest over other hooks; a hook earns more days once its posts earn the goal.")
+
+    def _stray_channels(days: list[dict]) -> str | None:
+        """The refusal for a day bound for a channel the brand does not post on."""
+        active = set(session.active_channels or ())
+        if not active:
+            return None
+        strays = sorted({str(p) for d in days for p in (d.get("platforms") or []) if str(p) not in active})
+        if not strays:
+            return None
+        return _err(
+            f"This brand posts on {', '.join(sorted(active))}. Days name {', '.join(strays)}, "
+            "which it does not post on: keep every day's platforms within the brand's channels."
+        )
+
+    def _feed_sources(days: list) -> str | None:
+        """Hold a plan's cited sources to the feed this run read. Only a plan
+        from shipped work cites one: on any other run a source the model
+        wrote is dropped, because nothing it could cite was shown to it. A
+        refusal names every problem, so one retry can fix them all."""
+        digest = getattr(session, "feed", None)
+        if digest is None:
+            for day in days:
+                day.sources = [] if isinstance(day, Day) else None
+            return None
+        known = digest.refs()
+        problems = source_problems(days, known, max_days=digest.options.max_days)
+        if problems:
+            return _err("Nothing was proposed: " + " ".join(problems))
+        resolve_sources(days, known)
+        return None
+
+    async def _propose(proposal, live_id) -> None:
+        """Put ``proposal`` in front of the person: on the session, held on the
+        conversation (a deploy before they decide used to lose it), and in the
+        viewport."""
+        session.proposal = proposal
+        try:
+            with _open_db() as db:
+                hold_proposal(db, getattr(session, "conversation_id", None), proposal)
+        except Exception:
+            logger.warning("content: proposal for session %s not held", session.session_id, exc_info=True)
+        await emit({
+            "event": ContentEvent.PLAN_GENERATED,
+            "session_id": session.session_id,
+            "plan_id": str(live_id) if live_id else None,
+            "payload": proposal.payload(PROPOSED),
+        })
+
+    async def submit_plan(plan: PlanDraft | dict) -> str:
+        try:
+            payload = plan if isinstance(plan, dict) else plan.model_dump(mode="json")
+            try:
+                draft = PlanDraft.model_validate(payload)
+            except ValidationError as exc:
+                return _err(f"PlanDraft validation failed: {exc}")
+            if draft.project_id != project_id:
+                return _err(
+                    f"project_id mismatch: payload has {draft.project_id}, "
+                    f"session is scoped to {project_id}."
+                )
+            refused = _feed_sources(draft.days)
+            if refused:
+                return refused
+            # The plan manages a period: one post per date in it, no more, no
+            # fewer. A run sets the period before its opening turn.
+            if session.period_days and len(draft.days) != session.period_days:
+                end = plan_end(session.period_start, session.period_days)
+                return _err(
+                    f"This plan covers {session.period_days} days, {session.period_start} to {end}: "
+                    f"send exactly {session.period_days} days, one per date. You sent {len(draft.days)}."
+                )
+            # A proposal, not a write (agents/content/plan_proposal.py). The
+            # live plan is read only to show what Accept would keep: days
+            # before today and days with a drafted post. The person decides
+            # in the viewport; the accept route writes.
+            with _open_db() as db:
+                row = db.get(ContentPlan, session.plan_id) if session.plan_id else None
+                if row is not None and row.project_id != project_id:
+                    row = None
+                live_days = list(row.days or []) if row is not None else None
+                live_id = row.id if row is not None else None
+            new_days = [d.model_dump(mode="json") for d in draft.days]
+            stray = _stray_channels(new_days)
+            if stray:
+                return stray
+            # A hook only one post tried is a hint, and a plan built on it is
+            # a guess repeated: held in code, because the brief said so and a
+            # plan still put 9 of 23 days on one (channel_mix.HINT_SHARE).
+            overreach = overreaching_hooks(session.channel_mix, new_days)
+            if overreach:
+                return _overreach_error(overreach)
+            strategy = draft.strategy.model_dump(mode="json")
+            if session.channel_mix is not None:
+                strategy["mix"] = mix_snapshot(session.channel_mix)
+            if getattr(session, "feed", None) is not None:
+                strategy["feed"] = session.feed.strategy()
+            proposal = build_proposal(
+                project_id=project_id,
+                draft_name=draft.name,
+                character=draft.character.model_dump(mode="json"),
+                strategy=strategy,
+                new_days=new_days,
+                live_days=live_days,
+                live_plan_id=live_id,
+                period=(
+                    PlanPeriod(session.period_start, session.period_days)
+                    if session.period_start and session.period_days
+                    else None
+                ),
+                today=utcnow().date(),
+            )
+            logger.info(
+                "content: plan proposed for session %s (%d days, %d kept, replaces %s)",
+                session.session_id, len(proposal.days), len(proposal.kept_days), proposal.replaces_plan_id,
+            )
+            await _propose(proposal, live_id)
+            return _ok_model(SubmitPlanResult(
+                status=PROPOSED,
+                plan_id="",
+                replaces_plan_id=str(live_id) if live_id else "",
+                days=len(proposal.days),
+                kept_days=proposal.kept_days,
+            ))
+        except Exception as exc:
+            logger.exception("submit_plan failed")
+            return _err(f"submit_plan failed: {exc}")
+
+    # Why a day keeps what it has, in words the agent relays.
+    _REFUSED = {
+        DRAFTED: "has a drafted post, and the plan keeps a drafted day as it is: change the post itself, "
+                 "from its card on the board",
+        PAST: "is in the past, and the plan keeps what happened",
+        OUTSIDE: "is outside this plan",
+    }
+
+    async def revise_plan_days(changes: list[PlanDayChange | dict]) -> str:
+        try:
+            try:
+                parsed = [c if isinstance(c, PlanDayChange) else PlanDayChange.model_validate(c) for c in changes]
+            except ValidationError as exc:
+                return _err(f"PlanDayChange validation failed: {exc}")
+            refused_sources = _feed_sources(parsed)
+            if refused_sources:
+                return refused_sources
+            today = utcnow().date()
+            # A proposal still waiting is what the person is looking at, so a
+            # change applies to it; otherwise to the plan this session manages.
+            held = session.proposal if getattr(session, "proposal", None) is not None else None
+            if held is not None and held.project_id != project_id:
+                held = None
+            saved = None
+            if held is None:
+                with _open_db() as db:
+                    row = db.get(ContentPlan, session.plan_id) if session.plan_id else None
+                    if row is not None and row.project_id == project_id:
+                        saved = {
+                            "plan_id": row.id, "name": row.name, "character": row.character,
+                            "strategy": row.strategy, "days": list(row.days or []),
+                            "start": row.start_date or session.period_start,
+                        }
+                if saved is None:
+                    return _err(
+                        "There is no plan to change yet. Write the whole plan with submit_plan; "
+                        "revise_plan_days changes days of a plan that exists."
+                    )
+            base_days = list(held.days) if held is not None else saved["days"]
+            start = held.start_date if held is not None else saved["start"]
+            if start is None:
+                return _err("This plan has no start date, so its days have no dates to change by.")
+            days, changed, refused = change_days(
+                base_days, [(c.date, c.fields()) for c in parsed], start=start, today=today,
+            )
+            if refused:
+                end = start + timedelta(days=max(len(base_days) - 1, 0))
+                said = "; ".join(
+                    f"{r.on.isoformat()} was sent twice" if r.reason not in _REFUSED
+                    else f"{r.on.isoformat()} {_REFUSED[r.reason]}"
+                    + (f" ({start.isoformat()} to {end.isoformat()})" if r.reason == OUTSIDE else "")
+                    for r in refused
+                )
+                return _err(f"Nothing was proposed: {said}. Send the change again without those days.")
+            if not changed:
+                return _err("Those days already read that way, so there is nothing to propose.")
+            unplanned = [days[i] for i in changed if not str(days[i].get("topic") or "").strip()
+                         or not str(days[i].get("pillar") or "").strip()]
+            if unplanned:
+                return _err("Every day needs a topic and a pillar; a change cannot clear either.")
+            stray = _stray_channels([days[i] for i in changed])
+            if stray:
+                return stray
+            # Only a change that crowds a hook further is refused: a plan made
+            # before the cap may lean on one already, and a one-day edit that
+            # leaves that alone is not the edit to stop.
+            before = {(o.channel, o.hook): o.days for o in overreaching_hooks(session.channel_mix, base_days)}
+            worse = [
+                o for o in overreaching_hooks(session.channel_mix, days)
+                if o.days > before.get((o.channel, o.hook), 0)
+            ]
+            if worse:
+                return _overreach_error(worse)
+            if held is not None:
+                proposal = revise_held_proposal(held, days, changed, today=today)
+                live_id = held.replaces_plan_id
+            else:
+                proposal = propose_day_changes(
+                    project_id=project_id, plan_id=saved["plan_id"], name=saved["name"], start=start,
+                    character=saved["character"], strategy=saved["strategy"], live_days=base_days,
+                    days=days, changed=changed, today=today,
+                )
+                live_id = saved["plan_id"]
+            if getattr(session, "feed", None) is not None:
+                proposal.strategy = {**(proposal.strategy or {}), "feed": session.feed.strategy()}
+            logger.info(
+                "content: %d day(s) proposed for session %s (of %s)",
+                len(changed), session.session_id, "a proposal" if held is not None else f"plan {live_id}",
+            )
+            await _propose(proposal, live_id)
+            return _ok({
+                "status": PROPOSED,
+                "changed": [(start + timedelta(days=i)).isoformat() for i in changed],
+                "message": "The change is in the viewport with Accept and Reject; nothing is saved until "
+                           "the person accepts. Say in a line what changed and why.",
+            })
+        except Exception as exc:
+            logger.exception("revise_plan_days failed")
+            return _err(f"revise_plan_days failed: {exc}")
+
+    async def _push_queued_edit(db: Session, post: ContentPost) -> str | None:
+        """A rewrite of a post a scheduler is holding reaches the scheduler
+        before it is saved, or it is not saved: the queue would publish the old
+        words. Returns the refusal for the model, or None once it has them."""
+        proj = db.get(Project, project_id)
+        label = (spec_for(post.publisher).label if spec_for(post.publisher) else "its scheduler")
+        try:
+            pub = publisher_for(proj.user_id, post.publisher, db)
+        except VendorNotConnected as exc:
+            db.rollback()
+            return _err(f"The post is scheduled on {label} and the rewrite can't reach it: {exc}")
+        try:
+            async with pub:
+                await push_edit(pub, post)
+        except PostAlreadyOut:
+            db.rollback()
+            db.refresh(post)
+            went_out(post)
+            db.add(post)
+            db.commit()
+            return _err(
+                "That post already went out, so the rewrite can't reach it; it is marked posted now. "
+                "Draft a new post for the new words."
+            )
+        except PublisherError as exc:
+            db.rollback()
+            return _err(
+                f"The post is scheduled on {label} and the update didn't go through, so nothing "
+                f"was saved: {exc.message or 'try again shortly'}."
+            )
+        return None
+
+    async def submit_post_draft(post: PostDraft | dict) -> str:
+        try:
+            payload = post if isinstance(post, dict) else post.model_dump(mode="json")
+            try:
+                draft = PostDraft.model_validate(payload)
+            except ValidationError as exc:
+                return _err(f"PostDraft validation failed: {exc}")
+            if draft.project_id != project_id:
+                return _err(
+                    f"project_id mismatch: payload has {draft.project_id}, "
+                    f"session is scoped to {project_id}."
+                )
+            # The session's channel files the post when the model left
+            # `platforms` out, and a text channel's draft with no slides is a
+            # text post whatever post_type defaulted to. "Left out" is read
+            # off what the model sent: the harness hands over a validated
+            # PostDraft, and the dump above fills every default in, so the
+            # re-validated draft cannot tell an omitted field from a given one.
+            sent = post.model_fields_set if isinstance(post, PostDraft) else set(post)
+            if "platforms" not in sent and session.channel in set(Platform):
+                draft.platforms = [Platform(session.channel)]
+            ch = resolve_channel(primary_channel(draft.platforms))
+            if ch.text_first and not draft.slides:
+                draft.post_type = TEXT_POST_TYPE
+            if draft.post_type == TEXT_POST_TYPE and not draft.caption.strip():
+                return _err("A text post carries its words in `caption`; it is empty.")
+            replies = [r for r in draft.replies if r.strip()]
+            # The platform's own limits, checked here rather than trusted to
+            # the model: an over-length tweet does not publish.
+            with _open_db() as db:
+                spec = _channel_spec(db, ch.id)
+            problems = copy_problems(
+                ch.id, draft.caption, replies, strips_links=bool(spec and spec.strips_links_on(ch.id)),
+            )
+            if problems:
+                return _err("Nothing saved. " + " ".join(problems) + " Tighten it and submit again.")
+            if draft.post_type == TEXT_POST_TYPE:
+                # The project's banned words, checked here for the same reason
+                # as the length: a rule the model may forget is a suggestion.
+                # Read fresh, so a Brand tab edit binds the very next submit.
+                with _open_db() as db:
+                    proj = db.get(Project, project_id)
+                    banned = voice_rules_of(proj.content_brand if proj else None).banned_words
+                used = banned_words_in("\n".join([draft.caption, *replies]), banned)
+                if used:
+                    named = ", ".join(f'"{w}"' for w in used)
+                    return _err(
+                        f"Nothing saved. The post uses {named}, which this project's voice rules ban. "
+                        "Rewrite that line and submit again."
+                    )
+            # Serialize against concurrent image-attach / edit_slide on this post.
+            lock_key = str(session.post_id) if session.post_id else f"slug:{project_id}:{draft.post_dir_slug}"
+            async with _post_lock(lock_key):
+              with _open_db() as db:
+                # A revise/resume session is bound to a specific post via
+                # session.post_id (routes/agents.py derives it from the
+                # conversation's artifact_id). That binding wins over the
+                # model-supplied slug: a drafting agent that mints a fresh
+                # date-slug (e.g. today's date) would otherwise miss the upsert
+                # key and FORK a brand-new post, orphaning it from the chat.
+                # Resolve the bound row first and keep its slug.
+                existing = None
+                if session.post_id is not None:
+                    bound = db.get(ContentPost, session.post_id)
+                    if bound is not None and bound.project_id == project_id:
+                        existing = bound
+                if existing is None:
+                    existing = db.exec(
+                        select(ContentPost).where(
+                            ContentPost.project_id == project_id,
+                            ContentPost.post_dir_slug == draft.post_dir_slug,
+                        )
+                    ).first()
+                # Never rename a post we're updating in place — the slug is its
+                # stable identity (URL + conversation link). Only a brand-new
+                # insert adopts the model-supplied slug.
+                effective_slug = existing.post_dir_slug if existing is not None else draft.post_dir_slug
+
+                # Structured slides are the source of truth: carry already-
+                # generated images forward across copy edits, render the HTML
+                # deterministically, and derive the flat image_prompts list.
+                # Legacy callers that still pass slides_html (no slides) keep
+                # working unchanged.
+                if draft.slides:
+                    merged = _merge_slide_images(draft.slides, existing)
+                    slides_json = [s.model_dump(mode="json") for s in merged]
+                    slides_html = render_slides_html(draft.layout, merged)
+                    image_prompts = derive_image_prompts(merged)
+                    slide_count = len(merged)
+                else:
+                    slides_json = existing.slides if existing is not None else []
+                    slides_html = draft.slides_html
+                    image_prompts = [p.model_dump(mode="json") for p in draft.image_prompts]
+                    slide_count = draft.slide_count
+
+                values = {
+                    "project_id":      project_id,
+                    "plan_id":         session.plan_id,
+                    "post_dir_slug":   effective_slug,
+                    "pillar":          draft.pillar,
+                    "topic":           draft.topic,
+                    "post_type":       draft.post_type,
+                    "format_id":       _resolve_format_id(db, project_id, draft.format_slug),
+                    "avatar_id":       draft.avatar_id,
+                    "layout":          draft.layout.value,
+                    "slide_count":     slide_count,
+                    "slides":          slides_json,
+                    "slides_html":     slides_html,
+                    "caption":         draft.caption,
+                    "replies":         replies,
+                    "hashtags":        draft.hashtags,
+                    "title":           draft.title,
+                    "hook_type":       draft.hook_type,
+                    "hook_text":       draft.hook_text,
+                    "hook_emotion":    draft.hook_emotion or "",
+                    "save_cta":        draft.save_cta or "",
+                    "image_prompts":   image_prompts,
+                    "audio_note":      draft.audio_note or "",
+                    "bridge_text":     draft.bridge_text or "",
+                    "strategic_note":  draft.strategic_note or "",
+                    "visual_brief":    draft.visual_brief or "",
+                    "emotional_arc":   draft.emotional_arc or "",
+                    "camera_ref_pool": draft.camera_ref_pool or "",
+                    "platforms":       [p.value for p in draft.platforms],
+                }
+                # A clone records its reference. The link is the server's (the
+                # session's, or the row's on a later write); only the verdict
+                # is the model's. Absent from `values` otherwise, so an
+                # ordinary re-submit never clears it.
+                recorded = clone_source(
+                    session.clone_reference or (existing.clone_source if existing is not None else None),
+                    draft.clone,
+                )
+                if recorded is not None:
+                    values["clone_source"] = recorded
+                if existing is not None:
+                    queued = is_queued_at_publisher(existing)
+                    before = (existing.caption, list(existing.replies or []))
+                    for k, v in values.items():
+                        setattr(existing, k, v)
+                    # Preserve a saved status across agent re-submits (chat
+                    # refinements): a post the user already Saved (draft) or
+                    # published must NOT be reset to "pending". `status` is
+                    # deliberately absent from `values` above.
+                    row = existing
+                    if queued and words_changed(existing, *before):
+                        refused = await _push_queued_edit(db, existing)
+                        if refused:
+                            return refused
+                else:
+                    # A brand-new post is unsaved — the user's Save flips it
+                    # pending → draft (see routes/content.py PATCH + the UI).
+                    row = ContentPost(**values, status=ContentStatus.PENDING)
+                    db.add(row)
+                # A draft for a plan day fills that day now, in the same
+                # commit, not when the chat ends: a chat cut off mid-way used
+                # to leave the board offering to draft the day again.
+                if session.plan_id is not None and session.day_index is not None:
+                    plan_row = db.get(ContentPlan, session.plan_id)
+                    # Only this project's plan: the session's plan id came in
+                    # on the request, and a post must never land on another
+                    # project's board however it was addressed.
+                    if plan_row is not None and plan_row.project_id != project_id:
+                        plan_row = None
+                    days = link_post_to_day(plan_row.days or [], session.day_index, row.id) if plan_row else None
+                    if days is not None:
+                        plan_row.days = days
+                        plan_row.updated_at = utcnow()
+                        db.add(plan_row)
+                db.commit()
+                db.refresh(row)
+                if session.post_id != row.id and session.conversation_id is not None:
+                    # "Open the draft → its chat" finds the conversation by
+                    # this link. It too used to wait for the chat to end, so
+                    # a draft whose chat was cut off reopened on a new one.
+                    try:
+                        link_artifact(db, session.conversation_id, "post", row.id)
+                    except Exception:
+                        logger.warning("content: failed to link conversation %s → post %s",
+                                       session.conversation_id, row.id, exc_info=True)
+                session.post_id = row.id
+                logger.info(
+                    "content: post %s upserted (slug=%s, layout=%s, slides=%d, images=%d)",
+                    row.id, row.post_dir_slug, row.layout, row.slide_count,
+                    sum(1 for s in (row.slides or []) if isinstance(s, dict) and s.get("image_url")),
+                )
+                await emit({
+                    "event": ContentEvent.POST_DRAFT_UPDATED,
+                    "session_id": session.session_id,
+                    "post_id": str(row.id),
+                    "payload": _build_post_payload(row, db),
+                })
+                return _ok_model(SubmitPostResult(
+                    post_id=str(row.id),
+                    post_dir_slug=row.post_dir_slug,
+                    slide_count=row.slide_count,
+                    images_generated=sum(
+                        1 for s in (row.slides or [])
+                        if isinstance(s, dict) and s.get("image_url")
+                    ),
+                ))
+        except Exception as exc:
+            logger.exception("submit_post_draft failed")
+            return _err(f"submit_post_draft failed: {exc}")
+
+    async def edit_slide(slide_id: str, patch: dict) -> str:
+        try:
+            slide_id = (slide_id or "").strip()
+            patch = patch or {}
+            if not slide_id:
+                return _err("slide_id is required (e.g. 'slide-03').")
+            if not isinstance(patch, dict) or not patch:
+                return _err("patch must be a non-empty object of the fields to change.")
+            if session.post_id is None:
+                return _err("No current post in this session to edit.")
+            async with _post_lock(str(session.post_id)):
+              with _open_db() as db:
+                row, err = _require_post(db, project_id, session.post_id)
+                if err:
+                    return err
+                slides = list(row.slides or [])
+                _slide, idx, err = _require_slide(row, slide_id)
+                if err:
+                    return err
+                existing_slide = slides[idx]
+                # edit_slide is the DELIBERATE surgical path — a real prompt edit
+                # (including a more concise rewrite) is allowed here. Degradation
+                # protection lives on the bulk re-emit path (_merge_slide_images),
+                # which is where prompts silently collapsed.
+                merged = {**existing_slide, **patch, "slide_id": slide_id}
+                # If this patch manually attaches an image (image_url) without
+                # declaring which prompt produced it, anchor provenance to the
+                # slide's current prompt — a blank image_prompt_used makes the
+                # slide read as falsely stale.
+                if patch.get("image_url") and "image_prompt_used" not in patch:
+                    merged["image_prompt_used"] = merged.get("image_prompt", "")
+                try:
+                    slide_obj = Slide.model_validate(merged)
+                except ValidationError as exc:
+                    return _err(f"patched slide is invalid — fix and call again:\n{exc}")
+                slides[idx] = slide_obj.model_dump(mode="json")
+                parsed = [Slide.model_validate(s) for s in slides]
+                row.slides = slides
+                row.slides_html = render_slides_html(row.layout, parsed)
+                row.image_prompts = derive_image_prompts(parsed)
+                row.slide_count = len(parsed)
+                row.updated_at = datetime.now(timezone.utc)
+                db.add(row)
+                db.commit()
+                db.refresh(row)
+                await emit({
+                    "event": ContentEvent.POST_DRAFT_UPDATED,
+                    "session_id": session.session_id,
+                    "post_id": str(row.id),
+                    "payload": _build_post_payload(row, db),
+                })
+                return _ok_model(EditSlideResult(
+                    post_id=str(row.id),
+                    slide_id=slide_id,
+                    updated=list(patch.keys()),
+                ))
+        except Exception as exc:
+            logger.exception("edit_slide failed")
+            return _err(f"edit_slide failed: {exc}")
+
+    # ----------------------- Readers -----------------------
+
+    async def fetch_brand_context() -> str:
+        try:
+            with _open_db() as db:
+                proj = db.get(Project, project_id)
+                if proj is None:
+                    return _err(f"Project {project_id} not found.")
+                channel_config = load_channel_config(proj.brand_channels, linked_pairs(linked_accounts(db, project_id)))
+                payload = {
+                    "project_id":            str(proj.id),
+                    "project_name":          proj.name,
+                    "slug":                  proj.slug,
+                    "tagline":               proj.tagline,
+                    "description":           proj.description,
+                    "url":                   proj.url,
+                    "company_name":          proj.company_name,
+                    "industry":              proj.industry,
+                    "audience":              proj.audience,
+                    "content_brand":         proj.content_brand,
+                    "content_pillars":       proj.content_pillars,
+                    "content_visual_assets": proj.content_visual_assets,
+                    # Where the brand posts, as the platform values a plan
+                    # day's `platforms` takes, and what the person said about
+                    # each channel (Accounts tab; channel_config).
+                    "active_channels":       channel_config.enabled(),
+                    "channels":              channel_config.profiles(),
+                    "primary_publisher":     channel_config.primary_publisher,
+                }
+                return _ok(payload)
+        except Exception as exc:
+            logger.exception("fetch_brand_context failed")
+            return _err(f"fetch_brand_context failed: {exc}")
+
+    async def fetch_topic_bank() -> str:
+        try:
+            with _open_db() as db:
+                rows = db.exec(
+                    select(ContentPost).where(
+                        ContentPost.project_id == project_id,
+                        ContentPost.status != ContentStatus.PENDING,  # unsaved drafts aren't "covered"
+                    )
+                ).all()
+                bank: dict[str, dict] = {}
+                for r in rows:
+                    if not r.pillar:
+                        continue
+                    slot = bank.setdefault(r.pillar, {"topics_used": [], "last_used_at": None})
+                    if r.topic and r.topic not in slot["topics_used"]:
+                        slot["topics_used"].append(r.topic)
+                    ts = r.posted_at or r.updated_at
+                    if ts is not None and (
+                        slot["last_used_at"] is None
+                        or ts.isoformat() > slot["last_used_at"]
+                    ):
+                        slot["last_used_at"] = ts.isoformat()
+                return _ok({"by_pillar": bank})
+        except Exception as exc:
+            logger.exception("fetch_topic_bank failed")
+            return _err(f"fetch_topic_bank failed: {exc}")
+
+    async def fetch_format_library(media: str = "", channel: str = "") -> str:
+        # Built-ins from disk plus the project's own rows, one shape, filtered
+        # by what the agent is making (agents/content/formats.py). The slide
+        # renderer inlines the whole caption-style registry, so no CSS rides
+        # along: the spec names the classes and the engine already has them.
+        try:
+            from agents.content import formats as format_library
+            with _open_db() as db:
+                rows = db.exec(
+                    select(ContentFormat).where(ContentFormat.project_id == project_id)
+                ).all()
+                library = format_library.library(rows)
+            picked = format_library.select(
+                library, media=(media or "").strip().lower() or None,
+                channel=(channel or "").strip().lower() or None,
+            )
+            return _ok({
+                "formats": [
+                    {
+                        "slug": f["slug"],
+                        "name": f["name"],
+                        "source": f["source"],
+                        "description": f["description"],
+                        "media": f["media"],
+                        "channels": f["channels"],
+                        "spec_markdown": f["spec_markdown"],
+                    }
+                    for f in picked
+                ],
+                "filtered_by": {"media": media or "", "channel": channel or ""},
+                "total_in_library": len(library),
+            })
+        except Exception as exc:
+            logger.exception("fetch_format_library failed")
+            return _err(f"fetch_format_library failed: {exc}")
+
+    async def fetch_avatar_library() -> str:
+        try:
+            with _open_db() as db:
+                rows = db.exec(
+                    select(ContentAvatar).where(ContentAvatar.project_id == project_id)
+                ).all()
+                return _ok({
+                    "avatars": [
+                        {
+                            "id":   str(r.id),
+                            "name": r.name,
+                            "data": r.data,
+                        }
+                        for r in rows
+                    ]
+                })
+        except Exception as exc:
+            logger.exception("fetch_avatar_library failed")
+            return _err(f"fetch_avatar_library failed: {exc}")
+
+    async def fetch_content_history(limit: int = 30) -> str:
+        try:
+            limit = min(int(limit or 30), 100)
+            with _open_db() as db:
+                rows = db.exec(
+                    select(ContentPost)
+                    .where(
+                        ContentPost.project_id == project_id,
+                        ContentPost.status != ContentStatus.PENDING,  # exclude unsaved drafts
+                    )
+                    .order_by(ContentPost.updated_at.desc())  # type: ignore[union-attr]
+                    .limit(limit)
+                ).all()
+                return _ok({
+                    "history": [
+                        {
+                            "id":            str(r.id),
+                            "post_dir_slug": r.post_dir_slug,
+                            "pillar":        r.pillar,
+                            "topic":         r.topic,
+                            "hook_type":     r.hook_type,
+                            "status":        r.status,
+                            "posted_at":     r.posted_at.isoformat() if r.posted_at else None,
+                            "perf":          r.perf,
+                        }
+                        for r in rows
+                    ]
+                })
+        except Exception as exc:
+            logger.exception("fetch_content_history failed")
+            return _err(f"fetch_content_history failed: {exc}")
+
+    async def fetch_content_analytics(days: int = 30) -> str:
+        """Published posts' numbers for the whole project, split the way a
+        review needs them: by platform and by post type, with the hook and
+        topic of the best and worst. fetch_content_history is the list; this
+        is the reading of it. Posted posts only, from what Duct recorded."""
+        from collections import defaultdict
+
+        from service.content_metrics import metric_value
+
+        try:
+            days = max(1, min(int(days or 30), 365))
+            since = utcnow() - timedelta(days=days)
+            with _open_db() as db:
+                rows = db.exec(
+                    select(ContentPost)
+                    .where(ContentPost.project_id == project_id)
+                    .where(ContentPost.posted_at.is_not(None))  # type: ignore[union-attr]
+                    .where(ContentPost.posted_at >= since)  # type: ignore[operator]
+                    .order_by(ContentPost.posted_at.desc())  # type: ignore[union-attr]
+                    .limit(200)
+                ).all()
+            groups: dict[str, dict[str, list]] = {"platform": defaultdict(list), "post_type": defaultdict(list)}
+            scored: list[tuple[float, ContentPost, str]] = []
+            for r in rows:
+                for platform in (r.platforms or ["tiktok"]):
+                    groups["platform"][str(platform)].append(r)
+                groups["post_type"][r.post_type or "slideshow"].append(r)
+                for key in ("completion_rate", "saves", "shares", "views"):
+                    value = metric_value(r.perf or {}, key)
+                    if value is not None:
+                        scored.append((float(value), r, key))
+                        break
+
+            def _summary(items: list) -> dict:
+                out: dict[str, Any] = {"posts": len(items)}
+                for key in ("views", "completion_rate", "saves", "shares", "likes", "comments"):
+                    vals = [v for v in (metric_value(p.perf or {}, key) for p in items) if v is not None]
+                    if vals:
+                        vals.sort()
+                        out[f"median_{key}"] = vals[len(vals) // 2]
+                        out[f"measured_{key}"] = len(vals)
+                return out
+
+            def _named(p: ContentPost, key: str, value: float) -> dict:
+                return {
+                    "topic": p.topic, "pillar": p.pillar, "post_type": p.post_type,
+                    "hook_type": p.hook_type, "platforms": p.platforms,
+                    "posted_at": p.posted_at.isoformat() if p.posted_at else None,
+                    key: value,
+                }
+
+            scored.sort(key=lambda t: -t[0])
+            return _ok({
+                "window_days": days,
+                "posted": len(rows),
+                "by_platform": {k: _summary(v) for k, v in groups["platform"].items()},
+                "by_post_type": {k: _summary(v) for k, v in groups["post_type"].items()},
+                "best": [_named(p, k, v) for v, p, k in scored[:5]],
+                "weakest": [_named(p, k, v) for v, p, k in scored[-5:][::-1]] if len(scored) > 5 else [],
+                "unmeasured": sum(1 for r in rows if not any(
+                    metric_value(r.perf or {}, k) is not None for k in ("views", "completion_rate", "saves", "shares")
+                )),
+                "note": "Medians over the posts that recorded each metric; an absent metric is unknown, not zero.",
+            })
+        except Exception as exc:
+            logger.exception("fetch_content_analytics failed")
+            return _err(f"fetch_content_analytics failed: {exc}")
+
+    async def fetch_discovered_references(min_play_count: int = 10000, limit: int = 30) -> str:
+        try:
+            min_plays = int(min_play_count or 10000)
+            limit     = min(int(limit or 30), 100)
+            with _open_db() as db:
+                rows = db.exec(
+                    select(ContentAsset)
+                    .where(
+                        ContentAsset.project_id == project_id,
+                        ContentAsset.asset_type == "discovered_reference",
+                    )
+                    .order_by(ContentAsset.created_at.desc())  # type: ignore[union-attr]
+                    .limit(200)  # over-fetch; we filter in Python by min_plays
+                ).all()
+                items: list[dict] = []
+                for r in rows:
+                    p = (r.params or {}).get("post") or {}
+                    if (p.get("play_count") or 0) < min_plays:
+                        continue
+                    items.append({
+                        "asset_id":      str(r.id),
+                        "tiktok_url":    r.url,
+                        "play_count":    p.get("play_count"),
+                        "digg_count":    p.get("digg_count"),
+                        "comment_count": p.get("comment_count"),
+                        "share_count":   p.get("share_count"),
+                        "collect_count": p.get("collect_count"),
+                        "hashtags":      p.get("hashtags") or [],
+                        "music":         (p.get("music_meta") or {}).get("music_name"),
+                        "author":        (p.get("author_meta") or {}).get("name"),
+                        "is_slideshow":  p.get("is_slideshow"),
+                        "text":          (p.get("text") or "")[:280],
+                        "created_at":    p.get("create_time_iso"),
+                    })
+                    if len(items) >= limit:
+                        break
+                return _ok({"references": items, "count": len(items)})
+        except Exception as exc:
+            logger.exception("fetch_discovered_references failed")
+            return _err(f"fetch_discovered_references failed: {exc}")
+
+    async def fetch_content_assets(asset_type: str = "", axis: str = "", subtype: str = "", limit: int = 50) -> str:
+        try:
+            asset_type = (asset_type or "").strip()
+            axis       = (axis or "").strip() or None
+            subtype    = (subtype or "").strip() or None
+            # Newest first and bounded: a project a few months old holds
+            # hundreds of assets, each carrying its `params` blob, and the
+            # unbounded listing was the largest single tool result the
+            # content agent produced — pruned only when the window filled.
+            limit = max(1, min(int(limit or 50), 200))
+            with _open_db() as db:
+                stmt = select(ContentAsset).where(ContentAsset.project_id == project_id)
+                if asset_type:
+                    stmt = stmt.where(ContentAsset.asset_type == asset_type)
+                stmt = stmt.order_by(ContentAsset.created_at.desc()).limit(limit + 1)
+                rows = db.exec(stmt).all()
+                truncated = len(rows) > limit
+                rows = rows[:limit]
+                assets = [
+                    {
+                        "id":         str(r.id),
+                        "asset_type": r.asset_type,
+                        "source":     r.source,
+                        "url":        r.url,
+                        "mime_type":  r.mime_type,
+                        "prompt":     r.prompt,
+                        "model":      r.model,
+                        "params":     r.params,
+                        "created_at": r.created_at.isoformat(),
+                    }
+                    for r in rows
+                ]
+            # Merge the repo-bundled global reference library (disk, not DB).
+            # Globals are project-agnostic, so they ride alongside the
+            # project-scoped rows whenever references are in scope.
+            if asset_type in ("", "reference"):
+                from service.content_references import global_reference_asset_dicts
+                assets.extend(global_reference_asset_dicts(axis=axis, subtype=subtype))
+            return _ok({"assets": assets, "truncated": truncated, "limit": limit})
+        except Exception as exc:
+            logger.exception("fetch_content_assets failed")
+            return _err(f"fetch_content_assets failed: {exc}")
+
+    # ----------------------- Image generation (Phase 4b) -----------------------
+
+    async def generate_image(**args: Any) -> str | list[dict]:
+        try:
+            from service.images import (
+                GenerateImageRequest,
+                ImageAPIError,
+                asset_source_for,
+                image_client_for,
+                persist_generated_image,
+            )
+            from service.google.gemini.client import build_multi_reference_prefix
+
+            image_provider, image_key = session.image_provider, session.image_api_key
+            if image_provider is None or not image_key:
+                return _err(_NO_IMAGE_KEY.format(verb="generation"))
+
+            payload = {k: v for k, v in args.items() if v not in (None, "")}
+            payload.setdefault("number_of_images", min(int(payload.get("number_of_images", 1) or 1), 4))
+            payload["model"] = image_model_for(image_provider, payload.get("model"))
+            # slide_id / item_index steer where the result is attached; they're
+            # not image params, so pull them out before building the request.
+            target_slide_id = str(payload.pop("slide_id", "") or "").strip()
+            _ti = payload.pop("item_index", None)
+            target_item_index = int(_ti) if _ti not in (None, "") else None
+
+            # Validate the attach target against the live post BEFORE paying for an
+            # image call — a bad slide_id/cell is a hard error (with the valid
+            # ids), not a silent attached_to:null. Shared guards; see _require_*.
+            if target_slide_id:
+                with _open_db() as db0:
+                    post0, err = _require_post(db0, project_id, session.post_id)
+                    if err:
+                        return err
+                    slide0, _idx, err = _require_slide(post0, target_slide_id)
+                    if err:
+                        return err
+                    if (err := _require_item(slide0, target_item_index)):
+                        return err
+
+            # Normalise single-ref legacy → list. The model may pass
+            # input_asset_id, input_asset_ids, or both; merge in order.
+            # Order encodes role: [character_ref, camera/style_ref].
+            ref_ids_raw: list = []
+            if payload.get("input_asset_id"):
+                ref_ids_raw.append(payload["input_asset_id"])
+            for extra in (payload.get("input_asset_ids") or []):
+                if extra and extra not in ref_ids_raw:
+                    ref_ids_raw.append(extra)
+            if len(ref_ids_raw) > 3:
+                return _err(
+                    "Too many reference images — max 3 (character + style + one supplementary). "
+                    "Drop the least useful and call again."
+                )
+
+            # A reference id is EITHER a per-project ContentAsset UUID
+            # (resolved from the DB + Railway Volume) OR a repo-bundled
+            # global library URL ('/static/references/...', resolved from
+            # disk — no DB row, no project scope). Classify in order so the
+            # [character, camera] role ordering is preserved.
+            from service.content_references import disk_path_for_public_url
+
+            ref_plan: list[tuple[str, str]] = []   # (kind, value); kind: 'global'|'uuid'
+            uuid_refs: list[str] = []
+            for raw in ref_ids_raw:
+                raw_s = str(raw).strip()
+                if disk_path_for_public_url(raw_s) is not None:
+                    ref_plan.append(("global", raw_s))
+                    continue
+                try:
+                    parsed = UUID(raw_s)
+                except ValueError:
+                    return _err(
+                        f"invalid reference asset id {raw_s!r} — expected a content "
+                        "asset UUID or a /static/references/... library URL."
+                    )
+                ref_plan.append(("uuid", str(parsed)))
+                uuid_refs.append(str(parsed))
+
+            # The Pydantic request carries UUIDs only (input_asset_ids is
+            # typed list[UUID]); global library refs reach the client as
+            # bytes via input_bytes_list below.
+            payload["input_asset_ids"] = uuid_refs
+            payload.pop("input_asset_id", None)
+            try:
+                request = GenerateImageRequest.model_validate(payload)
+            except ValidationError as exc:
+                return _err(f"The image request was invalid: {exc}")
+            # The descriptive prompt the agent passed — captured BEFORE the
+            # multi-reference prefix is prepended below, so image_prompt_used
+            # stays comparable to the slide's stored image_prompt for staleness.
+            generating_prompt = request.prompt
+
+            input_bytes_list: list[bytes] = []
+            global_refs: list[str] = []
+            with _open_db() as db:
+                for kind, value in ref_plan:
+                    if kind == "global":
+                        gp = disk_path_for_public_url(value)
+                        if gp is None or not gp.exists():
+                            return _err(f"reference library file missing on disk: {value}")
+                        input_bytes_list.append(gp.read_bytes())
+                        global_refs.append(value)
+                        continue
+                    ref_uuid = UUID(value)
+                    asset = db.get(ContentAsset, ref_uuid)
+                    if asset is None or asset.project_id != project_id:
+                        return _err(f"reference asset {ref_uuid} not found for this project.")
+                    ref_bytes = _load_asset_bytes(asset)
+                    if not ref_bytes:
+                        logger.warning("content: reference asset bytes unavailable: %s", asset.url)
+                        return _err("One of the reference images couldn't be loaded — try regenerating it.")
+                    input_bytes_list.append(ref_bytes)
+
+                # Auto-prepend the role-explanation prefix when 2+ refs.
+                if len(input_bytes_list) >= 2:
+                    prefix = build_multi_reference_prefix(len(input_bytes_list))
+                    if prefix and not request.prompt.startswith(prefix[:60]):
+                        request = request.model_copy(
+                            update={"prompt": f"{prefix}\n\n{request.prompt}"}
+                        )
+
+                client = image_client_for(image_provider, image_key)
+                try:
+                    images = await client.generate_image(
+                        request,
+                        input_bytes_list=input_bytes_list or None,
+                    )
+                except ImageAPIError as exc:
+                    logger.warning("content: image generation failed: %s", exc, exc_info=True)
+                    return _err("Image generation failed — please try again in a moment.")
+
+                assets = []
+                for img in images:
+                    asset = persist_generated_image(
+                        project_id, img,
+                        db=db,
+                        prompt=request.prompt,
+                        model=request.model.value,
+                        params={
+                            "aspect_ratio":      request.aspect_ratio.value,
+                            "image_size":        request.image_size.value,
+                            "seed":              request.seed,
+                            "negative_prompt":   request.negative_prompt,
+                            "input_asset_ids":   uuid_refs,
+                            "input_global_refs": global_refs,
+                        },
+                        post_id=session.post_id,
+                        source=asset_source_for(image_provider),
+                    )
+                    assets.append(asset)
+
+            # Attach the first image to the target slide so the preview updates
+            # live (one slide at a time) without a separate submit_post_draft.
+            attached = False
+            if target_slide_id and assets and session.post_id is not None:
+                try:
+                    async with _post_lock(str(session.post_id)):
+                      with _open_db() as db2:
+                        row = db2.get(ContentPost, session.post_id)
+                        if row is not None and row.project_id == project_id:
+                            attached = _attach_image_to_slide(
+                                db2, row, target_slide_id,
+                                asset_id=str(assets[0].asset_id),
+                                url=assets[0].url,
+                                item_index=target_item_index,
+                                prompt_used=generating_prompt,
+                            )
+                            if attached:
+                                db2.commit()
+                                db2.refresh(row)
+                                logger.info(
+                                    "content: image attached to %s%s on post %s",
+                                    target_slide_id,
+                                    f"#{target_item_index}" if target_item_index is not None else "",
+                                    row.id,
+                                )
+                                # Instant first paint: ship a small inline data
+                                # URI of the just-generated image so the viewport
+                                # renders it immediately, with no CDN round-trip;
+                                # the client swaps to the full-res CDN url once it
+                                # preloads.
+                                _pv_b64, _pv_mime = _downscale_for_vision(
+                                    images[0].data, images[0].mime_type, max_edge=800
+                                )
+                                await emit({
+                                    "event": ContentEvent.POST_DRAFT_UPDATED,
+                                    "session_id": session.session_id,
+                                    "post_id": str(row.id),
+                                    "payload": _build_post_payload(row, db2),
+                                    "inline_preview": {
+                                        "slide_id":   target_slide_id,
+                                        "item_index": target_item_index,
+                                        "data_uri":   f"data:{_pv_mime};base64,{_pv_b64}",
+                                    },
+                                })
+                except Exception:
+                    logger.exception("content: failed to attach image to slide %s", target_slide_id)
+
+            image_blocks: list[dict] = []
+            for img in images:
+                b64, vmime = _downscale_for_vision(img.data, img.mime_type)
+                image_blocks.append(_image_block(b64, vmime))
+            return _image_result(image_blocks, GenerateImageResult(
+                asset_ids=[str(a.asset_id) for a in assets],
+                asset_urls=[a.url for a in assets],
+                model=request.model.value,
+                attached_to=target_slide_id if attached else None,
+            ))
+        except Exception:
+            logger.exception("generate_image failed")
+            return _err("Image generation hit a snag — please try again.")
+
+    def _load_frame(db: Session, raw_id: str | None, which: str) -> tuple[Any, str | None]:
+        """A frame for the clip from one of this project's image assets."""
+        from service.videos import VideoFrame
+
+        if not raw_id:
+            return None, None
+        try:
+            asset = db.get(ContentAsset, UUID(str(raw_id).strip()))
+        except ValueError:
+            return None, _err(f"{which}_frame_asset_id {raw_id!r} is not an asset id.")
+        if asset is None or asset.project_id != project_id:
+            return None, _err(f"{which} frame asset {raw_id} not found for this project.")
+        mime = str(asset.mime_type or "image/png")
+        if not mime.startswith("image/"):
+            return None, _err(f"The {which} frame has to be an image; {raw_id} is {mime}.")
+        data = _load_asset_bytes(asset)
+        if not data:
+            return None, _err(f"The {which} frame couldn't be loaded — regenerate the image and try again.")
+        url = asset.url if str(asset.url).startswith("https://") else ""
+        return VideoFrame(data=data, mime_type=mime, url=url), None
+
+    async def generate_video(**args: Any) -> str:
+        try:
+            from service.generated_media import persist_generated_media
+            from service.images import asset_source_for
+            from service.videos import GenerateVideoRequest, VideoAPIError, fit_request, video_client_for
+
+            provider, key = session.video_provider, session.video_api_key
+            if provider is None or not key:
+                return _err(_NO_VIDEO_KEY)
+            first_id = args.get("first_frame_asset_id")
+            last_id = args.get("last_frame_asset_id")
+            if last_id and not first_id:
+                return _err("A last frame needs a first frame: pass first_frame_asset_id too, or drop the last frame.")
+
+            model = video_model_for(provider, args.get("model") or session.video_model or None)
+            try:
+                request = GenerateVideoRequest(
+                    prompt=str(args.get("prompt") or "").strip(),
+                    model=model,
+                    duration_seconds=int(args.get("duration_seconds") or 8),
+                    aspect_ratio=args.get("aspect_ratio") or VideoAspectRatio.PORTRAIT_9_16,
+                    resolution=args.get("resolution") or VideoResolution.P720,
+                    negative_prompt=args.get("negative_prompt") or None,
+                )
+            except ValidationError as exc:
+                return _err(f"The video request was invalid: {exc}")
+            request, notes = fit_request(request, has_last_frame=bool(last_id))
+
+            # A short session: check the post and read the frames, then let it
+            # go. The wait below runs to minutes and must not hold a connection.
+            with _open_db() as db:
+                _post, err = _require_post(db, project_id, session.post_id)
+                if err:
+                    return err
+                first_frame, err = _load_frame(db, first_id, "first")
+                if err:
+                    return err
+                last_frame, err = _load_frame(db, last_id, "last")
+                if err:
+                    return err
+                first_url = ""
+                if first_id:
+                    first_url = db.get(ContentAsset, UUID(str(first_id).strip())).url
+
+            try:
+                clip = await video_client_for(provider, key).generate_video(
+                    request, first_frame=first_frame, last_frame=last_frame,
+                )
+            except VideoAPIError as exc:
+                logger.warning("content: video generation failed: %s", exc)
+                return _err(_video_failure(exc, provider))
+
+            cost = clip.cost_usd if clip.cost_usd is not None else video_cost_usd(
+                request.model, request.resolution.value, request.duration_seconds,
+            )
+            params = {
+                "duration_seconds": request.duration_seconds,
+                "aspect_ratio": request.aspect_ratio.value,
+                "resolution": request.resolution.value,
+                "negative_prompt": request.negative_prompt,
+                "first_frame_asset_id": str(first_id or ""),
+                "last_frame_asset_id": str(last_id or ""),
+                "first_frame_url": first_url,
+                "cost_usd": cost,
+                "provider": provider.value,
+            }
+            async with _post_lock(str(session.post_id)):
+                with _open_db() as db2:
+                    asset = persist_generated_media(
+                        project_id, clip.data, clip.mime_type,
+                        db=db2, prompt=request.prompt, model=request.model.value, params=params,
+                        post_id=session.post_id, source=asset_source_for(provider),
+                    )
+                    row = db2.get(ContentPost, session.post_id)
+                    attached = row is not None and row.project_id == project_id
+                    if attached:
+                        # Making a clip makes this a video post: the viewport,
+                        # the review and publishing all key off post_type.
+                        row.video = cut_of(asset)
+                        row.post_type = VIDEO_POST_TYPE
+                        row.updated_at = datetime.now(timezone.utc)
+                        db2.add(row)
+                        db2.commit()
+                        db2.refresh(row)
+                        await emit({
+                            "event": ContentEvent.POST_DRAFT_UPDATED,
+                            "session_id": session.session_id,
+                            "post_id": str(row.id),
+                            "payload": _build_post_payload(row, db2),
+                        })
+
+            if cost is not None:
+                # Billed like a model call so the conversation's spend includes
+                # it; `media` scope counts toward the total and never moves the
+                # context gauge (see agents/core/lc._usage_scope).
+                await emit({
+                    "event": AgentEvent.TOKEN_USAGE,
+                    "model": request.model.value,
+                    "scope": "media",
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "total_tokens": 0,
+                    "context_window": 0,
+                    "cost_usd": cost,
+                })
+
+            logger.info(
+                "content: %s s clip on %s for post %s (%s)",
+                request.duration_seconds, request.model.value, session.post_id,
+                f"${cost:.2f}" if cost is not None else "unpriced",
+            )
+            return _ok_model(GenerateVideoResult(
+                asset_id=str(asset.id),
+                url=asset.url,
+                model=request.model.value,
+                duration_seconds=request.duration_seconds,
+                aspect_ratio=request.aspect_ratio.value,
+                resolution=request.resolution.value,
+                cost_usd=cost,
+                attached_to_post=str(session.post_id) if attached else None,
+                notes=notes,
+            ))
+        except Exception:
+            logger.exception("generate_video failed")
+            return _err("Video generation hit a snag — please try again.")
+
+    async def edit_image(**args: Any) -> str | list[dict]:
+        try:
+            from service.images import (
+                EditImageRequest,
+                ImageAPIError,
+                asset_source_for,
+                image_client_for,
+                persist_generated_image,
+            )
+
+            image_provider, image_key = session.image_provider, session.image_api_key
+            if image_provider is None or not image_key:
+                return _err(_NO_IMAGE_KEY.format(verb="editing"))
+
+            payload = {k: v for k, v in args.items() if v not in (None, "")}
+            payload.setdefault("number_of_images", min(int(payload.get("number_of_images", 1) or 1), 4))
+            payload["model"] = image_model_for(image_provider, payload.get("model"))
+            try:
+                request = EditImageRequest.model_validate(payload)
+            except ValidationError as exc:
+                return _err(f"The image edit request was invalid: {exc}")
+
+            with _open_db() as db:
+                base_asset = db.get(ContentAsset, request.input_asset_id)
+                if base_asset is None or base_asset.project_id != project_id:
+                    return _err(f"input_asset_id {request.input_asset_id} not found for this project.")
+                base_bytes = _load_asset_bytes(base_asset)
+                if not base_bytes:
+                    return _err("The image you're editing couldn't be loaded — try regenerating it.")
+
+                def _load(ref_id: UUID | None) -> bytes | None:
+                    if ref_id is None:
+                        return None
+                    a = db.get(ContentAsset, ref_id)
+                    if a is None or a.project_id != project_id:
+                        return None
+                    return _load_asset_bytes(a)
+
+                mask_bytes    = _load(request.mask_asset_id)
+                style_bytes   = _load(request.style_asset_id)
+                subject_bytes = _load(request.subject_asset_id)
+
+                client = image_client_for(image_provider, image_key)
+                try:
+                    images = await client.edit_image(
+                        request,
+                        base_bytes=base_bytes,
+                        mask_bytes=mask_bytes,
+                        style_bytes=style_bytes,
+                        subject_bytes=subject_bytes,
+                    )
+                except ImageAPIError as exc:
+                    logger.warning("content: image edit failed: %s", exc, exc_info=True)
+                    return _err("Image editing failed — please try again in a moment.")
+
+                assets = []
+                for img in images:
+                    asset = persist_generated_image(
+                        project_id, img,
+                        db=db,
+                        prompt=request.prompt,
+                        model=request.model.value,
+                        params={
+                            "edit_mode":         request.edit_mode.value if request.edit_mode else None,
+                            "input_asset_id":    str(request.input_asset_id),
+                            "mask_asset_id":     str(request.mask_asset_id)    if request.mask_asset_id    else None,
+                            "style_asset_id":    str(request.style_asset_id)   if request.style_asset_id   else None,
+                            "subject_asset_id":  str(request.subject_asset_id) if request.subject_asset_id else None,
+                            "seed":              request.seed,
+                            "negative_prompt":   request.negative_prompt,
+                        },
+                        post_id=session.post_id,
+                        source=asset_source_for(image_provider),
+                    )
+                    assets.append(asset)
+
+            image_blocks: list[dict] = []
+            for img in images:
+                b64, vmime = _downscale_for_vision(img.data, img.mime_type)
+                image_blocks.append(_image_block(b64, vmime))
+            return _image_result(image_blocks, EditImageResult(
+                asset_ids=[str(a.asset_id) for a in assets],
+                asset_urls=[a.url for a in assets],
+                model=request.model.value,
+            ))
+        except Exception:
+            logger.exception("edit_image failed")
+            return _err("Image editing hit a snag — please try again.")
+
+    # ----------------------- Publishing (service/publishers) -----------------------
+
+    def _channel_spec(db: Session, channel: str):
+        """The scheduler this project's ``channel`` goes through, or None."""
+        proj = db.get(Project, project_id)
+        return project_publishing(db, proj.id, proj.user_id).for_channel(channel) if proj else None
+
+    async def publish_post(
+        post_id: str,
+        social_account_ids: list[str] | None = None,
+        scheduled_at: str | None = None,
+        tiktok_draft: bool = False,
+        allow_uncomposed: bool = False,
+    ) -> str:
+        try:
+            if not post_id:
+                return _err("post_id is required.")
+            account_ids = [str(x) for x in (social_account_ids or []) if str(x).strip()]
+            due = parse_iso(scheduled_at) if scheduled_at else None
+            if scheduled_at and due is None:
+                return _err(
+                    f"scheduled_at {scheduled_at!r} isn't a time I can read. Send ISO 8601 with the "
+                    "user's UTC offset, e.g. 2026-10-02T09:00:00+02:00."
+                )
+
+            with _open_db() as db:
+                post, err = _require_post(db, project_id, UUID(str(post_id)))
+                if err:
+                    return err
+                proj = db.get(Project, project_id)
+                if proj is None:
+                    return _err("Project missing.")
+                publishing = project_publishing(db, proj.id, proj.user_id)
+                if not account_ids:
+                    # No list_social_accounts tool exists for the model to
+                    # find an id with, so naming none means the project's
+                    # own linked account for this platform.
+                    link, why_not = default_account(db, post)
+                    if link is None:
+                        return _err(why_not)
+                    account_ids = [link.external_account_id]
+                spec, why_not = chosen_publisher(db, project_id, account_ids, publishing)
+                if spec is None:
+                    return _err(why_not)
+                blockers = publish_blockers(post, spec)
+                if blockers:
+                    return _err(" ".join(blockers))
+
+                pick = pick_media(db, post, allow_uncomposed=allow_uncomposed)
+                if post.post_type == VIDEO_POST_TYPE and not pick.files:
+                    return _err(
+                        "This video post has no clip yet — make one with generate_video, "
+                        "then publish."
+                    )
+                if pick.missing:
+                    return _err(
+                        "These slides have no composed render, so their captions "
+                        f"wouldn't publish: {pick.missing}. Call render_slide on each, then "
+                        "publish again — or pass allow_uncomposed=true to publish "
+                        "single-image slides as raw photos (captions won't appear; "
+                        "collage / before-after still require a render)."
+                    )
+                # A text post goes out as words alone; a post with slides
+                # carries them.
+                if not pick.files and not is_text_only(post):
+                    return _err("No slide images to publish — render or generate images first.")
+
+                # The person says yes to every send, on a card that shows what
+                # goes out, where and when. The agent reads pages, search
+                # results and strangers' captions; a sentence in any of them
+                # could otherwise publish a post early. Asked after the checks
+                # (a post that cannot go out is never put to the person) and
+                # before any media is read: a resumed thread re-runs this body
+                # from the top, so everything above is a read.
+                if pause is None:
+                    return _ok({
+                        "status": "needs_approval",
+                        "post_id": str(post.id),
+                        "message": "Publishing needs the person's yes and nobody is here to give it. Leave the post as it is.",
+                    })
+                card = publish_card(post, spec, account_ids, due, tiktok_draft=bool(tiktok_draft), files=pick.files)
+                answer = await pause(AgentEvent.TOOL_APPROVAL_REQUIRED, card, timeout=APPROVAL_TIMEOUT)
+                if answer.get("approved") and answer.get("fingerprint") != card["fingerprint"]:
+                    # The yes was for the post as the card showed it. On a
+                    # resume this body re-reads the post, and anything that
+                    # moved since (or an app too old to send the print back)
+                    # goes to the person again rather than out unseen.
+                    return _err(
+                        "The post changed after the person saw the publish card, so nothing was "
+                        "sent. Call publish_post again so they approve this version."
+                    )
+                if not answer.get("approved"):
+                    return _ok({
+                        "status": "skipped",
+                        "post_id": str(post.id),
+                        "topic": post.topic,
+                        "message": (
+                            "The person did not approve publishing, so nothing was sent and the post is "
+                            "unchanged. Do not publish it again unless they ask."
+                        ),
+                    })
+                try:
+                    media = await load_media(pick.files)
+                except MediaUnreadable:
+                    return _err("Some media for this post couldn't be loaded — try regenerating the images.")
+
+                try:
+                    pub = publisher_for(proj.user_id, spec.id, db)
+                except VendorNotConnected as exc:
+                    return _err(str(exc))
+                try:
+                    async with pub:
+                        remote = await send_post(
+                            pub, post, media,
+                            targets=[Target(a) for a in account_ids],
+                            scheduled_at=due,
+                            tiktok_draft=bool(tiktok_draft),
+                        )
+                except PublisherError as exc:
+                    logger.warning("content: publish failed: %s", exc, exc_info=True)
+                    return _err(f"Couldn't publish that just now — {exc.message or 'please try again shortly'}.")
+
+                if why := publish_failure(remote, spec):
+                    return _err(why)
+                record_published(post, remote, due, spec)
+                db.add(post)
+                db.commit()
+                db.refresh(post)
+                logger.info(
+                    "content: published post %s via %s → id=%s status=%s",
+                    post.id, spec.id, remote.id, remote.status,
+                )
+                return _ok({
+                    "post_id":               str(post.id),
+                    "publisher":             spec.id,
+                    "publisher_post_id":     remote.id,
+                    "status":                post.status,
+                    "scheduled_at":          remote.scheduled_at.isoformat() if remote.scheduled_at else None,
+                    "social_account_ids":    account_ids,
+                    "media_count":           len(media),
+                    # Replies the scheduler does not publish: tell the user to
+                    # post them by hand (a thread's tail, a LinkedIn comment).
+                    "replies_to_post_by_hand": unpublished_replies(post, spec),
+                    "uncomposed_slides":     pick.uncomposed,   # published as raw photos (no caption)
+                })
+        except GraphBubbleUp:
+            # The approval card parks the thread by raising; that is the loop
+            # working, not a failed publish.
+            raise
+        except Exception as exc:
+            logger.exception("publish_post failed")
+            return _err(f"publish_post failed: {exc}")
+
+    async def mark_posted(post_id: str, url: str | None = None) -> str:
+        try:
+            post_id_raw = post_id
+            if not post_id_raw:
+                return _err("post_id is required.")
+            post_id = UUID(str(post_id_raw))
+            with _open_db() as db:
+                post, err = _require_post(db, project_id, post_id)
+                if err:
+                    return err
+                # The scheduler still holds a scheduled post and will publish
+                # it at its time whatever this row says; marking it posted by
+                # hand would leave it to go out a second time. The unschedule
+                # path is the one that takes it off the queue.
+                if is_queued_at_publisher(post):
+                    label = spec_for(post.publisher).label if spec_for(post.publisher) else "its scheduler"
+                    return _err(
+                        f"This post is queued at {label} and will go out at its scheduled time. "
+                        "Unschedule it first if it was posted by hand, or wait for it to post."
+                    )
+                post.status    = "posted"
+                post.posted_at = datetime.now(timezone.utc)
+                if url:
+                    post.published_url = str(url)
+                db.add(post)
+                db.commit()
+                db.refresh(post)
+                return _ok_model(MarkPostedResult(post_id=str(post.id), status=post.status))
+        except Exception as exc:
+            logger.exception("mark_posted failed")
+            return _err(f"mark_posted failed: {exc}")
+
+    async def log_metrics(post_id: str) -> str:
+        try:
+            post_id_raw = post_id
+            if not post_id_raw:
+                return _err("post_id is required.")
+            post_id = UUID(str(post_id_raw))
+
+            with _open_db() as db:
+                post, err = _require_post(db, project_id, post_id)
+                if err:
+                    return err
+                if not post.publisher_post_id:
+                    return _err("Post hasn't been published yet — run publish_post first.")
+                spec = spec_for(post.publisher)
+                if not metrics_sync(post, spec):
+                    return _err(no_sync_message(post, spec))
+                proj = db.get(Project, project_id)
+                if proj is None:
+                    return _err("Project missing.")
+                try:
+                    pub = publisher_for(proj.user_id, spec.id, db)
+                except VendorNotConnected as exc:
+                    return _err(str(exc))
+                try:
+                    async with pub:
+                        # The same pull the sync route makes: numbers the
+                        # person typed in stay theirs.
+                        got = await pull_metrics(pub, post)
+                except PublisherError as exc:
+                    logger.warning("content: metrics pull failed: %s", exc, exc_info=True)
+                    return _err(f"Couldn't pull metrics just now — {exc.message or 'please try again shortly'}.")
+                if got is None:
+                    return _err(not_synced_yet(post, spec))
+                db.add(post)
+                db.commit()
+                db.refresh(post)
+
+                return _ok_model(LogMetricsResult(
+                    post_id=str(post.id),
+                    view_count=int(metric_value(post.perf, "views") or 0),
+                    like_count=int(metric_value(post.perf, "likes") or 0),
+                    snapshots=len(got.daily),
+                ))
+        except Exception as exc:
+            logger.exception("log_metrics failed")
+            return _err(f"log_metrics failed: {exc}")
+
+    async def submit_assessment(markers: list, notes: str = "") -> str:
+        try:
+            scores = [m if isinstance(m, MarkerScore) else MarkerScore.model_validate(m) for m in markers or []]
+            # All six or nothing: a subset would still produce a 0-100 figure,
+            # and the owner could not tell it was judged on half the post.
+            missing = [m.value for m in ReviewMarker if m not in {s.id for s in scores}]
+            if missing:
+                return _err(f"Score every marker; missing: {', '.join(missing)}.")
+            if session.post_id is None:
+                return _err("No current post in this session to review.")
+            with _open_db() as db:
+                row, err = _require_post(db, project_id, session.post_id)
+                if err:
+                    return err
+                result = assess(
+                    row.slides or [], row.caption or "", row.hashtags or [], scores,
+                    replies=row.replies or [], channel=primary_channel(row.platforms),
+                    notes=(notes or "").strip(), scored_at=now_iso(),
+                )
+                # Only this column is written, so an image attach racing the
+                # review cannot be undone by it; no post lock needed.
+                row.last_assessment = result.model_dump(mode="json")
+                db.add(row)
+                db.commit()
+                db.refresh(row)
+                await emit({
+                    "event":      ContentEvent.POST_DRAFT_UPDATED,
+                    "session_id": session.session_id,
+                    "post_id":    str(row.id),
+                    "payload":    _build_post_payload(row, db),
+                })
+                weakest = sorted(result.markers, key=lambda m: m.score)[:2]
+                return _ok({
+                    "status":        "ok",
+                    "post_id":       str(row.id),
+                    "topic":         row.topic,
+                    "overall":       result.overall,
+                    "band":          result.band,
+                    "content_score": result.content_score,
+                    "failed_checks": [
+                        c.model_dump(mode="json", include={"id", "severity", "offenders"})
+                        for c in result.checks if not c.passed
+                    ],
+                    "weakest":       [m.model_dump(mode="json", include={"id", "score", "fix"}) for m in weakest],
+                })
+        except ValidationError as exc:
+            return _err(f"markers are invalid — fix and call again:\n{exc}")
+        except Exception as exc:
+            logger.exception("submit_assessment failed")
+            return _err(f"submit_assessment failed: {exc}")
+
+    async def render_slide(slide_id: str) -> str | list[dict]:
+        try:
+            slide_id = (slide_id or "").strip()
+            if not slide_id:
+                return _err("slide_id is required (e.g. 'slide-01').")
+            if session.post_id is None:
+                return _err("No current post in this session to render.")
+            with _open_db() as db:
+                row, err = _require_post(db, project_id, session.post_id)
+                if err:
+                    return err
+                _slide, _idx, err = _require_slide(row, slide_id)
+                if err:
+                    return err
+                post_id = row.id
+
+            render_id = str(uuid4())
+            loop = asyncio.get_event_loop()
+            fut: asyncio.Future = loop.create_future()
+            session.render_futures[render_id] = fut
+            await emit({
+                "event":      ContentEvent.SLIDE_RENDER_REQUESTED,
+                "session_id": session.session_id,
+                "post_id":    str(post_id),
+                "slide_id":   slide_id,
+                "render_id":  render_id,
+            })
+            try:
+                png_b64 = await asyncio.wait_for(asyncio.shield(fut), timeout=25.0)
+            except asyncio.TimeoutError:
+                return _err(
+                    "No browser rendered the slide in time (no connected session UI). "
+                    "Proceed using the raw photo + the structured slide data."
+                )
+            finally:
+                session.render_futures.pop(render_id, None)
+
+            if not png_b64 or not str(png_b64).strip():
+                return _err(
+                    "the browser couldn't rasterize the slide. Proceed on the raw "
+                    "photo + the structured slide data."
+                )
+            try:
+                png = base64.b64decode(png_b64)
+            except Exception:
+                return _err("the render returned invalid image data.")
+
+            asset_url = ""
+            try:
+                asset_url = _persist_slide_render(project_id, post_id, slide_id, png)
+            except Exception:
+                logger.exception("render_slide: persist failed (returning image anyway)")
+
+            # Persist full-res (for publishing); show the agent a lighter copy.
+            return _image_result(
+                [_image_block(_downscale_png_b64(png), "image/png")],
+                RenderSlideResult(
+                    slide_id=slide_id, asset_url=asset_url,
+                    note="preview downscaled; the full-res render is saved for publishing",
+                ),
+            )
+        except Exception as exc:
+            logger.exception("render_slide failed")
+            return _err(f"render_slide failed: {exc}")
+
+    async def fetch_post(post_dir_slug: str = "", post_id: str = "") -> str:
+        try:
+            slug = (post_dir_slug or "").strip()
+            pid = (post_id or "").strip()
+            with _open_db() as db:
+                row = None
+                if pid:
+                    try:
+                        row = db.get(ContentPost, UUID(pid))
+                    except ValueError:
+                        return _err(f"invalid post_id: {pid}")
+                elif slug:
+                    row = db.exec(
+                        select(ContentPost).where(
+                            ContentPost.project_id == project_id,
+                            ContentPost.post_dir_slug == slug,
+                        )
+                    ).first()
+                elif session.post_id is not None:
+                    row = db.get(ContentPost, session.post_id)
+                if row is None or row.project_id != project_id:
+                    return _err("post not found for this project (pass a valid post_dir_slug or post_id).")
+
+                slides_out = []
+                for s in row.slides or []:
+                    if not isinstance(s, dict):
+                        continue
+                    used = (s.get("image_prompt_used") or "").strip()
+                    cur = (s.get("image_prompt") or "").strip()
+                    slides_out.append({
+                        **s,
+                        "image_stale": bool(s.get("image_url")) and (cur != used),
+                    })
+                return _ok({
+                    "post_id":       str(row.id),
+                    "post_dir_slug": row.post_dir_slug,
+                    "pillar":        row.pillar,
+                    "topic":         row.topic,
+                    "layout":        row.layout,
+                    "status":        row.status,
+                    "slide_count":   row.slide_count,
+                    "hook_emotion":  row.hook_emotion,
+                    "emotional_arc": row.emotional_arc,
+                    "visual_brief":  row.visual_brief,
+                    "strategic_note": row.strategic_note,
+                    "caption":       row.caption,
+                    "hashtags":      row.hashtags,
+                    "slides":        slides_out,
+                    # The literal rendered markup, so you can see exactly how your
+                    # structured choices (classes/layout) compose. Author edits as
+                    # structured slides — the renderer rebuilds this on save.
+                    "slides_html":   row.slides_html,
+                })
+        except Exception as exc:
+            logger.exception("fetch_post failed")
+            return _err(f"fetch_post failed: {exc}")
+
+    async def fetch_slide_context(slide_id: str) -> str:
+        try:
+            slide_id = (slide_id or "").strip()
+            if not slide_id:
+                return _err("slide_id is required (e.g. 'slide-03').")
+            with _open_db() as db:
+                post, err = _require_post(db, project_id, session.post_id)
+                if err:
+                    return err
+                slide, idx, err = _require_slide(post, slide_id)
+                if err:
+                    return err
+
+                # Locked character = slide-1's generated image (the reference every
+                # later slide chains from). None until slide 1 is generated.
+                character_asset_id = None
+                for s in post.slides or []:
+                    if isinstance(s, dict) and str(s.get("slide_id")).strip().endswith("01"):
+                        character_asset_id = s.get("image_asset_id")
+                        break
+
+                camera_refs = _resolve_camera_refs(db, project_id, post.camera_ref_pool or "")
+                cam = camera_refs[0]["asset_id"] if camera_refs else None
+                is_slide_one = str(slide.get("slide_id")).strip().endswith("01")
+                char = str(character_asset_id) if character_asset_id else None
+                # Role-ordered ref chain: slide 1 = [cameraRef]; slides 2-5 =
+                # [character, cameraRef]. (Collage/before-after cells: pass only
+                # the cameraRef per cell — see the image discipline brief.)
+                suggested_refs = ([cam] if cam else []) if is_slide_one \
+                    else [x for x in (char, cam) if x]
+
+                cur = (slide.get("image_prompt") or "").strip()
+                used = (slide.get("image_prompt_used") or "").strip()
+                return _ok({
+                    "slide_id":            slide_id,
+                    "role":                slide.get("role", ""),
+                    "kind":                slide.get("kind", "photo"),
+                    "headline":            slide.get("headline", ""),
+                    "subtext":             slide.get("subtext", ""),
+                    "image_prompt":        slide.get("image_prompt", ""),
+                    "image_stale":         bool(slide.get("image_url")) and (cur != used),
+                    "visual_brief":        post.visual_brief,
+                    "emotional_arc_line":  _arc_line_for_slide(post.emotional_arc, slide_id, idx),
+                    "camera_ref_pool":     post.camera_ref_pool,
+                    "camera_ref_assets":   camera_refs,
+                    "character_asset_id":  char,
+                    "suggested_input_asset_ids": suggested_refs,
+                    "suggested_model":     "gemini-3-pro-image" if is_slide_one else None,
+                })
+        except Exception as exc:
+            logger.exception("fetch_slide_context failed")
+            return _err(f"fetch_slide_context failed: {exc}")
+
+    # Memory is cross-agent: the content agent remembers the same project the
+    # audit agent does, through the same tools in agents/core.
+    async def _on_memory(entry: dict) -> None:
+        await emit({"event": ContentEvent.MEMORY_WRITTEN, "memory": entry})
+
+    memory_tools = build_memory_tools_lc(
+        project_id,
+        user_id=getattr(session, "user_id", None),
+        conversation_id=getattr(session, "conversation_id", None),
+        agent_type="tiktok_studio",
+        on_memory=_on_memory,
+    ) if remember else []
+
+    def _bind(fn, name: ContentTool, description: str, args_schema=None) -> StructuredTool:
+        return StructuredTool.from_function(
+            coroutine=fn,
+            name=name.value,
+            description=description,
+            args_schema=args_schema,
+        )
+
+    return [
+        *memory_tools,
+        _bind(
+            submit_plan, ContentTool.SUBMIT_PLAN,
+            "Propose the content plan for the period this session manages. The argument "
+            "schema is the contract: an ordered list of days, one per date in the period, "
+            "each with a topic and a pillar, every platform among the brand's channels. "
+            "Nothing is saved by this call: the plan appears in the viewport with Accept, "
+            "Modify and Reject, and only the person's Accept writes it. On a period that "
+            "already has a plan, Accept keeps the days before today and the days with a "
+            "drafted post (the result lists them as kept_days) and replaces the rest. A "
+            "later call in the same session replaces the proposal. Call this AFTER emitting "
+            "<duct_artifact>{\"type\":\"plan\",...}</duct_artifact>, with the whole plan. To change "
+            "some days of a plan, call revise_plan_days instead.",
+            SubmitPlanArgs,
+        ),
+        _bind(
+            revise_plan_days, ContentTool.REVISE_PLAN_DAYS,
+            "Change some days of the plan: one day, a week, any days the person names. Send each "
+            "day's date and ONLY the fields that change; every other field and every other day stays "
+            "exactly as it is. No <duct_artifact> and no whole plan. It changes the proposal waiting "
+            "in the viewport if there is one, otherwise the saved plan, and like submit_plan it only "
+            "proposes: the person sees those days before and after, and Accept writes them alone. A "
+            "day with a drafted post or a day in the past cannot change and is refused by name.",
+            RevisePlanDaysArgs,
+        ),
+        _bind(
+            submit_post_draft, ContentTool.SUBMIT_POST_DRAFT,
+            "Persist a single post draft. The argument schema is the contract; the tool "
+            "upserts a content_posts row keyed by (project_id, post_dir_slug), "
+            "and emits POST_DRAFT_UPDATED. Call AFTER emitting "
+            "<duct_artifact>{\"type\":\"post\",...}</duct_artifact>.",
+            SubmitPostDraftArgs,
+        ),
+        _bind(
+            edit_slide, ContentTool.EDIT_SLIDE,
+            "Surgically edit ONE slide of the current post WITHOUT re-sending the "
+            "whole post. Pass slide_id + a `patch` of only the fields that change "
+            "— e.g. {\"caption_style\":\"cap-raw\"}, {\"headline\":\"...\"}, "
+            "{\"kind\":\"text\"}, {\"image_prompt\":\"...\"}, or {\"items\":[...]}. "
+            "The slide is merged + revalidated, the HTML re-rendered, and "
+            "POST_DRAFT_UPDATED emitted. Changing image_prompt marks that image "
+            "stale (regenerate to match). Use submit_post_draft for whole-post or "
+            "multi-slide changes, or to add / remove / reorder slides.",
+            EditSlideArgs,
+        ),
+        _bind(
+            fetch_brand_context, ContentTool.FETCH_BRAND_CONTEXT,
+            "Return the current brand context for this project: identity "
+            "(name/slug/tagline/url), audience, content_brand JSONB, pillars, "
+            "visual assets, and active_channels (where the brand already posts, "
+            "as platform values). No arguments. Call this FIRST in a new session.",
+        ),
+        _bind(
+            fetch_topic_bank, ContentTool.FETCH_TOPIC_BANK,
+            "Return per-pillar topic usage by scanning content_posts. "
+            "Each entry: pillar -> { topics_used: [...], last_used_at: ISO|None }. "
+            "Use this to decide whether to dispatch research_pillar sub-agents.",
+        ),
+        _bind(
+            fetch_format_library, ContentTool.FETCH_FORMAT_LIBRARY,
+            "Return the format library: the built-in recipes plus this project's own, "
+            "each with slug, name, description (what it is for and when to use it), "
+            "the media kinds and channels it applies to, and spec_markdown, the full "
+            "recipe to follow. Filter with media (video|slideshow|image|text|article) "
+            "and channel so you read only what fits the post; an empty filter returns "
+            "all. Put the chosen slug in the day's / post's format_slug. Never write "
+            "caption, hook or layout CSS: the renderer inlines the shared style "
+            "registry and the spec names its classes.",
+            FormatArgs,
+        ),
+        _bind(
+            fetch_avatar_library, ContentTool.FETCH_AVATAR_LIBRARY,
+            "Return the list of per-project avatars (name + full JSONB data including ref images).",
+        ),
+        _bind(
+            fetch_content_history, ContentTool.FETCH_CONTENT_HISTORY,
+            "Return recent posts (default last 30) for de-duplication and "
+            "to inform hook variation. Fields: post_dir_slug, pillar, topic, "
+            "hook_type, status, posted_at, perf.",
+            HistoryArgs,
+        ),
+        _bind(
+            fetch_content_analytics, ContentTool.FETCH_CONTENT_ANALYTICS,
+            "The project's published posts' numbers over a window (default 30 days), "
+            "split by platform and by post type, with the best and weakest posts named "
+            "by topic, hook and type. Read it for a review of what worked; "
+            "fetch_content_history is the raw list.",
+            AnalyticsArgs,
+        ),
+        _bind(
+            fetch_content_assets, ContentTool.FETCH_CONTENT_ASSETS,
+            "Return content assets (generated images, uploads, references) "
+            "for this project. Filter by asset_type if provided "
+            "(e.g. 'generated', 'logo', 'background', 'reference', 'upload'). "
+            "References include the repo-bundled GLOBAL library (camera / "
+            "layouts / captions) served from /static/references — narrow it "
+            "with the optional axis + subtype filters. A global reference's "
+            "`id` is its /static/references/... URL; pass that id straight "
+            "into generate_image's input_asset_ids.",
+            ContentAssetsArgs,
+        ),
+        _bind(
+            fetch_discovered_references, ContentTool.FETCH_DISCOVERED_REFERENCES,
+            "Return TikTok posts the user (or a previous discovery run) saved as "
+            "high-performing references. Use this to ground topic / hook / format "
+            "decisions in real-world signal — what's actually working in the "
+            "target audience's niche right now. Each row carries the post's "
+            "engagement counts (play, digg, share, comment, collect), hashtags, "
+            "music, author, and the TikTok URL. Filter by min_play_count to "
+            "skip the long tail (default 10000).",
+            DiscoveredReferencesArgs,
+        ),
+        _bind(
+            fetch_post, ContentTool.FETCH_POST,
+            "Return the current persisted state of ONE post — structured slides "
+            "(copy + image prompts + any generated image_url), layout, and "
+            "metadata. Use this to ground an edit on the live post before "
+            "changing a caption/prompt or generating images, especially when "
+            "resuming an earlier draft. Pass post_dir_slug or post_id; with "
+            "neither, returns this session's current post. Each slide includes "
+            "`image_stale` (true = the prompt changed after the image was made, "
+            "so the image should be regenerated).",
+            FetchPostArgs,
+        ),
+        _bind(
+            fetch_slide_context, ContentTool.FETCH_SLIDE_CONTEXT,
+            "Pre-assembled context for generating ONE slide's image — call this "
+            "right before generate_image for each slide so you never work from "
+            "memory. Returns the slide's current image_prompt, the post's "
+            "visual_brief, THIS slide's emotional_arc line, the camera_ref_pool + "
+            "resolved cameraRef candidates, the locked character asset (slide 1's "
+            "image, for the slides 2-5 reference chain), and the role-ordered "
+            "suggested input_asset_ids + suggested model for this slide. Use these "
+            "so realism, character, and framing stay consistent across the set.",
+            SlideIdArgs,
+        ),
+        _bind(
+            render_slide, ContentTool.RENDER_SLIDE,
+            "Rasterize ONE slide to a 1080×1920 (9:16) PNG and SEE it — the "
+            "COMPOSED slide as it will actually look (caption overlay, gradient, "
+            "layout, safe zones), not just the raw photo. Returns the image inline "
+            "so you can critique composition, caption legibility, text/face "
+            "overlap, and safe-zone fit, then fix the structured slide. These "
+            "composed renders are also what publish_post uploads. Needs a "
+            "connected session UI; if none responds it times out — then proceed "
+            "on the raw photo + structured data.",
+            SlideIdArgs,
+        ),
+        _bind(
+            generate_image, ContentTool.GENERATE_IMAGE,
+            "Generate one or more images from a text prompt. "
+            "Returns inline image data (so you can see the result) PLUS a stable "
+            "asset_url. Defaults: 9:16 portrait, 1 image. Generated images are "
+            "saved to the project's media library.",
+            GenerateImageInput,
+        ),
+        _bind(
+            generate_video, ContentTool.GENERATE_VIDEO,
+            "Make a video clip for the current post and make it the post's clip. From the prompt "
+            "alone, or animated from a first frame (an image asset), optionally ending on a last "
+            "frame. Waits until the clip is ready — ten seconds to several minutes — then saves "
+            "the mp4 as the post's cut (earlier clips stay as takes the user can switch back to) "
+            "and returns its URL, its cost, and any change made to fit the model (length, ratio, "
+            "resolution). Every second of video costs money: make one clip at a time.",
+            GenerateVideoInput,
+        ),
+        _bind(
+            edit_image, ContentTool.EDIT_IMAGE,
+            "Edit an existing content asset (inpaint, outpaint, bgswap, style transfer, "
+            "or free-form Gemini edit). Returns the edited image inline + a stable "
+            "asset_url. The original asset is preserved — every edit creates a new "
+            "content_assets row.",
+            EditImageInput,
+        ),
+        _bind(
+            submit_assessment, ContentTool.SUBMIT_ASSESSMENT,
+            "Save the pre-publish review of the current post and show it to the user. "
+            "Pass the six marker scores the review_post sub-agent returned (all six). "
+            "The server adds the completeness checks, weighs the markers and computes "
+            "the overall; the result names the failed checks and the weakest markers "
+            "for you to relay. Advice only — it never blocks publishing.",
+            SubmitAssessmentArgs,
+        ),
+        _bind(
+            publish_post, ContentTool.PUBLISH_POST,
+            "Publish a saved post through the project's scheduler (the connector "
+            "the user linked the account at), now or at scheduled_at, and "
+            "record the result on the post. It posts from the account the "
+            "project linked for the post's platform unless social_account_ids "
+            "names others; when that is ambiguous the error lists the linked "
+            "accounts to ask the user about. A slideshow "
+            "uploads each slide's COMPOSED render (call render_slide first; by "
+            "default slides with no render are refused, since their captions "
+            "wouldn't appear). A text post goes out as words alone, with as many "
+            "of its replies as the scheduler publishes on that channel (a "
+            "thread, a first comment), and the result counts the replies left "
+            "for the user to post by "
+            "hand. A post the platform would refuse (over its limit, words "
+            "alone where it needs media) is refused here with the reason. Every "
+            "send waits for the person's yes on a card showing what goes out, "
+            "where and when; call it only when they asked to publish, and a "
+            "'skipped' answer means leave the post as it is.",
+            PublishPostArgs,
+        ),
+        _bind(
+            mark_posted, ContentTool.MARK_POSTED,
+            "Mark a post as posted (manual flag — use when the user posted "
+            "outside of Duct, e.g. a thread they pasted by hand). Sets "
+            "status='posted' and posted_at=now, and stores the live post's link "
+            "when given.",
+            MarkPostedArgs,
+        ),
+        _bind(
+            log_metrics, ContentTool.LOG_METRICS,
+            "Refresh performance metrics for a post from the scheduler that "
+            "published it: lifetime + daily numbers, merged into post.perf / "
+            "post.daily_perf. Requires publish_post to have run first. Where the "
+            "scheduler doesn't report the post's channel it says so, and the "
+            "numbers are typed in by hand.",
+            PostIdArgs,
+        ),
+    ]

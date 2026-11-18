@@ -1,0 +1,115 @@
+"use client";
+
+import { createContext, useContext, useEffect, useState, useCallback } from "react";
+import { useRouter } from "next/navigation";
+import {
+  SESSION_EXPIRED_EVENT,
+  authToken,
+  clearAuthToken,
+  decodeJwtPayload,
+  isTokenValid,
+} from "./authFetch";
+import { analytics } from "./analytics";
+
+const AuthContext = createContext(null);
+
+export function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [token, setToken] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const router = useRouter();
+
+  useEffect(() => {
+    const stored = authToken();
+    if (isTokenValid(stored)) {
+      const payload = decodeJwtPayload(stored);
+      setToken(stored);
+      setUser({
+        email: payload.sub,
+        name: payload.name,
+        // Absent on a token minted before the claim existed; firstName() in
+        // lib/userProfile.js falls back to the first word of `name`.
+        givenName: payload.given_name || "",
+        picture: payload.picture,
+        // A guest holds a real token for a real row (lib/guest.js); this is
+        // what lets the shell say "save your work" instead of an email
+        // nobody chose.
+        guest: payload.guest === true,
+      });
+      // The account UUID, not `sub` — that is the email, and it must not reach
+      // an analytics provider. Safe before consent resolves: until someone says
+      // yes the provider sends crash reports and nothing else, and if the
+      // answer is no that never changes.
+      analytics.identify(payload.uid);
+    }
+    setLoading(false);
+  }, []);
+
+  const signOut = useCallback(() => {
+    // Before the state clears: whoever signs in next on this machine should not
+    // inherit the last person's id.
+    analytics.reset();
+    clearAuthToken();
+    setUser(null);
+    setToken(null);
+    router.replace("/");
+  }, [router]);
+
+  // A token can pass `isTokenValid` and still be refused by the backend — it is
+  // never verified here, only read. authFetch retires such a session and fires
+  // this; without listening, the app keeps rendering as though signed in.
+  useEffect(() => {
+    window.addEventListener(SESSION_EXPIRED_EVENT, signOut);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, signOut);
+  }, [signOut]);
+
+  return (
+    <AuthContext.Provider value={{ user, token, loading, signOut }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be used within AuthProvider");
+  return ctx;
+}
+
+/** The signed-in user or null, for a component that also renders outside the
+ *  shell (a /preview scene) and only wants the name when there is one. */
+export function useAuthUser() {
+  return useContext(AuthContext)?.user || null;
+}
+
+function AuthLoadingMessage({ message }) {
+  return (
+    <div
+      className="flex min-h-dvh items-center justify-center bg-background px-4"
+      role="status"
+      aria-live="polite"
+      aria-busy="true"
+    >
+      <p className="text-sm text-muted-foreground">{message}</p>
+    </div>
+  );
+}
+
+export function AuthGuard({ children }) {
+  const { user, loading } = useAuth();
+  const router = useRouter();
+
+  useEffect(() => {
+    if (!loading && !user) {
+      router.replace("/");
+    }
+  }, [loading, user, router]);
+
+  if (loading) {
+    return <AuthLoadingMessage message="Loading…" />;
+  }
+  if (!user) {
+    return <AuthLoadingMessage message="Redirecting to sign in…" />;
+  }
+  return <>{children}</>;
+}

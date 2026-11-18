@@ -1,0 +1,1036 @@
+"""Provider, model, and SDK tool enums with helper functions.
+
+Follows the nomadtools agents/models.py pattern for provider-agnostic
+model initialization via LangChain's init_chat_model().
+"""
+
+from __future__ import annotations
+
+from enum import Enum, StrEnum
+from typing import Any, NamedTuple
+
+
+class Provider(str, Enum):
+    OPENAI = "openai"
+    GOOGLE_GENAI = "google_genai"
+    ANTHROPIC = "anthropic"
+    # OpenRouter runs on its own first-party integration (``langchain-openrouter``
+    # → ``ChatOpenRouter``), not on ChatOpenAI-with-a-base-URL. It was the latter
+    # until the native package existed, and the swap buys the things the plain
+    # chat-completions shape has nowhere to put: per-provider routing preferences
+    # (``openrouter_provider``), OpenRouter's unified ``reasoning`` parameter,
+    # data-collection controls, and app-attribution headers.
+    #
+    # The compatible shape is still the port (see agents/core/ports) and still
+    # the way any *other* gateway would arrive — Ollama, vLLM, llama.cpp, a
+    # self-hosted LiteLLM. OpenRouter simply stopped being the thing standing in
+    # for it. ``GATEWAY_BASE_URL`` / ``NATIVE_GATEWAY_PROVIDERS`` below is where
+    # that split is written down.
+    OPENROUTER = "openrouter"
+    # xAI is a first-party vendor, not a gateway: LangChain resolves "xai" to
+    # ``langchain-xai`` → ``ChatXAI``, so it needs no base-URL entry and takes
+    # the native branch in ``langchain_provider``. Reachable as the OpenAI
+    # shape at api.x.ai too, but the native package carries reasoning_effort
+    # and xAI's server-side search as real fields rather than passthrough.
+    XAI = "xai"
+    # Open models on an Ollama server the instance points at (OLLAMA_BASE_URL),
+    # through ``langchain-ollama`` → ``ChatOllama``: Ollama's own API rather
+    # than its OpenAI-compatible one, which would drop the reasoning text.
+    # No key — the server is the credential — and no catalogue: a model id is
+    # whatever tag the server holds, written ``ollama:<tag>`` (see
+    # ``OLLAMA_MODEL_PREFIX``).
+    OLLAMA = "ollama"
+    # Any server that speaks OpenAI's chat-completions API, at an address the
+    # user brings: vLLM, llama.cpp, LM Studio, SGLang, or a host of open-weight
+    # models (Together, Fireworks, Groq, DeepInfra). ChatOpenAI at that base
+    # URL. The credential is the address, an optional key and the models the
+    # user chose, packed into one string (``service/compatible.py``) so it
+    # travels and is stored exactly like a key. Model ids are
+    # ``compat:<the server's id>`` (``COMPATIBLE_MODEL_PREFIX``).
+    OPENAI_COMPATIBLE = "openai_compatible"
+
+
+class ModelName(str, Enum):
+    
+    # OpenAI. GPT-6 replaced 5.6 in this catalogue on 2026-09-29, and the
+    # names moved down a rung with it: 5.6 was sol/terra/luna with sol the flagship, 6 is
+    # astra/sol/luna with astra the flagship and sol the cost-efficient high
+    # end. So Sol is 5.6 Terra's job at 5.6 Terra's input price, not 5.6
+    # Sol's. 5.6 Terra has no successor of its own; RETIRED_MODELS sends it,
+    # and a saved 5.6 Sol, to Sol. GPT_5_MINI is the one older id kept (it
+    # is the engine default and the ChatGPT-plan floor).
+    #
+    # Sol is 6.1 Sol (2026-09-29), not 6 Sol: same $2/$10, half the cached
+    # input price, and OpenAI puts it near Astra on agentic work. 6 Sol never
+    # shipped in a Duct release, so it leaves no RETIRED_MODELS row. 6.1 Sol
+    # also has no `none` reasoning rung, which 6 Sol had.
+    #
+    # Two request-shape facts ride with the family, both handled below the
+    # catalogue: tool calling needs the Responses API once reasoning is on
+    # (langchain-openai switches to it for any gpt-6 request carrying tools),
+    # and a temperature is rejected unless reasoning is off
+    # (``takes_temperature``).
+    GPT_6_ASTRA   = "gpt-6-astra"      # flagship — offered, not a tier default
+    GPT_6_1_SOL   = "gpt-6.1-sol"      # near-Astra on agentic work at a fifth of its price
+    GPT_6_LUNA    = "gpt-6-luna"       # efficient, repeatable work at scale
+    GPT_5_MINI    = "gpt-5-mini"
+    # Kept on purpose, not by omission — do not curate these away. They are
+    # generations behind and the catalog lists the GPT-4 line as deprecated,
+    # but both are still served with no announced shutdown.
+    GPT_4O        = "gpt-4o"
+    GPT_4O_MINI   = "gpt-4o-mini"
+    
+    # Google. Verified against the live ListModels response, not just the docs
+    # — the published shutdown dates are "earliest possible" and drift both
+    # ways (gemini-3.1-flash-lite-preview is still served past its date, while
+    # gemini-3.1-flash-preview is already gone and was dropped from here).
+    # The only current-generation Pro, and the Heavy rung of the shipped
+    # default triple. Still a `-preview` id because Google has published no
+    # stable 3.x Pro; verified against the live ListModels response and a real
+    # generateContent call rather than taken from the docs.
+    GEMINI_3_1_PRO_PREVIEW = "gemini-3.1-pro-preview"
+    GEMINI_3_8_FLASH = "gemini-3.8-flash"
+    GEMINI_3_5_FLASH_LITE = "gemini-3.5-flash-lite"
+    GEMINI_2_5_FLASH = "gemini-2.5-flash"
+    
+    # Anthropic. Fable 5.1 is the most capable widely released model, above the
+    # Opus tier and priced accordingly ($10/$50 against Opus 5.5's $4/$20) —
+    # offered, not defaulted to. Opus 5.5 (2026-09-22) and Sonnet 5.5
+    # (2026-09-28) replaced Opus 5 and Sonnet 5 on 2026-09-29, and Haiku 5.5
+    # replaced Haiku 4.5 on 2026-10-26: a tenth of the price, a 1M window, and
+    # the first Haiku with an effort dial. Fable 5.1 and the three 5.5s share a
+    # request contract the older models do not, except that Haiku 5.5 alone
+    # still takes a forced tool call — see ``CLAUDE_BOUND_THINKING`` and
+    # ``CLAUDE_NO_FORCED_TOOL_CHOICE`` below.
+    CLAUDE_FABLE = "claude-fable-5-1"
+    CLAUDE_OPUS = "claude-opus-5-5"
+    CLAUDE_SONNET = "claude-sonnet-5-5"
+    CLAUDE_HAIKU = "claude-haiku-5-5"
+    # xAI. Verified against docs.x.ai: 500k context, $2/$6, and
+    # `reasoning_effort` low/medium/high/xhigh with high the default —
+    # "Reasoning cannot be disabled", so there is no off rung to offer. No
+    # fallback pair below: it is the only Grok in the catalogue, and
+    # MODEL_FALLBACK never guesses a target it was not given.
+    GROK_4_7 = "grok-4.7"
+
+    # OpenRouter — vendor/slug form. A *curated default list*, not a whitelist:
+    # OpenRouter fronts 400+ models, so resolve_engine_model passes an unknown
+    # slug through verbatim rather than silently substituting a default. These
+    # are the open-weight / long-tail models worth naming.
+    #
+    # Refreshed 2026-09-29 against the live /api/v1/models catalogue *and each
+    # vendor's own changelog*, because an OpenRouter slug names a build and
+    # goes stale without looking stale. deepseek/deepseek-v4-flash is pinned
+    # to the April preview: third parties still host its weights, so it
+    # serves, but DeepSeek retired it on 2026-09-10 and its own API has
+    # answered to that name with V4.1 Flash since. deepseek-v4-pro was the
+    # preview too; DeepSeek's API has served the 0813 GA build under it since
+    # 2026-08-13. Qwen3.8 Flash, Kimi K3 and GLM-5.3 Flash are each their
+    # vendor's current release.
+    #
+    #   deepseek-chat      $0.26/$1.03  164k  →  v4.1-flash  $0.15/$0.60  1.0M
+    #   qwen3-235b-a22b    $0.45/$1.82  131k  →  qwen3.8-flash $0.15/$0.47 1.0M
+    #   glm-4.6            $0.43/$1.75  205k  →  glm-5.3-flash $0.15/$0.50 1.3M
+    #   kimi-k2            $0.57/$2.30  131k  →  kimi-k3     $3.00/$15.00 1.0M
+    #
+    # V4.1 Flash costs more per uncached token than the retired preview's
+    # cheapest hosts ($0.08/$0.15) and a fifth as much per cached one, which
+    # is most of what an agent loop sends. It is the only Flash DeepSeek
+    # still serves, so the Light rung takes it; a saved pick of the preview
+    # keeps running as picked (see RETIRED_MODELS).
+    #
+    # kimi-k3 is the exception to the "cheaper and longer" pattern above: it is
+    # ~6x the price of the k2.5 it replaces, bought with 4x the context. It is
+    # here as the capable end of the open-weight list, not as a volume model.
+    #
+    # V4 Pro sits beside V4.1 Flash rather than replacing it — same vendor,
+    # same 1.0M context, ~4x the price for the reasoning tier.
+    #
+    # GPT-6 Luna replaced gpt-5-mini as OpenAI's entry here: the same small
+    # rung at 40% of its input and 25% of its output price.
+    #
+    # All carry `tools` in supported_parameters; a slug that cannot tool-call
+    # has no business here, since every Duct agent is a tool-calling agent.
+    OR_DEEPSEEK_V4_1_FLASH = "deepseek/deepseek-v4.1-flash"
+    OR_DEEPSEEK_V4_PRO = "deepseek/deepseek-v4-pro-0813"
+    OR_QWEN3_8_FLASH = "qwen/qwen3.8-flash"
+    OR_KIMI_K3 = "moonshotai/kimi-k3"
+    OR_GLM_5_3_FLASH = "z-ai/glm-5.3-flash"
+    # OpenRouter spells Anthropic's versions with a dot where the Messages API
+    # uses a dash: this is claude-opus-5-5, not a different model.
+    OR_CLAUDE_OPUS = "anthropic/claude-opus-5.5"
+    OR_CLAUDE_SONNET = "anthropic/claude-sonnet-5.5"
+    OR_GPT_6_LUNA = "openai/gpt-6-luna"
+
+
+class AgentEffort(StrEnum):
+    """How hard the model works before responding — still the API's request field.
+
+    Named after the Claude CLI's ``--effort`` flag, where the spelling started,
+    and kept when that engine went: ``agents/thinking.py`` is the portable layer
+    that maps these rungs onto every provider's own dial, and it happens to
+    share Anthropic's spelling because it *is* Anthropic's spelling.
+
+    LOW    — fastest, cheapest; good for simple lookups
+    MEDIUM — balanced default
+    HIGH   — deeper reasoning; recommended for complex analysis (e.g. SEO audit)
+    XHIGH  — between HIGH and MAX; the sweet spot for coding/agentic work on
+             Opus 5.5, Sonnet 5.5, Fable 5.1 and Opus 4.7 onward. Falls back to
+             HIGH on models that predate it (Opus 4.6, Sonnet 4.6 and earlier).
+    MAX    — maximum effort; most expensive
+    """
+
+    LOW   = "low"
+    MEDIUM = "medium"
+    HIGH  = "high"
+    XHIGH = "xhigh"
+    MAX   = "max"
+
+
+class ImageModel(str, Enum):
+    """Image generation model IDs, across the three providers that have one.
+
+    ``provider_of`` places each by prefix, the same way it does chat models,
+    and ``service/images/client.py`` turns the provider into a backend.
+
+    Google. Imagen is gone: imagen-4.0-{generate,ultra-generate,fast-generate}-001
+    were retired on 2026-08-17 and Google's own replacement is
+    gemini-3.1-flash-image — already the default below, so nothing here lost a
+    capability. gemini-2.5-flash-image is dropped for the same reason ahead of
+    its 2026-10-02 shutdown. Historical ContentAsset rows still carry these
+    strings; that is fine, ImageAsset.model is a plain str and is never
+    re-validated.
+
+    OpenAI. Three rungs of one family, and the older one is kept on purpose.
+    The 2.5 pair split on *what the call is for* rather than on size: Flare is
+    "fast, high-quality everyday generation" (OpenAI publishes ~half
+    gpt-image-2's latency at higher quality), Sunburst is the editing-precision
+    rung — slower, same token price, better at changing one thing and leaving
+    the rest alone. Flare is the default because a slide run is a batch of
+    everyday generations, and a run that wants Sunburst can name it.
+
+    gpt-image-2 stays listed because both 2.5 models cost twice its token rate
+    and it is still served with no announced shutdown — it is the cheap rung,
+    not a deadline. gpt-image-1.5, gpt-image-1-mini and chatgpt-image-latest
+    are the deadline: they shut down on 2026-12-01 (announced 2026-06-02), so
+    listing them would be listing a date. Needs API Organization Verification
+    on some accounts, and Tier 1 is capped at 5 images/minute.
+
+    xAI. grok-imagine-image-2.0 is the id the generation and edit endpoints
+    document; the plain ``grok-imagine-image`` alias is the older standard tier.
+
+    OpenRouter. A *deliberately short* list against a catalogue of 52, and the
+    shortness is the design. Three of these four reach vendors no first-party
+    key here can — Seedream, Flux, Recraft — and Recraft emits SVG, which is a
+    capability nothing else in this enum has rather than another raster model.
+    The fourth is the Gemini workhorse, listed because a run needs a cheap
+    default and the gateway bills it at Google's own rate.
+
+    Unlike the OpenRouter *chat* slugs, an unrecognised image slug is **not**
+    passed through: ``ImageModel`` is a Pydantic enum in the content agent's
+    tool schema, so opening it to free-form strings would let a run name a
+    model that does not exist and fail on a slide. Adding one is one line and
+    a ``_CAPS`` row in service/openrouter/images.py — cheap, on purpose, and
+    the right moment for it is when somebody asks for that model by name.
+    """
+
+    GEMINI_3_1_FLASH_IMAGE      = "gemini-3.1-flash-image"
+    GEMINI_3_1_FLASH_LITE_IMAGE = "gemini-3.1-flash-lite-image"
+    GEMINI_3_PRO_IMAGE          = "gemini-3-pro-image"
+    GPT_IMAGE_2_5_FLARE         = "gpt-image-2.5-flare"
+    GPT_IMAGE_2_5_SUNBURST      = "gpt-image-2.5-sunburst"
+    GPT_IMAGE_2                 = "gpt-image-2"
+    GROK_IMAGINE_IMAGE_2        = "grok-imagine-image-2.0"
+    OR_GEMINI_3_1_FLASH_IMAGE   = "google/gemini-3.1-flash-image"
+    OR_SEEDREAM_5_PRO           = "bytedance-seed/seedream-5-0-pro"
+    OR_FLUX_2_PRO               = "black-forest-labs/flux.2-pro"
+    OR_RECRAFT_V4_VECTOR        = "recraft/recraft-v4-styles-vector"
+
+
+# gemini-3.1-flash-image: the high-efficiency, high-volume flash image model
+# (per the Gemini image-generation docs) — the right default for slide gen,
+# and what the tool schema advertises before a run has resolved a provider.
+DEFAULT_IMAGE_MODEL = ImageModel.GEMINI_3_1_FLASH_IMAGE
+
+# The model a run uses on each image-capable provider when the agent did not
+# name one, or named one the resolved provider cannot serve.
+DEFAULT_IMAGE_MODELS: dict[Provider, ImageModel] = {
+    Provider.GOOGLE_GENAI: ImageModel.GEMINI_3_1_FLASH_IMAGE,
+    Provider.OPENAI:       ImageModel.GPT_IMAGE_2_5_FLARE,
+    Provider.XAI:          ImageModel.GROK_IMAGINE_IMAGE_2,
+    Provider.OPENROUTER:   ImageModel.OR_GEMINI_3_1_FLASH_IMAGE,
+}
+
+# Which key a run spends on images, when the user brought more than one.
+# Gemini leads because it is the cheapest per slide and the only backend that
+# takes several references in one call — the pattern the slide prompts are
+# written for. The order is a preference, not a capability ranking: any of
+# the three serves a run on its own.
+IMAGE_PROVIDER_ORDER: tuple[Provider, ...] = (
+    Provider.GOOGLE_GENAI,
+    Provider.OPENAI,
+    Provider.XAI,
+    # Last, and last on purpose: a gateway is a hop, so a first-party key for
+    # the same model is the more direct route whenever the user brought one.
+    # Its place in this tuple is what it is here for — a run whose only key is
+    # an OpenRouter one used to resolve to None and decline every picture.
+    Provider.OPENROUTER,
+)
+
+
+def image_model_for(provider: Provider, requested: "ImageModel | str | None" = None) -> ImageModel:
+    """The image model a run on ``provider`` should use.
+
+    The agent's tool schema defaults to the Gemini model, so on any other
+    backend the request arrives naming a model the key cannot reach. That is
+    corrected here rather than refused: the agent chose "an image", not "a
+    Google image".
+    """
+    if requested is not None:
+        name = str(getattr(requested, "value", requested) or "").strip()
+        if name and provider_of(name) is provider:
+            return ImageModel(name)
+    return DEFAULT_IMAGE_MODELS[provider]
+
+
+class VideoModel(str, Enum):
+    """Video generation model IDs: Veo on a Gemini key, Seedance on OpenRouter.
+
+    A modality like images, not a connector: both are reachable with keys users
+    already bring, which reversed the 2026-09-01 routing design's "video is a
+    Higgsfield connection" (issue #284). ``provider_of`` places each by shape,
+    ``service/videos/client.py`` turns the provider into a backend, and
+    ``service/videos/caps.py`` holds what each one serves, which is the table
+    to update with a new row.
+
+    Google. All three are still ``-preview`` ids on the Gemini API (Vertex has
+    ``-001``). Lite is the default: $0.05/s at 720p against Veo 3.1's $0.40,
+    and a TikTok clip is a draft far more often than a final cut.
+
+    OpenRouter. Seedance, which no first-party key here reaches. 2.0 Mini is
+    newer and cheaper than 2.0 Fast with the same resolutions, lengths and
+    frame control, so Fast is not listed; 2.5 is the long-clip premium rung
+    (to 30 s). The same Pydantic-enum argument as ``ImageModel`` keeps this a
+    short list rather than a passthrough: the tool schema names these, and a
+    free-form slug would let a run invent one.
+    """
+    VEO_3_1              = "veo-3.1-generate-preview"
+    VEO_3_1_FAST         = "veo-3.1-fast-generate-preview"
+    VEO_3_1_LITE         = "veo-3.1-lite-generate-preview"
+    OR_SEEDANCE_2_5      = "bytedance/seedance-2.5"
+    OR_SEEDANCE_2_0_MINI = "bytedance/seedance-2.0-mini"
+
+
+# The model a run uses on each video-capable provider when nobody picked one.
+DEFAULT_VIDEO_MODELS: dict[Provider, VideoModel] = {
+    Provider.GOOGLE_GENAI: VideoModel.VEO_3_1_LITE,
+    Provider.OPENROUTER:   VideoModel.OR_SEEDANCE_2_0_MINI,
+}
+
+# Which key a run spends on video, when the user brought more than one. Gemini
+# first for the same reason as images: a first-party key is one hop fewer.
+VIDEO_PROVIDER_ORDER: tuple[Provider, ...] = (Provider.GOOGLE_GENAI, Provider.OPENROUTER)
+
+
+def video_model_for(provider: Provider, requested: "VideoModel | str | None" = None) -> VideoModel:
+    """The video model a run on ``provider`` should use: the requested one when
+    that provider serves it, else the provider's default. Same correction as
+    ``image_model_for`` — a Seedance id on a Gemini run means "a clip"."""
+    if requested is not None:
+        name = str(getattr(requested, "value", requested) or "").strip()
+        if name and provider_of(name) is provider:
+            return VideoModel(name)
+    return DEFAULT_VIDEO_MODELS[provider]
+
+
+# What a Veo clip costs per second, by resolution, from Google's pricing page on
+# 2026-09-29. Audio is always on for Veo on the Gemini API, so there is one
+# rate per resolution (4K is not offered; see VideoResolution). Seedance has no row on purpose: OpenRouter bills it in
+# video tokens and reports each job's cost, and that figure is exact where a
+# table here would be an estimate.
+VIDEO_PRICE_PER_SECOND: dict[VideoModel, dict[str, float]] = {
+    VideoModel.VEO_3_1:      {"720p": 0.40, "1080p": 0.40},
+    VideoModel.VEO_3_1_FAST: {"720p": 0.10, "1080p": 0.12},
+    VideoModel.VEO_3_1_LITE: {"720p": 0.05, "1080p": 0.08},
+}
+
+
+def video_cost_usd(model: "VideoModel | str", resolution: str, seconds: int) -> float | None:
+    """A clip's price from the table, or None for a model it has no row for."""
+    try:
+        rates = VIDEO_PRICE_PER_SECOND.get(VideoModel(str(getattr(model, "value", model))))
+    except ValueError:
+        return None
+    rate = (rates or {}).get(str(resolution).lower())
+    return round(rate * seconds, 4) if rate is not None else None
+
+
+class AspectRatio(StrEnum):
+    """Image aspect ratios accepted by the Gemini image models."""
+
+    SQUARE_1_1     = "1:1"
+    PORTRAIT_9_16  = "9:16"
+    LANDSCAPE_16_9 = "16:9"
+    PORTRAIT_3_4   = "3:4"
+    LANDSCAPE_4_3  = "4:3"
+    PORTRAIT_2_3   = "2:3"
+    LANDSCAPE_3_2  = "3:2"
+    PORTRAIT_4_5   = "4:5"
+    LANDSCAPE_5_4  = "5:4"
+    PORTRAIT_9_21  = "9:21"
+    LANDSCAPE_21_9 = "21:9"
+    PORTRAIT_3_5   = "3:5"
+    LANDSCAPE_5_3  = "5:3"
+
+
+# Default provider → model mapping
+DEFAULT_MODELS = {
+    Provider.OPENAI: ModelName.GPT_5_MINI,
+    Provider.GOOGLE_GENAI: ModelName.GEMINI_3_8_FLASH,
+    Provider.ANTHROPIC: ModelName.CLAUDE_SONNET,
+    Provider.OPENROUTER: ModelName.OR_DEEPSEEK_V4_1_FLASH,
+    Provider.XAI: ModelName.GROK_4_7,
+}
+
+# Where a run goes when its model will not answer — model data, so it lives
+# here beside the enum it is written in. The *policy* over it (which engines get
+# a chain at all, and whether the provider still matches) is the engine
+# dimension and lives in agents/engines.resolve_fallback_models; nothing should
+# read this dict directly.
+#
+# **Same provider, one step.** Two rules, both deliberate:
+#
+# * Same provider, because a fallback has to run on the key the caller handed
+#   us. `service/auth.get_user_provider_keys` returns only the providers the
+#   caller actually supplied a header for — normally exactly one — so a
+#   cross-provider hop would have no credential, and reaching for Duct's own key
+#   would move a customer's spend onto our account without asking.
+# * One step, because a fallback is a quality downgrade the user did not choose.
+#   Sonnet → Haiku still writes the brief. A longer ladder turns a transient 529
+#   into a materially worse deliverable with no signal that it happened.
+#
+# Absent = no fallback, and the middleware is not mounted at all. That is the
+# right answer for a model already at the bottom of its family, and for an
+# unrecognised OpenRouter slug: OpenRouter fronts 400+ models, so there is no
+# basis for guessing what a caller's chosen slug should degrade to, and
+# silently substituting another vendor's model is worse than failing.
+MODEL_FALLBACK: dict[ModelName, tuple[ModelName, ...]] = {
+    # Anthropic
+    ModelName.CLAUDE_FABLE:          (ModelName.CLAUDE_OPUS,),
+    ModelName.CLAUDE_OPUS:           (ModelName.CLAUDE_SONNET,),
+    ModelName.CLAUDE_SONNET:         (ModelName.CLAUDE_HAIKU,),
+    # Google
+    ModelName.GEMINI_3_1_PRO_PREVIEW: (ModelName.GEMINI_3_8_FLASH,),
+    # 3.5 Flash-Lite is the bottom of the family: 2.5 Flash-Lite was retired
+    # (generateContent 404s "no longer available to new users" while
+    # ListModels still lists it — which is why only a generate call counts as
+    # verification; tests/test_model_transport.py makes one per id, live).
+    ModelName.GEMINI_3_8_FLASH:      (ModelName.GEMINI_3_5_FLASH_LITE,),
+    ModelName.GEMINI_2_5_FLASH:      (ModelName.GEMINI_3_5_FLASH_LITE,),
+    # OpenAI. Luna is the bottom of its family: it is the cheapest OpenAI
+    # model in PRICING, so a step "down" to 5 Mini was 2.5x dearer on input and
+    # 4x on output — and content takes the fallback as its *cheap* research
+    # model, so a Luna run's research cost more than the run.
+    # tests/test_model_transport.py holds every pair price-monotone.
+    ModelName.GPT_6_ASTRA:           (ModelName.GPT_6_1_SOL,),
+    ModelName.GPT_6_1_SOL:             (ModelName.GPT_6_LUNA,),
+    ModelName.GPT_5_MINI:            (ModelName.GPT_4O_MINI,),
+    ModelName.GPT_4O:                (ModelName.GPT_4O_MINI,),
+}
+
+# Gateways — providers that front other vendors' models and whose endpoint is
+# therefore a config value rather than a fixed vendor URL. Overridable per
+# install (config.openrouter_base_url) so the same code path reaches a
+# self-hosted router or a local model server.
+# Context windows, in tokens: the window Duct budgets a thread against, which
+# is not always the one the provider publishes. Claude Opus/Sonnet and GPT-6
+# all publish 1M or more; Duct budgets them at 200k and 400k, because every
+# turn re-sends the whole thread and the long end of a 1M window is where a
+# run's cost goes (docs/engineering/agent-engineering.md, gap 3, will derive
+# the summarisation trigger from this table for the same reason). Today it
+# feeds the context gauge in the chat shell: a stale number makes the ring
+# slightly wrong, never a request wrong, so it is a table rather than a live
+# lookup. The default is the Claude budget, the most common case; a model
+# missing from the table still gets a gauge.
+DEFAULT_CONTEXT_WINDOW = 200_000
+CONTEXT_WINDOW: dict[ModelName, int] = {
+    ModelName.GPT_6_ASTRA: 400_000,
+    ModelName.GPT_6_1_SOL: 400_000,
+    ModelName.GPT_6_LUNA: 400_000,
+    ModelName.GPT_5_MINI: 400_000,
+    ModelName.GPT_4O: 128_000,
+    ModelName.GPT_4O_MINI: 128_000,
+    ModelName.GEMINI_3_1_PRO_PREVIEW: 1_000_000,
+    ModelName.GEMINI_3_8_FLASH: 1_000_000,
+    ModelName.GEMINI_3_5_FLASH_LITE: 1_000_000,
+    ModelName.GEMINI_2_5_FLASH: 1_000_000,
+    ModelName.CLAUDE_FABLE: 1_000_000,
+    ModelName.CLAUDE_OPUS: 200_000,
+    ModelName.CLAUDE_SONNET: 200_000,
+    ModelName.CLAUDE_HAIKU: 200_000,
+    ModelName.GROK_4_7: 500_000,
+    ModelName.OR_DEEPSEEK_V4_1_FLASH: 1_000_000,
+    ModelName.OR_DEEPSEEK_V4_PRO: 1_000_000,
+    ModelName.OR_QWEN3_8_FLASH: 1_000_000,
+    ModelName.OR_KIMI_K3: 1_000_000,
+    ModelName.OR_GLM_5_3_FLASH: 1_300_000,
+    ModelName.OR_CLAUDE_OPUS: 200_000,
+    ModelName.OR_CLAUDE_SONNET: 200_000,
+    ModelName.OR_GPT_6_LUNA: 400_000,
+}
+
+
+class ModelPrice(NamedTuple):
+    """USD per million tokens, as the provider lists them."""
+
+    input: float
+    output: float
+    cache_read: float = 0.0
+    cache_write: float = 0.0
+
+
+# List prices, USD per million tokens, from the providers' pricing pages on
+# 2026-09-29. This feeds the cost figure beside the context gauge and nothing
+# else: a stale price makes the figure slightly wrong, never a request wrong,
+# so a table is right and a live lookup is not. A model that is missing here
+# shows tokens without a dollar figure rather than a made-up one — on BYO keys
+# the number is what the user actually pays, so a guess is worse than a blank.
+#
+# An OpenRouter slug carries its *model vendor's* rate, read off the vendor's
+# own endpoint in /api/v1/models/<slug>/endpoints. OpenRouter bills whichever
+# host served the call, and Duct sets no provider preference, so its default
+# routing (weighted toward cheaper hosts) decides. The single price
+# /api/v1/models shows per model is one host's, not a list price: for the
+# retired V4 Flash preview it was a host at 0% uptime.
+PRICING: dict[ModelName, ModelPrice] = {
+    # Short-context rates. GPT-6 doubles input above a 272k-token prompt and
+    # Duct budgets it at 400k, so a turn in between under-reports.
+    ModelName.GPT_6_ASTRA: ModelPrice(10.0, 50.0, 1.0, 12.5),
+    ModelName.GPT_6_1_SOL: ModelPrice(2.0, 10.0, 0.1, 2.5),
+    ModelName.GPT_6_LUNA: ModelPrice(0.1, 0.5, 0.01, 0.125),
+    ModelName.GPT_5_MINI: ModelPrice(0.25, 2.0, 0.025),
+    ModelName.GPT_4O: ModelPrice(2.5, 10.0, 1.25),
+    ModelName.GPT_4O_MINI: ModelPrice(0.15, 0.6, 0.075),
+    ModelName.GEMINI_3_1_PRO_PREVIEW: ModelPrice(2.0, 12.0, 0.2),
+    ModelName.GEMINI_3_8_FLASH: ModelPrice(0.75, 3.75, 0.075),
+    ModelName.GEMINI_3_5_FLASH_LITE: ModelPrice(0.3, 2.5, 0.03),
+    ModelName.GEMINI_2_5_FLASH: ModelPrice(0.3, 2.5, 0.03),
+    ModelName.CLAUDE_FABLE: ModelPrice(10.0, 50.0, 0.25, 12.5),
+    # Opus 5.5's cache read is 5% of input, not the family's 10%.
+    ModelName.CLAUDE_OPUS: ModelPrice(4.0, 20.0, 0.2, 5.0),
+    ModelName.CLAUDE_SONNET: ModelPrice(2.0, 10.0, 0.2, 2.5),
+    # Haiku 5.5's short-prompt card. Above a 100k-token prompt every rate is
+    # 5x ($0.50 / $2.50 in and out); ModelPrice has no tier for that, so a
+    # turn between 100k and the 200k budget under-reports, as GPT-6 does
+    # above 272k.
+    ModelName.CLAUDE_HAIKU: ModelPrice(0.1, 0.5, 0.01, 0.125),
+    # Base rates. xAI doubles both above a 200k-token prompt; ModelPrice has
+    # no tier for that, so a very long Grok run under-reports.
+    ModelName.GROK_4_7: ModelPrice(2.0, 6.0, 0.5),
+    # DeepSeek's off-peak rates. It doubles them 01:00-04:00 and 06:00-10:00
+    # UTC on weekdays; ModelPrice has no clock, so a call then under-reports.
+    ModelName.OR_DEEPSEEK_V4_1_FLASH: ModelPrice(0.15, 0.6, 0.003),
+    ModelName.OR_DEEPSEEK_V4_PRO: ModelPrice(0.66, 1.98, 0.022),
+    ModelName.OR_QWEN3_8_FLASH: ModelPrice(0.15, 0.47, 0.016),
+    ModelName.OR_KIMI_K3: ModelPrice(3.0, 15.0, 0.3),
+    ModelName.OR_GLM_5_3_FLASH: ModelPrice(0.15, 0.5, 0.03),
+    ModelName.OR_CLAUDE_OPUS: ModelPrice(4.0, 20.0, 0.2, 5.0),
+    ModelName.OR_CLAUDE_SONNET: ModelPrice(2.0, 10.0, 0.2, 2.5),
+    ModelName.OR_GPT_6_LUNA: ModelPrice(0.1, 0.5, 0.01, 0.125),
+}
+
+
+class RetiredModel(NamedTuple):
+    """A catalogue id that left for a successor, and what outlives it.
+
+    ``successor`` is ``None`` only for an OpenRouter slug whose one successor
+    costs more: OpenRouter passes an unknown slug through, so the pick keeps
+    running as chosen rather than being moved up a price class.
+    """
+
+    successor: ModelName | None
+    context_window: int
+    price: ModelPrice
+
+
+# Ids the catalogue offered until a successor replaced them. They outlive the
+# enum member in three places, and each needs something different:
+#
+# * **A saved tier pick** (``user_model_settings.tiers``) or ``GENERATE_MODEL``
+#   still names the old id. Without this table ``resolve_engine_model`` finds
+#   no ``ModelName`` and falls to the *provider default*, so a Heavy pick of
+#   Opus 5 would have run on Sonnet without a word. The successor keeps the
+#   user on the line they chose.
+# * **A stored thread** was served by the old model, and its gauge and cost
+#   are read back per message. The old model's own price and window keep
+#   those figures true rather than repriced at the successor's rate.
+# * **The thinking dial** for a saved pick describes the model that will
+#   actually run, which is the successor.
+#
+# A successor is never a price step up the user did not choose: a saved
+# GPT-5.6 Sol moves to 6.1 Sol ($2/$10), not to 6 Astra ($10/$50), the same
+# rule ``agents/tiers.tier_chain`` keeps for a tier that cannot run. The
+# DeepSeek V4 Flash preview has no successor that passes it, so it has none.
+RETIRED_MODELS: dict[str, RetiredModel] = {
+    "claude-opus-5": RetiredModel(ModelName.CLAUDE_OPUS, 200_000, ModelPrice(5.0, 25.0, 0.5, 6.25)),
+    "claude-sonnet-5": RetiredModel(ModelName.CLAUDE_SONNET, 200_000, ModelPrice(2.0, 10.0, 0.2, 2.5)),
+    "claude-haiku-4-5": RetiredModel(ModelName.CLAUDE_HAIKU, 200_000, ModelPrice(1.0, 5.0, 0.1, 1.25)),
+    "anthropic/claude-opus-5": RetiredModel(ModelName.OR_CLAUDE_OPUS, 200_000, ModelPrice(5.0, 25.0, 0.5, 6.25)),
+    "anthropic/claude-sonnet-5": RetiredModel(ModelName.OR_CLAUDE_SONNET, 200_000, ModelPrice(2.0, 10.0, 0.2, 2.5)),
+    "gpt-5.6-sol": RetiredModel(ModelName.GPT_6_1_SOL, 400_000, ModelPrice(4.0, 20.0, 0.4, 5.0)),
+    "gpt-5.6-terra": RetiredModel(ModelName.GPT_6_1_SOL, 400_000, ModelPrice(2.0, 12.0, 0.2, 2.5)),
+    "gpt-5.6-luna": RetiredModel(ModelName.GPT_6_LUNA, 400_000, ModelPrice(0.2, 1.2, 0.02, 0.25)),
+    "grok-4.6": RetiredModel(ModelName.GROK_4_7, 500_000, ModelPrice(2.0, 6.0, 0.5)),
+    # Also the agent-eval model: scripts/agent_eval.py names the slug and hands
+    # it to the runner directly, so the eval stays on the build its baseline
+    # was recorded on, and this row keeps that run priced.
+    "deepseek/deepseek-v4-flash": RetiredModel(None, 1_000_000, ModelPrice(0.0763, 0.1526, 0.0153)),
+    "deepseek/deepseek-v4-pro": RetiredModel(ModelName.OR_DEEPSEEK_V4_PRO, 1_000_000, ModelPrice(0.9363, 1.8726, 0.078)),
+    "openai/gpt-5-mini": RetiredModel(ModelName.OR_GPT_6_LUNA, 400_000, ModelPrice(0.25, 2.0, 0.025)),
+}
+
+
+def current_model_id(model_id: str) -> str:
+    """``model_id``, or its successor's id when it has left the catalogue."""
+    model_id = str(model_id or "").strip()
+    retired = RETIRED_MODELS.get(model_id)
+    return retired.successor.value if retired is not None and retired.successor else model_id
+
+
+def _model_key(model: "ModelName | str | None") -> "ModelName | None":
+    if isinstance(model, ModelName):
+        return model
+    try:
+        return ModelName(str(model))
+    except ValueError:
+        return None
+
+
+# A model on the instance's own Ollama server costs nothing per token: the
+# price is the hardware, which nobody bills by the call. Zero, not ``None``,
+# because zero is the true answer and a blank would read as "unknown".
+LOCAL_MODEL_PRICE = ModelPrice(0.0, 0.0)
+
+
+def price_for(model: "ModelName | str | None") -> ModelPrice | None:
+    """The price list for a model id, by enum member or raw string; ``None``
+    for a model the table does not know. A retired id is priced as itself,
+    since a thread it served was billed at its own rate."""
+    if is_ollama_model(model):
+        return LOCAL_MODEL_PRICE
+    key = _model_key(model)
+    if key is not None:
+        return PRICING.get(key)
+    retired = RETIRED_MODELS.get(str(model or ""))
+    return retired.price if retired is not None else None
+
+
+def cost_usd(
+    model: "ModelName | str | None",
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+) -> float | None:
+    """What one model call cost, or ``None`` when the model is not priced.
+
+    ``input_tokens`` is LangChain's count, which *includes* the cached and
+    cache-written tokens; those are billed at their own rates, so they are
+    taken out of the input figure before it is priced.
+    """
+    price = price_for(model)
+    if price is None:
+        return None
+    uncached = max(0, input_tokens - cache_read_tokens - cache_creation_tokens)
+    total = (
+        uncached * price.input
+        + cache_read_tokens * price.cache_read
+        + cache_creation_tokens * price.cache_write
+        + output_tokens * price.output
+    )
+    return round(total / 1_000_000, 6)
+
+
+def context_window_for(model: "ModelName | str | None") -> int:
+    """The context window for a model id, by enum member or raw string.
+
+    A provider may report the model it actually served (a fallback, a dated
+    alias) rather than the one asked for; a string it does not know falls
+    through to the default rather than failing the gauge.
+    """
+    key = _model_key(model)
+    if key is not None:
+        return CONTEXT_WINDOW.get(key, DEFAULT_CONTEXT_WINDOW)
+    retired = RETIRED_MODELS.get(str(model or ""))
+    return retired.context_window if retired is not None else DEFAULT_CONTEXT_WINDOW
+
+
+GATEWAY_BASE_URL: dict[Provider, str] = {
+    Provider.OPENROUTER: "https://openrouter.ai/api/v1",
+}
+
+# Of those, the ones with a first-party LangChain integration of their own.
+# A gateway NOT listed here is served as the OpenAI chat-completions shape at
+# its own base URL, which is the fallback every gateway supports — that is what
+# a future Ollama / vLLM / LiteLLM entry would get, and it is why
+# ``langchain_provider`` still has two branches with only one gateway in the
+# table. Membership here is a claim that the package exists and is maintained,
+# not a preference: see the ``langchain-openrouter`` note in pyproject.toml.
+NATIVE_GATEWAY_PROVIDERS: frozenset[Provider] = frozenset({Provider.OPENROUTER})
+
+
+def langchain_provider(provider: Provider) -> str:
+    """The ``model_provider`` string LangChain's init_chat_model expects.
+
+    A gateway with its own integration passes its own name through — LangChain
+    resolves ``"openrouter"`` to ``langchain-openrouter``. A gateway without one
+    resolves to ``"openai"``: it is the OpenAI chat-completions wire format at a
+    different base URL, not a distinct integration. Keeping the mapping here
+    means call sites never special-case a provider.
+    """
+    if provider in GATEWAY_BASE_URL and provider not in NATIVE_GATEWAY_PROVIDERS:
+        return Provider.OPENAI.value
+    if provider is Provider.OPENAI_COMPATIBLE:
+        return Provider.OPENAI.value
+    return provider.value
+
+
+def get_api_key_kwargs(
+    provider: Provider,
+    api_key: str,
+    *,
+    base_url: str = "",
+) -> dict:
+    """Credential (and endpoint) kwargs for the given provider.
+
+    Passed as a constructor kwarg, never by mutating ``os.environ`` — a global
+    mutation races across concurrent requests carrying different BYO keys, and
+    lets a server-side key win over the user's.
+    """
+    # Both gateway shapes take the same two kwargs: ChatOpenRouter aliases its
+    # `openrouter_api_key` / `openrouter_api_base` fields to `api_key` /
+    # `base_url`, exactly as ChatOpenAI names them. So this branch does not need
+    # to know which of the two a gateway is.
+    if provider in GATEWAY_BASE_URL:
+        return {
+            "api_key": api_key,
+            "base_url": base_url or GATEWAY_BASE_URL[provider],
+        }
+    if provider == Provider.OPENAI:
+        return {"openai_api_key": api_key}
+    if provider == Provider.GOOGLE_GENAI:
+        return {"google_api_key": api_key}
+    if provider == Provider.ANTHROPIC:
+        return {"anthropic_api_key": api_key}
+    if provider == Provider.XAI:
+        return {"xai_api_key": api_key}
+    if provider == Provider.OLLAMA:
+        # The server is the credential; there is no key to send.
+        return {"base_url": base_url}
+    if provider == Provider.OPENAI_COMPATIBLE:
+        # ``api_key`` here is already the endpoint's own key, unpacked by
+        # ``resolve_chat_model``. The OpenAI SDK refuses to build a client with
+        # none, and a server that checks no key ignores whatever it is sent.
+        return {"api_key": api_key or NO_ENDPOINT_KEY, "base_url": base_url}
+    return {}
+
+
+# What a key-less OpenAI-compatible server is sent in its key's place.
+NO_ENDPOINT_KEY = "no-key"
+
+
+def resolve_provider(name: str | None) -> Provider:
+    """Resolve a string to a Provider enum, defaulting to GOOGLE_GENAI."""
+    if not name:
+        return Provider.GOOGLE_GENAI
+    try:
+        return Provider(name.lower().strip())
+    except ValueError:
+        return Provider.GOOGLE_GENAI
+
+
+def resolve_model(name: str | None, provider: Provider) -> ModelName:
+    """Resolve a string to a ModelName enum, defaulting per provider."""
+    if not name:
+        return DEFAULT_MODELS.get(provider, ModelName.GEMINI_3_8_FLASH)
+    try:
+        return ModelName(current_model_id(name))
+    except ValueError:
+        return DEFAULT_MODELS.get(provider, ModelName.GEMINI_3_8_FLASH)
+
+
+# Which provider serves a model id, by the shape of the id itself.
+#
+# Derived rather than tabulated on purpose. A dict would be a third list to
+# keep in step with ModelName and MODEL_THINKING, and it would have no answer
+# at all for the case that matters most: an OpenRouter slug Duct has never
+# heard of. Vendor prefixes are stable — Anthropic has never shipped a model
+# that is not `claude-*` — so the prefix *is* the fact.
+#
+# Order matters. The `/` test runs first because `anthropic/claude-opus-5` is
+# an OpenRouter slug, not an Anthropic model: it bills through OpenRouter's key
+# and reaches a different endpoint, and reading it as Anthropic would spend the
+# wrong credential.
+_PROVIDER_PREFIXES: tuple[tuple[str, Provider], ...] = (
+    ("claude-", Provider.ANTHROPIC),
+    ("gemini-", Provider.GOOGLE_GENAI),
+    ("gpt-", Provider.OPENAI),
+    ("o1-", Provider.OPENAI),
+    ("o3-", Provider.OPENAI),
+    # Absent until the image models arrived, which is why the catalogue never
+    # listed grok-4.6 under xAI: provider_of returned None and the endpoint
+    # skipped it.
+    ("grok-", Provider.XAI),
+    ("veo-", Provider.GOOGLE_GENAI),
+)
+
+
+# An Ollama model is namespaced because its tag has no shape of its own:
+# `qwen3:8b` matches no vendor prefix, and `hf.co/org/repo:Q4_K_M` contains a
+# "/" and would be read as an OpenRouter slug, spending the wrong credential.
+# A bare ":" is no test either — OpenRouter slugs end in `:free` and `:nitro`.
+OLLAMA_MODEL_PREFIX = "ollama:"
+
+
+def is_ollama_model(model: "ModelName | str | None") -> bool:
+    return str(getattr(model, "value", model) or "").strip().startswith(OLLAMA_MODEL_PREFIX)
+
+
+def ollama_model_id(tag: str) -> str:
+    """The id Duct stores for an Ollama tag."""
+    return f"{OLLAMA_MODEL_PREFIX}{tag.strip()}"
+
+
+def ollama_tag(model: "ModelName | str") -> str:
+    """The tag Ollama knows a model by: the id without Duct's namespace."""
+    return str(getattr(model, "value", model) or "").strip().removeprefix(OLLAMA_MODEL_PREFIX)
+
+
+# Namespaced for the same reason as Ollama's, more so: a vLLM model is named by
+# its Hugging Face repo (`Qwen/Qwen3-32B`), which reads as an OpenRouter slug.
+COMPATIBLE_MODEL_PREFIX = "compat:"
+
+
+def is_compatible_model(model: "ModelName | str | None") -> bool:
+    return str(getattr(model, "value", model) or "").strip().startswith(COMPATIBLE_MODEL_PREFIX)
+
+
+def compatible_model_id(served: str) -> str:
+    """The id Duct stores for a model an OpenAI-compatible server lists."""
+    return f"{COMPATIBLE_MODEL_PREFIX}{served.strip()}"
+
+
+def compatible_served_id(model: "ModelName | str") -> str:
+    """The id the server knows a model by: Duct's id without the namespace."""
+    return str(getattr(model, "value", model) or "").strip().removeprefix(COMPATIBLE_MODEL_PREFIX)
+
+
+def provider_of(model: "ModelName | str") -> Provider | None:
+    """The provider that serves this model id, or None when unrecognisable.
+
+    None is a real answer, not a failure to default: a caller choosing a
+    credential must not be handed a guess. ``agents/tiers.resolve_tier_model``
+    treats it as "fall back to this tier's default model" rather than
+    "attempt it against an arbitrary key".
+    """
+    name = str(getattr(model, "value", model) or "").strip().lower()
+    if not name:
+        return None
+    # Before the "/" test: an Ollama tag pulled from Hugging Face has one.
+    if name.startswith(OLLAMA_MODEL_PREFIX):
+        return Provider.OLLAMA
+    if name.startswith(COMPATIBLE_MODEL_PREFIX):
+        return Provider.OPENAI_COMPATIBLE
+    if "/" in name:
+        return Provider.OPENROUTER
+    for prefix, provider in _PROVIDER_PREFIXES:
+        if name.startswith(prefix):
+            return provider
+    return None
+
+
+def _model_id(model: "ModelName | str | None") -> str:
+    return str(getattr(model, "value", model) or "").strip().lower()
+
+
+# Claude models on Anthropic's newer request contract, which Fable 5.1
+# introduced and the 5.5 models kept. Two facts that arrived together on every
+# model until Haiku 5.5, which binds its thinking but still takes a forced tool
+# call — so they are two tables, and a model is on each for its own reason:
+#
+# * **A thinking block is bound to the conversation before it.** Replaying one
+#   after an earlier turn changed is a 400 on accounts created on or after
+#   2026-08-31, which is every new customer's own key, and Duct's harness does
+#   change earlier turns: tool-result pruning, the seen-image swap and
+#   compaction all rewrite history. ``agents/core/lc.resolve_chat_model`` asks
+#   the API to drop a stale block instead of refusing the request.
+CLAUDE_BOUND_THINKING: frozenset[str] = frozenset({
+    ModelName.CLAUDE_FABLE.value,
+    ModelName.CLAUDE_OPUS.value,
+    ModelName.CLAUDE_SONNET.value,
+    ModelName.CLAUDE_HAIKU.value,
+    ModelName.OR_CLAUDE_OPUS.value,
+    ModelName.OR_CLAUDE_SONNET.value,
+})
+
+# * **A forced tool call is a 400.** ``tool_choice`` of ``any`` or a named tool
+#   is refused on the Messages API and through OpenRouter alike. LangChain's
+#   ``ToolStrategy`` forces exactly that, so a typed answer at the end of a
+#   tool loop has to be asked for another way (``agents/core/research.py``).
+#   Haiku 5.5 accepts a forced call (the response then starts with it and
+#   carries no thinking block), which is why it is absent here and not above.
+CLAUDE_NO_FORCED_TOOL_CHOICE: frozenset[str] = frozenset({
+    ModelName.CLAUDE_FABLE.value,
+    ModelName.CLAUDE_OPUS.value,
+    ModelName.CLAUDE_SONNET.value,
+    ModelName.OR_CLAUDE_OPUS.value,
+    ModelName.OR_CLAUDE_SONNET.value,
+})
+
+
+def accepts_forced_tool_choice(model: "ModelName | str | None") -> bool:
+    """False for a model that refuses ``tool_choice`` of ``any`` or a named tool."""
+    return _model_id(model) not in CLAUDE_NO_FORCED_TOOL_CHOICE
+
+
+def binds_thinking_to_conversation(model: "ModelName | str | None") -> bool:
+    """True for a model whose thinking blocks fail on an edited history."""
+    return _model_id(model) in CLAUDE_BOUND_THINKING
+
+
+# Reasoning models that fix their own sampling. A temperature other than the
+# default is refused while they reason: a 400 from GPT-6 and the Claude 5
+# family, Haiku 5.5 included, and for Fable 5.1 and Sonnet 5.5 a ValueError
+# langchain-anthropic raises before the request leaves. Callers pass one anyway — 0 for the
+# key-verify call and the memory pass — so the transport drops it for these
+# rather than every caller carrying the list. GPT-6 takes a temperature back
+# only at reasoning effort `none`, which Duct never sends.
+_FIXED_SAMPLING_PREFIXES: tuple[str, ...] = (
+    "claude-fable-",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-5",
+    "gpt-6",
+)
+
+
+def takes_temperature(model: "ModelName | str | None") -> bool:
+    """False for a model that refuses a sampling temperature while it reasons."""
+    name = _model_id(model)
+    name = name.split("/", 1)[1] if "/" in name else name
+    return not name.startswith(_FIXED_SAMPLING_PREFIXES)
+
+
+class Modality(StrEnum):
+    """What a model can *emit*. Input modality is deliberately not modelled.
+
+    The distinction is the whole reason this exists. Every chat model in the
+    catalogue *accepts* images — that is how file upload already works — so an
+    input table would be a column of True and would answer the wrong question.
+    What the settings page needs to know is whether a chosen model can produce
+    an image, because that decides whether the user has to pick a separate
+    image model at all.
+    """
+
+    TEXT = "text"
+    IMAGE = "image"
+    VIDEO = "video"
+
+
+# What each model emits. Absent means text only, which is the honest default:
+# as of this catalogue **no** chat model here generates images — that lives in
+# the disjoint ``ImageModel`` enum, reached through a different SDK call path.
+#
+# The table exists anyway, and is checked anyway, because the resolution it
+# feeds ("does any configured tier already cover images?") is three lines, and
+# writing it now means the day a chat model gains image output the settings
+# page re-resolves itself instead of needing a UI change.
+MODEL_EMITS: dict[str, frozenset[Modality]] = {
+    **{model.value: frozenset({Modality.TEXT, Modality.IMAGE}) for model in ImageModel},
+    **{model.value: frozenset({Modality.VIDEO}) for model in VideoModel},
+}
+
+
+def model_emits(model: "ModelName | str", modality: Modality) -> bool:
+    """True when this model can produce ``modality`` itself."""
+    name = str(getattr(model, "value", model) or "").strip()
+    return modality in MODEL_EMITS.get(name, frozenset({Modality.TEXT}))
+
+
+# The name a person would say out loud, keyed by model id.
+#
+# The picker used to render the id itself, so the answer to "which model am I
+# on" was `gemini-3.1-pro-preview` — punctuation a marketer has to decode
+# before they can compare it to the row above. The id still ships and is still
+# shown underneath, because it is what a support thread needs.
+#
+# A model missing from this map falls back to its id, which is exactly the old
+# behaviour. That is deliberate: a new model appearing unlabelled is a cosmetic
+# regression, and making this map mandatory would mean a failing test every
+# time the catalogue gained a row.
+MODEL_LABELS: dict[str, str] = {
+    ModelName.GPT_6_ASTRA.value: "GPT-6 Astra",
+    ModelName.GPT_6_1_SOL.value: "GPT-6.1 Sol",
+    ModelName.GPT_6_LUNA.value: "GPT-6 Luna",
+    ModelName.GPT_5_MINI.value: "GPT-5 mini",
+    ModelName.GPT_4O.value: "GPT-4o",
+    ModelName.GPT_4O_MINI.value: "GPT-4o mini",
+    ModelName.GEMINI_3_1_PRO_PREVIEW.value: "Gemini 3.1 Pro (preview)",
+    ModelName.GEMINI_3_8_FLASH.value: "Gemini 3.8 Flash",
+    ModelName.GEMINI_3_5_FLASH_LITE.value: "Gemini 3.5 Flash-Lite",
+    ModelName.GEMINI_2_5_FLASH.value: "Gemini 2.5 Flash",
+    ModelName.CLAUDE_FABLE.value: "Claude Fable 5.1",
+    ModelName.CLAUDE_OPUS.value: "Claude Opus 5.5",
+    ModelName.CLAUDE_SONNET.value: "Claude Sonnet 5.5",
+    ModelName.CLAUDE_HAIKU.value: "Claude Haiku 5.5",
+    ModelName.GROK_4_7.value: "Grok 4.7",
+    ModelName.OR_DEEPSEEK_V4_1_FLASH.value: "DeepSeek V4.1 Flash",
+    ModelName.OR_DEEPSEEK_V4_PRO.value: "DeepSeek V4 Pro",
+    ModelName.OR_QWEN3_8_FLASH.value: "Qwen3.8 Flash",
+    ModelName.OR_KIMI_K3.value: "Kimi K3",
+    ModelName.OR_GLM_5_3_FLASH.value: "GLM-5.3 Flash",
+    ModelName.OR_CLAUDE_OPUS.value: "Claude Opus 5.5",
+    ModelName.OR_CLAUDE_SONNET.value: "Claude Sonnet 5.5",
+    ModelName.OR_GPT_6_LUNA.value: "GPT-6 Luna",
+    # The image models are not tier picks, but they are rendered in the same
+    # sentence as one, and a raw id beside a name reads as a different kind
+    # of thing.
+    ImageModel.GEMINI_3_1_FLASH_IMAGE.value: "Gemini 3.1 Flash Image",
+    ImageModel.GEMINI_3_1_FLASH_LITE_IMAGE.value: "Gemini 3.1 Flash-Lite Image",
+    ImageModel.GEMINI_3_PRO_IMAGE.value: "Gemini 3 Pro Image",
+    ImageModel.GPT_IMAGE_2_5_FLARE.value: "GPT Image 2.5 Flare",
+    ImageModel.GPT_IMAGE_2_5_SUNBURST.value: "GPT Image 2.5 Sunburst",
+    ImageModel.GPT_IMAGE_2.value: "GPT Image 2",
+    ImageModel.GROK_IMAGINE_IMAGE_2.value: "Grok Imagine 2.0",
+    ImageModel.OR_GEMINI_3_1_FLASH_IMAGE.value: "Gemini 3.1 Flash Image",
+    ImageModel.OR_SEEDREAM_5_PRO.value: "Seedream 5 Pro",
+    ImageModel.OR_FLUX_2_PRO.value: "FLUX.2 Pro",
+    ImageModel.OR_RECRAFT_V4_VECTOR.value: "Recraft V4 Vector (SVG)",
+    VideoModel.VEO_3_1.value: "Veo 3.1",
+    VideoModel.VEO_3_1_FAST.value: "Veo 3.1 Fast",
+    VideoModel.VEO_3_1_LITE.value: "Veo 3.1 Lite",
+    VideoModel.OR_SEEDANCE_2_5.value: "Seedance 2.5",
+    VideoModel.OR_SEEDANCE_2_0_MINI.value: "Seedance 2.0 Mini",
+}
+
+
+def model_label(model: Any) -> str:
+    """The name a person knows a model by, or its id when it has none."""
+    value = str(getattr(model, "value", model) or "")
+    return MODEL_LABELS.get(value, value)
+
+
+def run_model_fields(provider: Any, model: Any) -> dict[str, str]:
+    """What a run-start event says about the model it runs on.
+
+    On every PIPELINE_STARTED, from one helper, so the transcript can say
+    "Switched to Claude Sonnet 5.5" when a resumed thread comes back on a
+    different model — a fact the reader could not otherwise learn, and one
+    that explains a change of voice or a different verdict on the same data.
+    """
+    return {
+        "provider": str(getattr(provider, "value", provider) or ""),
+        "model": str(getattr(model, "value", model) or ""),
+        "model_label": model_label(model),
+    }

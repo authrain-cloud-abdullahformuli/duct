@@ -1,0 +1,130 @@
+name: Backend Checks
+
+permissions:
+  contents: read
+
+on:
+  # `edited` is deliberately absent: on `pull_request` it fires when the TITLE
+  # or DESCRIPTION changes, so retitling a PR re-ran every job below. `synchronize`
+  # already covers new commits, which is the only edit that can change the answer.
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    # Only when this area actually changed. Before this, a backend-only PR still
+    # paid for a full run here. Filtering the PR trigger and not the `push` one
+    # is deliberate — main keeps building and deploying exactly as it does today,
+    # so this can only ever remove work from a PR, never from a release.
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend.yml'
+  push:
+    branches:
+      - main
+  workflow_call:
+
+jobs:
+  backend-checks:
+    name: Ruff and pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The site's integrations pages are generated from this directory's
+      # connector metadata, catalogues, executors and knowledge packs, so a PR
+      # that adds a field, an operation or a connector learns here, on its own
+      # diff, that the pages fell behind. Standard library only; no setup needed.
+      - name: Check the integrations pages still match the backend
+        working-directory: .
+        run: python3 scripts/build_integrations.py --check
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Install backend dependencies
+        run: poetry install --with dev
+
+      - name: Ruff
+        run: poetry run ruff check server.py agents routes service tests utils
+
+      - name: Pytest
+        # `live` tests are already deselected by addopts in pyproject.toml; the
+        # explicit -m keeps that visible here and survives an addopts change.
+        run: poetry run pytest -q -m "not live" tests
+
+  # The offline suite runs on in-memory SQLite by design, so nothing above
+  # touches the dialect production runs on. This does: the whole migration
+  # chain applied to a fresh Postgres, then `alembic check`, which fails when
+  # the models have drifted from what the migrations produce — the diff an
+  # `--autogenerate` would have written. A JSONB column, an index only
+  # Postgres accepts, a model change without its migration: all land here on
+  # the pull request rather than on the Railway deploy.
+  migrations:
+    name: Migrations on Postgres
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: duct
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # psycopg3 scheme up front, as content-eval.yml does: alembic uses
+      # DATABASE_URL verbatim and db.session leaves an explicit +psycopg alone.
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/duct
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Install backend dependencies
+        run: poetry install --with dev
+
+      - name: Apply every migration to an empty database
+        run: poetry run python scripts/migrations.py upgrade head
+
+      - name: Models match the migrations
+        run: poetry run alembic check
+
+      # Down and back up once: a migration whose downgrade was never run is
+      # the one that strands a rollback on Railway.
+      - name: The newest migration can be undone
+        run: |
+          poetry run alembic downgrade -1
+          poetry run alembic upgrade head

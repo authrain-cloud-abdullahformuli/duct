@@ -1,0 +1,41 @@
+import { Trans } from "@lingui/react/macro";
+
+import { activateRequestI18n } from "@/i18n/server";
+import LocalBackendGate from "../../components/LocalBackendGate.jsx";
+
+// The lead magnet's own chrome. Gated like every other subtree that talks to
+// the API: the desktop shell only learns its sidecar's port at runtime, and a
+// request that leaves before then goes to the hosted API with a token the
+// sidecar minted — a 401 the app reads as a dead session.
+export const metadata = {
+  robots: { index: false, follow: false },
+};
+
+export default async function PublicLayout({ children }) {
+  await activateRequestI18n();
+  return (
+    <div className="h-dvh flex flex-col bg-background overflow-hidden">
+      <header className="shrink-0 border-b border-border/70 bg-background/90 backdrop-blur-xl px-4 h-[calc(3.5rem+env(safe-area-inset-top,0px))] pt-[env(safe-area-inset-top,0px)] flex items-center gap-3">
+        <a href="https://getduct.ai" className="flex items-center gap-2 text-sm font-semibold text-foreground hover:opacity-80 transition-opacity">
+          <svg width="22" height="22" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <rect width="32" height="32" rx="8" fill="#ff5c00"/>
+            <path d="M8 10h10a6 6 0 0 1 0 12H8V10z" fill="#fff"/>
+          </svg>
+          Duct
+        </a>
+        <span className="text-border/70" aria-hidden="true">·</span>
+        <span className="text-sm text-muted-foreground"><Trans>Free SEO Audit</Trans></span>
+        <div className="flex-1" />
+        <a
+          href="https://getduct.ai"
+          className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+        >
+          <Trans>Back to site</Trans>
+        </a>
+      </header>
+      <main id="main-content" className="flex-1 min-h-0 flex flex-col" tabIndex={-1}>
+        <LocalBackendGate>{children}</LocalBackendGate>
+      </main>
+    </div>
+  );
+}

@@ -1,0 +1,32 @@
+{
+  "name": "@authrain/duct",
+  "version": "1.0.0",
+  "description": "Open-source AI marketing agent: a growth analyst with every login across Google Ads, GA4, Stripe, Mixpanel, and Search Console",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/authrain-cloud-abdullahformuli/duct.git"
+  },
+  "keywords": [
+    "ai-agent",
+    "marketing",
+    "growth",
+    "analytics",
+    "google-ads",
+    "ga4",
+    "stripe",
+    "seo-audit",
+    "content-studio",
+    "autonomous-agents"
+  ],
+  "author": "Abdullah Formuli <authrainmedia@gmail.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/authrain-cloud-abdullahformuli/duct/issues"
+  },
+  "homepage": "https://github.com/authrain-cloud-abdullahformuli/duct#readme"
+}

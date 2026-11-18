@@ -1,0 +1,547 @@
+"""Catalog-driven data fetching — entity id in, connector data out.
+
+The old pipeline bound a fixed set of zero-argument tools per goal, capped at
+eight, chosen before the model saw anything. This is the replacement: the
+**entity catalog is the tool surface**, the agent names an entity, and one
+dispatcher resolves the connector, the account, the credentials and the call.
+
+What that buys, beyond removing the cap:
+
+* **Adding a connector is a catalog entry plus one line here.** Nothing in the
+  agent, the prompt or the tool schema changes — which is the property the
+  verification checks depend on (they declare the entities they need and are
+  skipped, visibly, when a connector is absent).
+* **Identifiers still never come from the model.** The one genuinely good
+  property of the old zero-argument design was that a hallucinated customer id
+  was structurally impossible. The account comes from the project's binding and
+  the credentials from ``service/connector_access.py``; the model supplies an
+  entity id and a date range and nothing else.
+* **A missing connector is an instruction, not an exception.** Every failure
+  path returns a payload telling the agent what to do next (bind an account,
+  ask for a connection, try a different window) because a raised exception ends
+  the run while a payload lets it recover.
+
+Framework-free by construction — ``agents/insights/data_tools.py`` is the thin
+LangChain binder over this.
+"""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+from uuid import UUID
+
+from agents.core.errors import ErrorCode, classify_error, safe_excerpt
+from agents.insights.catalog.base import _CATALOGS
+from agents.insights.catalog.publishers import PUBLISHERS_SOURCE
+from utils.dates import last_n_days
+
+logger = logging.getLogger(__name__)
+
+# Default analysis window when the agent does not name one. Ends yesterday:
+# ad platforms only settle a day's numbers after it closes, so including today
+# silently understates the most recent day — one of the quieter ways a
+# marketing number lies.
+DEFAULT_WINDOW_DAYS = 30
+
+# A single response is capped before it reaches the model. Search terms and geo
+# rows in particular can run to hundreds of entries, and an agent that spends
+# its context on row 400 has none left to reason with.
+MAX_RESPONSE_CHARS = 60_000
+
+
+@dataclass(frozen=True)
+class FetchSpec:
+    """How to call one catalog entity's fetcher.
+
+    ``call`` takes ``(account_id, date_from, date_to, creds)`` and returns the
+    raw dict. Per-connector rather than per-entity, because the argument shapes
+    differ by vendor, not by report.
+    """
+
+    entity_id: str
+    connector_id: str
+    #: Key into the dispatch table below. An internal name, not something the
+    #: model may call — every entity is reached through FetchData(entity_id=…).
+    fetch_fn: str
+    call: Callable[[str, str, str, dict], dict[str, Any]]
+
+
+# ---------------------------------------------------------------------------
+# Per-connector call adapters
+# ---------------------------------------------------------------------------
+
+def _google_ads(fn: Callable, **extra: Any) -> Callable[[str, str, str, dict], dict]:
+    """Google Ads clients want the MCC id as well."""
+
+    def _call(account_id: str, date_from: str, date_to: str, creds: dict) -> dict:
+        return fn(
+            account_id,
+            date_from=date_from,
+            date_to=date_to,
+            client_id=creds.get("client_id", ""),
+            client_secret=creds.get("client_secret", ""),
+            refresh_token=creds.get("refresh_token", ""),
+            login_customer_id=creds.get("login_customer_id", ""),
+            **extra,
+        )
+
+    return _call
+
+
+def _google_oauth(fn: Callable) -> Callable[[str, str, str, dict], dict]:
+    """GA4 and Search Console: plain OAuth, no MCC id."""
+
+    def _call(account_id: str, date_from: str, date_to: str, creds: dict) -> dict:
+        return fn(
+            account_id,
+            date_from=date_from,
+            date_to=date_to,
+            refresh_token=creds.get("refresh_token", ""),
+            client_id=creds.get("client_id", ""),
+            client_secret=creds.get("client_secret", ""),
+        )
+
+    return _call
+
+
+def _manual_blob(creds: dict, account_id: str, account_key: str) -> dict:
+    """The stored blob, with the picked account on ``account_key`` when it lacks one."""
+    blob = dict(creds)
+    if account_key and account_id and not blob.get(account_key):
+        blob[account_key] = account_id
+    return blob
+
+
+class WindowUnsupported(ValueError):
+    """The ask names a window this source cannot read."""
+
+
+# Where a day-count fetcher leaves the window it actually read, for
+# `fetch_entity` to report in place of the one asked for.
+_READ_WINDOW_KEY = "_window_read"
+
+
+def _window_read(window: Any, days: int, yesterday: date) -> tuple[str, str]:
+    """The dates a day-count fetcher covered: its own ``window`` when it says
+    (Clarity clamps the days it was given), else the last ``days`` ending
+    yesterday, the rule every one of them counts by."""
+    if isinstance(window, dict):
+        start, end = window.get("from") or window.get("date_from"), window.get("to") or window.get("date_to")
+        if start and end:
+            return str(start), str(end)
+        try:
+            days = max(1, int(window.get("days") or days))
+        except (TypeError, ValueError):
+            pass
+    return (yesterday - timedelta(days=days - 1)).isoformat(), yesterday.isoformat()
+
+
+def _manual(fn: Callable, account_key: str = "") -> Callable[[str, str, str, dict], dict]:
+    """Manual-credential connectors take the stored blob whole plus a window in days.
+
+    They read "the last N days", counted back from yesterday, whatever dates
+    the ask carried. So a window ending earlier is a past period they cannot
+    read, and is refused rather than answered: answering an August ask with
+    the latest 31 days captioned as August was how a period comparison
+    compared September with itself. A recent ask is answered, and the window
+    the fetcher actually read travels back with the data.
+    """
+
+    def _call(account_id: str, date_from: str, date_to: str, creds: dict) -> dict:
+        start, end = date.fromisoformat(date_from), date.fromisoformat(date_to)
+        days = max(1, (end - start).days + 1)
+        yesterday = date.today() - timedelta(days=1)
+        if end < yesterday:
+            raise WindowUnsupported(
+                f"reads only the most recent days, ending {yesterday.isoformat()}; "
+                f"{date_from} to {date_to} is a past period it cannot fetch"
+            )
+        data = fn(_manual_blob(creds, account_id, account_key), days)
+        if isinstance(data, dict):
+            data[_READ_WINDOW_KEY] = _window_read(data.get("window"), days, yesterday)
+        return data
+
+    return _call
+
+
+def _manual_dated(fn: Callable, account_key: str) -> Callable[[str, str, str, dict], dict]:
+    """A manual connector whose fetcher takes the exact dates, not a day count.
+
+    ``_manual`` hands its fetchers a length, and they each count back from
+    yesterday, which is right for a metric that only settles once the day is
+    over and wrong for "what shipped today": a window of today alone would
+    come back as yesterday. GitHub's events are final the moment they happen.
+    """
+
+    def _call(account_id: str, date_from: str, date_to: str, creds: dict) -> dict:
+        return fn(_manual_blob(creds, account_id, account_key), date_from, date_to)
+
+    return _call
+
+
+def _campaigns(account_id: str, date_from: str, date_to: str, creds: dict) -> dict:
+    """fetch_campaigns predates the keyword-only convention the others use."""
+    from service.google.fetch import fetch_campaigns
+
+    return fetch_campaigns(
+        account_id,
+        client_id=creds.get("client_id", ""),
+        client_secret=creds.get("client_secret", ""),
+        refresh_token=creds.get("refresh_token", ""),
+        date_from=date_from,
+        date_to=date_to,
+        login_customer_id=creds.get("login_customer_id", ""),
+    )
+
+
+def _build_specs() -> dict[str, FetchSpec]:
+    """Entity id → how to fetch it, derived from the catalogs.
+
+    Deferred imports throughout: the Google client libraries are heavy and a
+    session that never fetches should not pay for them.
+    """
+    from service.google.fetch import (
+        fetch_ad_group_performance,
+        fetch_device_performance,
+        fetch_geo_performance,
+        fetch_search_terms,
+    )
+    from service.google.ga4 import fetch_ga4_conversion_paths, fetch_ga4_landing_pages, fetch_ga4_weekly_users
+    from service.google.gsc import (
+        fetch_gsc_page_performance,
+        fetch_gsc_query_page,
+        fetch_gsc_query_performance,
+    )
+    from service.clarity.fetch import fetch_clarity
+    from service.github.fetch import fetch_github
+    from service.growthbook.fetch import fetch_growthbook
+    from service.mixpanel.fetch import fetch_mixpanel
+    from service.rss.fetch import fetch_rss
+
+    by_tool: dict[str, Callable[[str, str, str, dict], dict]] = {
+        "fetch_campaign_performance": _campaigns,
+        "fetch_search_terms": _google_ads(fetch_search_terms),
+        "fetch_device_performance": _google_ads(fetch_device_performance),
+        "fetch_geo_performance": _google_ads(fetch_geo_performance),
+        "fetch_ad_group_performance": _google_ads(fetch_ad_group_performance),
+        "fetch_ga4_landing_pages": _google_oauth(fetch_ga4_landing_pages),
+        "fetch_ga4_conversion_paths": _google_oauth(fetch_ga4_conversion_paths),
+        "fetch_ga4_weekly_users": _google_oauth(fetch_ga4_weekly_users),
+        "fetch_gsc_query_performance": _google_oauth(fetch_gsc_query_performance),
+        "fetch_gsc_page_performance": _google_oauth(fetch_gsc_page_performance),
+        "fetch_gsc_query_page": _google_oauth(fetch_gsc_query_page),
+        "fetch_mixpanel": _manual(fetch_mixpanel, "project_id"),
+        "fetch_clarity": _manual(fetch_clarity),
+        "fetch_growthbook": _manual(fetch_growthbook, "project_id"),
+        "fetch_github": _manual_dated(fetch_github, "repo"),
+        "fetch_rss": _manual_dated(fetch_rss, "account_id"),
+        "fetch_social_post_metrics": _publishers_unreachable,
+    }
+
+    specs: dict[str, FetchSpec] = {}
+    for connector_id, catalog in _CATALOGS.items():
+        for entity in catalog.get("entities", []):
+            fetch_fn = entity.get("fetch_fn", "")
+            call = by_tool.get(fetch_fn)
+            if call is None:
+                # A catalog entry with no dispatcher is a real drift bug, but a
+                # loud one at fetch time beats an import-time crash that takes
+                # the whole agent down.
+                logger.warning(
+                    "insights: catalog entity %s names unknown fetcher %s",
+                    entity.get("entity_id"),
+                    fetch_fn,
+                )
+                continue
+            specs[entity["entity_id"]] = FetchSpec(
+                entity_id=entity["entity_id"],
+                connector_id=connector_id,
+                fetch_fn=fetch_fn,
+                call=call,
+            )
+    return specs
+
+
+_specs: dict[str, FetchSpec] | None = None
+
+
+def fetch_specs() -> dict[str, FetchSpec]:
+    """The entity → fetcher map, built once."""
+    global _specs
+    if _specs is None:
+        _specs = _build_specs()
+    return _specs
+
+
+def known_entities() -> list[str]:
+    return sorted(fetch_specs())
+
+
+# ---------------------------------------------------------------------------
+# The dispatcher
+# ---------------------------------------------------------------------------
+
+def resolve_window(date_from: str, date_to: str) -> tuple[str, str]:
+    """A complete, ordered window. Half-specified ranges fall back whole rather
+    than pairing a real date with a guess."""
+    if date_from and date_to:
+        return (date_from, date_to) if date_from <= date_to else (date_to, date_from)
+    return last_n_days(DEFAULT_WINDOW_DAYS)
+
+
+def fetch_entity(
+    entity_id: str,
+    *,
+    user_id: UUID,
+    project_id: UUID | None,
+    date_from: str = "",
+    date_to: str = "",
+) -> dict[str, Any]:
+    """Fetch one catalog entity for this project. Never raises.
+
+    Returns either ``{"status": "ok", ...}`` with the data, or a status the
+    agent can act on: ``unknown_entity``, ``needs_account``, ``not_connected``,
+    or ``fetch_failed``.
+    """
+    spec = fetch_specs().get(entity_id)
+    if spec is None:
+        return {
+            "status": "unknown_entity",
+            "entity_id": entity_id,
+            "message": f"No such entity. Available: {', '.join(known_entities())}",
+        }
+
+    from db.session import get_session as db_session
+    from service.connector_access import (
+        STATUS_BOUND,
+        get_data_source,
+        resolve_read_credentials,
+    )
+
+    # The schedulers are a vendor key on the project's owner, not a connector
+    # credential on the user, so they resolve their own way.
+    if spec.connector_id == PUBLISHERS_SOURCE:
+        return fetch_publishers(spec, project_id=project_id, date_from=date_from, date_to=date_to)
+
+    with next(db_session()) as db:
+        source = get_data_source(db, spec.connector_id, user_id=user_id, project_id=project_id)
+        if source is None or source.status != STATUS_BOUND or not source.account_id:
+            return _not_ready(spec, source)
+        account_id = source.account_id
+        creds = resolve_read_credentials(
+            db,
+            user_id=user_id,
+            project_id=project_id,
+            connector_type=spec.connector_id,
+            account_id=account_id,
+        )
+
+    # Google-shaped connectors need a refresh token; manual-credential
+    # connectors hand back their own blob, so "anything stored" is the test.
+    from service.connector_access import _GOOGLE_SHAPED
+
+    connected = creds.get("refresh_token") if spec.connector_id in _GOOGLE_SHAPED else bool(creds)
+    if not connected:
+        return {
+            "status": "not_connected",
+            "entity_id": entity_id,
+            "connector_id": spec.connector_id,
+            "message": (
+                f"{spec.connector_id} has no usable credentials stored. Ask the user to "
+                "reconnect it with RequestConnection."
+            ),
+        }
+
+    window_from, window_to = resolve_window(date_from, date_to)
+    try:
+        data = spec.call(account_id, window_from, window_to, creds)
+    except WindowUnsupported as exc:
+        return {
+            "status": "window_unsupported",
+            "entity_id": entity_id,
+            "connector_id": spec.connector_id,
+            "account_id": account_id,
+            "date_from": window_from,
+            "date_to": window_to,
+            "message": (
+                f"{spec.connector_id} {exc}. Do not retry this window — compare inside "
+                "the most recent days, or say the comparison is unavailable for this source."
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001 — reported to the agent, never raised
+        logger.warning("insights: fetch %s failed", entity_id, exc_info=True)
+        if classify_error(exc) is ErrorCode.CONNECTOR_EXPIRED:
+            # A revoked or expired grant is not a fetch that failed; it is a
+            # source that is gone until a human reconnects it. Said as such,
+            # so the agent stops there instead of trying the next entity on
+            # the same dead token and reporting "an API error".
+            return {
+                "status": "reauth_required",
+                "entity_id": entity_id,
+                "connector_id": spec.connector_id,
+                "account_id": account_id,
+                "message": (
+                    f"{spec.connector_id} rejected its stored credential (expired or "
+                    "revoked). Nothing from this source can be fetched until the user "
+                    "reconnects it in the Toolbox — call RequestConnection "
+                    "if the analysis needs it, and do not fetch from it again this session."
+                ),
+            }
+        return {
+            "status": "fetch_failed",
+            "entity_id": entity_id,
+            "connector_id": spec.connector_id,
+            "account_id": account_id,
+            "date_from": window_from,
+            "date_to": window_to,
+            "message": (
+                f"{spec.connector_id} returned an error: {safe_excerpt(exc)}. Do not retry the "
+                "same call — say what you could not fetch and carry on."
+            ),
+        }
+
+    from agents.insights.totals import summarise
+
+    # A day-count fetcher says what it read; that window is the one reported,
+    # because the caption on a number has to be the window the number covers.
+    read = data.pop(_READ_WINDOW_KEY, None) if isinstance(data, dict) else None
+    note: dict[str, str] = {}
+    if read and tuple(read) != (window_from, window_to):
+        window_from, window_to = read
+        note = {"window_note": "This source reads the most recent days; the window is the one it read, not the one asked for."}
+
+    return {
+        "status": "ok",
+        "entity_id": entity_id,
+        "connector_id": spec.connector_id,
+        "account_id": account_id,
+        # The window travels with the data deliberately: a number without its
+        # window is the single easiest way to state something false.
+        "date_from": window_from,
+        "date_to": window_to,
+        **note,
+        # Before the rows, so a cut payload keeps them: the totals are the
+        # numbers a brief quotes, and Duct adds them up, not the model.
+        **summarise(entity_id, data),
+        "data": data,
+    }
+
+
+def _not_ready(spec: FetchSpec, source: Any) -> dict[str, Any]:
+    """The connector is missing or unbound — say which, and what fixes it."""
+    if source is None or source.status == "not_connected":
+        return {
+            "status": "not_connected",
+            "entity_id": spec.entity_id,
+            "connector_id": spec.connector_id,
+            "message": (
+                f"{spec.connector_id} is not connected to this project. Use "
+                "RequestConnection if the analysis needs it, or continue without it "
+                "and say so."
+            ),
+        }
+    return {
+        "status": "needs_account",
+        "entity_id": spec.entity_id,
+        "connector_id": spec.connector_id,
+        "message": (
+            f"{spec.connector_id} is connected but this project has not chosen an "
+            "account. Call SelectAccount first, then fetch again."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The schedulers: social post metrics
+# ---------------------------------------------------------------------------
+
+def _publishers_unreachable(account_id: str, date_from: str, date_to: str, creds: dict) -> dict:
+    """Never called: ``fetch_entity`` branches to :func:`fetch_publishers`
+    before resolving connector credentials. Exists so the catalog's entity has
+    a dispatch entry and the catalog contract test can see it."""
+    raise RuntimeError("social_post_metrics is fetched through service/publishers, not a connector")
+
+
+def _in_window(posted_at: str, date_from: str, date_to: str) -> bool:
+    day = (posted_at or "")[:10]
+    return bool(day) and date_from <= day <= date_to
+
+
+def fetch_publishers(
+    spec: FetchSpec, *, project_id: UUID | None, date_from: str = "", date_to: str = ""
+) -> dict[str, Any]:
+    """Every post the project's schedulers report, inside the window by
+    posting date. Never raises; the statuses mirror a connector's so the
+    agent reacts the same way ("not_connected" names Content → Accounts)."""
+    import asyncio
+
+    from db.session import get_session as db_session
+    from models.project import Project
+    from service.publishers.metrics import as_rows, collect_reported_posts, owner_has_scheduler
+
+    window_from, window_to = resolve_window(date_from, date_to)
+    not_connected = {
+        "status": "not_connected",
+        "entity_id": spec.entity_id,
+        "connector_id": spec.connector_id,
+        "message": (
+            "No scheduler is connected to this project. The owner connects PostBridge or "
+            "Zernio in Content → Accounts; until then there are no post numbers to read."
+        ),
+    }
+    with next(db_session()) as db:
+        proj = db.get(Project, project_id) if project_id is not None else None
+        if proj is None or not owner_has_scheduler(db, proj.user_id):
+            return not_connected
+        # fetch_entity runs on a worker thread with no loop of its own, so the
+        # async adapters get one here; the DB reads inside happen first.
+        collected = asyncio.run(collect_reported_posts(db, proj))
+
+    if collected.all_failed:
+        spec_failed, exc = collected.failures[0]
+        return {
+            "status": "fetch_failed",
+            "entity_id": spec.entity_id,
+            "connector_id": spec.connector_id,
+            "date_from": window_from,
+            "date_to": window_to,
+            "message": (
+                f"{spec_failed.label} returned an error: {safe_excerpt(exc)}. Do not retry the "
+                "same call — say the post numbers could not be read and carry on."
+            ),
+        }
+
+    every = as_rows(collected)
+    rows = [r for r in every if _in_window(r["posted_at"], window_from, window_to)]
+    undated = sum(1 for r in every if not r["posted_at"])
+    data: dict[str, Any] = {
+        "rows": sorted(rows, key=lambda r: r["views"], reverse=True),
+        "rows_available": len(every),
+        "schedulers": [s.id for s in collected.asked],
+        "platforms": sorted({r["platform"] for r in rows if r["platform"]}),
+        "notices": [
+            f"{s.label} did not answer: {safe_excerpt(exc)}" for s, exc in collected.failures
+        ],
+    }
+    if undated:
+        data["undated_rows"] = undated
+        data["data_quality"] = [
+            f"{undated} posts carry no posting date at the scheduler and are left out of the window."
+        ]
+
+    from agents.insights.totals import summarise
+
+    return {
+        "status": "ok",
+        "entity_id": spec.entity_id,
+        "connector_id": spec.connector_id,
+        "date_from": window_from,
+        "date_to": window_to,
+        **summarise(spec.entity_id, data),
+        "data": data,
+    }

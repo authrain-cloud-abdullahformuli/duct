@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""
+Validates every marketing HTML page under site/ against the Duct <head> checklist
+(see CLAUDE.md).
+
+Exits non-zero if any required element is missing or out of spec. Warnings
+(a meta description outside 140–160 characters) print but do not fail.
+"""
+
+import sys
+import os
+import glob
+import json
+from urllib.parse import urlsplit
+from html.parser import HTMLParser
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# The i18n generator owns the list of language trees and the JSON-LD types it
+# leaves without a language. Reading both from it means a language added there
+# is checked here without a second edit, and the two scripts cannot disagree
+# about which objects need `inLanguage`.
+sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+from build_site_i18n import LD_ENTITY_TYPES, LOCALES  # noqa: E402
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+# Pages where canonical AND meta description are set dynamically by JS.
+# Empty since blog posts became static (scripts/build_blog.py); kept because
+# the next dynamic page should be declared here rather than special-cased.
+DYNAMIC_META = set()
+
+# Error/utility pages — skip all SEO checks (no canonical, OG, Twitter needed).
+ERROR_PAGES = {"404.html"}
+
+# The home page in each language is the first crumb of every trail, so it is
+# the one page that carries no BreadcrumbList.
+HOME_PAGES = {"index.html"} | {f"{prefix}/index.html" for prefix in LOCALES}
+
+# Noindex pages kept only so old links keep working. No search result shows
+# them, so they carry no structured data and their description is never a
+# snippet. blog/post.html forwards ?slug= links from before posts were
+# pre-rendered.
+REDIRECT_SHIMS = {"blog/post.html"}
+
+# Google cuts a snippet at about 160 characters, and a much shorter one leaves
+# room in the result unused. A warning, not a failure: bringing a page into
+# range is a copy change, and a copy change means a `make i18n` run that has
+# no place in an unrelated PR.
+DESCRIPTION_MIN, DESCRIPTION_MAX = 140, 160
+
+# Width and height let Facebook and LinkedIn draw the card on the first share
+# instead of leaving it blank until their crawler has fetched the image once.
+REQUIRED_OG = {
+    "og:type", "og:url", "og:title", "og:description", "og:image",
+    "og:image:width", "og:image:height", "og:site_name",
+}
+REQUIRED_TWITTER = {"twitter:card", "twitter:title", "twitter:description", "twitter:image"}
+
+CANONICAL_BASE = "https://getduct.ai"
+
+# ── HTML parser ───────────────────────────────────────────────────────────────
+
+
+GTM_HOST = "googletagmanager.com"
+
+
+def _is_gtm_host(src: str) -> bool:
+    """Whether a script or frame loads from Google Tag Manager. Read off the
+    parsed host, not the raw string, so a path that merely mentions the domain
+    does not count and a lookalike host does not slip past."""
+    host = (urlsplit(src).hostname or "").lower()
+    return host == GTM_HOST or host.endswith("." + GTM_HOST)
+
+class PageChecker(HTMLParser):
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self.errors = []
+        self.warnings = []
+
+        self.has_canonical = False
+        self.canonical_href = None
+        self.description = None
+        self.has_robots = False
+        self.og_props = set()
+        self.twitter_props = set()
+        self.has_css = False
+        self.has_config_js = False
+        self.has_duct_js = False
+        self.duct_js_defer = False
+        self.loads_google_tags = False
+        self.ld_blocks = []
+        self._in_ld = False
+        # Every local image the page references, src and srcset alike. A shot
+        # variant that was never generated is a broken picture, not a slow one.
+        self.image_refs = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+
+        if tag in ("script", "iframe") and _is_gtm_host(attrs.get("src") or ""):
+            self.loads_google_tags = True
+
+        if tag == "link":
+            rel = attrs.get("rel", "")
+            href = attrs.get("href", "")
+            if rel == "canonical":
+                self.has_canonical = True
+                self.canonical_href = href
+            if rel == "stylesheet" and "duct.css" in href:
+                self.has_css = True
+
+        if tag == "meta":
+            name = attrs.get("name", "").lower()
+            prop = attrs.get("property", "").lower()
+            content = attrs.get("content", "")
+
+            if name == "description":
+                self.description = content
+            if name == "robots":
+                self.has_robots = True
+            if prop in REQUIRED_OG:
+                self.og_props.add(prop)
+            if name in REQUIRED_TWITTER:
+                self.twitter_props.add(name)
+
+        if tag == "img":
+            if attrs.get("src"):
+                self.image_refs.append(attrs["src"])
+            for cand in attrs.get("srcset", "").split(","):
+                cand = cand.strip().split(" ")[0]
+                if cand:
+                    self.image_refs.append(cand)
+
+        if tag == "script":
+            if attrs.get("type", "").lower() == "application/ld+json":
+                self._in_ld = True
+            src = attrs.get("src", "")
+            if "config.js" in src:
+                self.has_config_js = True
+            if "duct.js" in src:
+                self.has_duct_js = True
+                self.duct_js_defer = "defer" in attrs
+
+    def handle_data(self, data):
+        if self._in_ld:
+            self.ld_blocks.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self._in_ld = False
+
+    def run_checks(self, rel_path):
+        is_dynamic = rel_path in DYNAMIC_META
+        is_error = rel_path in ERROR_PAGES
+        is_shim = rel_path in REDIRECT_SHIMS
+        is_translated = rel_path.split("/")[0] in LOCALES
+
+        # Error pages only need CSS/JS; skip all SEO checks.
+        if is_error:
+            return
+
+        # Determine expected asset prefix. Any page one directory down — blog,
+        # changelog — reaches the shared assets through "../".
+        is_nested = "/" in rel_path
+        asset_prefix = "../assets/" if is_nested else "assets/"
+
+        # Canonical
+        if not is_dynamic:
+            if not self.has_canonical:
+                self.errors.append("Missing <link rel='canonical'>")
+            elif self.canonical_href and not self.canonical_href.startswith(CANONICAL_BASE):
+                self.errors.append(f"Canonical does not start with {CANONICAL_BASE}: {self.canonical_href!r}")
+            elif self.canonical_href and self.canonical_href.endswith(".html"):
+                self.errors.append(f"Canonical should use clean URL (no .html): {self.canonical_href!r}")
+
+        # Description (dynamic pages set this via JS). Length is held on the
+        # English source only: a translation's length is the catalogue's
+        # outcome (German runs a third longer, Japanese far shorter), not
+        # something to fix on the generated page.
+        if not is_dynamic:
+            if self.description is None:
+                self.errors.append("Missing <meta name='description'>")
+            elif not (is_translated or is_shim) and not (
+                DESCRIPTION_MIN <= len(self.description) <= DESCRIPTION_MAX
+            ):
+                self.warnings.append(
+                    f"Meta description is {len(self.description)} characters; "
+                    f"keep it {DESCRIPTION_MIN}–{DESCRIPTION_MAX}"
+                )
+
+        # Robots
+        if not self.has_robots:
+            self.errors.append("Missing <meta name='robots'>")
+
+        # JSON-LD. A malformed block is silently dropped by every consumer, so a
+        # page keeps rendering while its structured data is simply gone — which
+        # is exactly the failure an answer engine punishes and nobody notices.
+        #
+        # `inLanguage` is required on each top-level object, the unit the i18n
+        # generator stamps per language; a nested Question or ListItem is in
+        # its container's language, and a Person or Organization has none.
+        # Without it a crawler guesses the language of the block's claims from
+        # their text. An @graph wrapper has no @type and fails on that first,
+        # so no object escapes the rule by being nested one level down.
+        ld_types = set()
+        for i, block in enumerate(self.ld_blocks):
+            try:
+                parsed = json.loads(block)
+            except json.JSONDecodeError as exc:
+                self.errors.append(f"JSON-LD block {i + 1} is not valid JSON: {exc}")
+                continue
+            for obj in parsed if isinstance(parsed, list) else [parsed]:
+                if not isinstance(obj, dict):
+                    self.errors.append(f"JSON-LD block {i + 1} is not an object")
+                    continue
+                if "@type" not in obj:
+                    self.errors.append(f"JSON-LD block {i + 1} has no @type")
+                    continue
+                types = obj["@type"] if isinstance(obj["@type"], list) else [obj["@type"]]
+                ld_types.update(types)
+                if not obj.get("inLanguage") and not LD_ENTITY_TYPES.issuperset(types):
+                    self.errors.append(
+                        f"JSON-LD block {i + 1} ({', '.join(types)}) has no inLanguage"
+                    )
+
+        # A malformed block counts as absent here, which is what it is to Google.
+        if rel_path not in HOME_PAGES and not is_shim and "BreadcrumbList" not in ld_types:
+            self.errors.append("Missing JSON-LD BreadcrumbList (every page below a home page needs one)")
+
+        # OG tags
+        missing_og = REQUIRED_OG - self.og_props
+        if missing_og:
+            self.errors.append(f"Missing OG properties: {', '.join(sorted(missing_og))}")
+
+        # Twitter tags
+        missing_tw = REQUIRED_TWITTER - self.twitter_props
+        if missing_tw:
+            self.errors.append(f"Missing Twitter meta tags: {', '.join(sorted(missing_tw))}")
+
+        # Images resolve
+        for ref in self.image_refs:
+            if ref.startswith(("http://", "https://", "data:", "//")):
+                continue
+            path = ref.split("?")[0]
+            base = self.site_root if path.startswith("/") else self.page_dir
+            target = os.path.normpath(os.path.join(base, path.lstrip("/")))
+            if not os.path.isfile(target):
+                self.errors.append(f"Image not found: {ref}")
+
+        # CSS
+        if not self.has_css:
+            self.errors.append(f"Missing <link rel='stylesheet' href='{asset_prefix}duct.css'>")
+
+        # config.js + duct.js
+        if not self.has_config_js:
+            self.errors.append(f"Missing <script src='{asset_prefix}config.js'>")
+        if not self.has_duct_js:
+            self.errors.append(f"Missing <script src='{asset_prefix}duct.js'>")
+        elif not self.duct_js_defer:
+            self.errors.append("duct.js script tag is missing the 'defer' attribute")
+
+        # Cloudflare's Google tag gateway already adds GTM and GA4 to every page
+        # at the edge, so a copy in the source counts every visit twice.
+        if self.loads_google_tags:
+            self.errors.append("Loads Google Tag Manager; Cloudflare's tag gateway already adds it at the edge, so this counts every visit twice")
+
+
+# ── Runner ────────────────────────────────────────────────────────────────────
+
+def check_file(filepath, site_root):
+    rel = os.path.relpath(filepath, site_root)
+    with open(filepath, encoding="utf-8") as f:
+        content = f.read()
+
+    checker = PageChecker(rel)
+    checker.site_root = site_root
+    checker.page_dir = os.path.dirname(filepath)
+    checker.feed(content)
+    checker.run_checks(rel)
+    return checker.errors, checker.warnings
+
+
+def main():
+    site_root = os.path.join(REPO_ROOT, "site")
+    # The generated language trees (scripts/build_site_i18n.py) hold the same
+    # pages under /es/, /de/ … and must pass the same checks: a localised page
+    # with an .html canonical or a broken OG card is still a broken page.
+    html_files = sorted(
+        glob.glob(os.path.join(site_root, "*.html")) +
+        glob.glob(os.path.join(site_root, "blog", "*.html")) +
+        glob.glob(os.path.join(site_root, "changelog", "*.html")) +
+        glob.glob(os.path.join(site_root, "tools", "*.html")) +
+        glob.glob(os.path.join(site_root, "integrations", "*.html")) +
+        [f for d in LOCALES for f in glob.glob(os.path.join(site_root, d, "*.html"))] +
+        [f for d in LOCALES for sub in ("tools", "integrations")
+         for f in glob.glob(os.path.join(site_root, d, sub, "*.html"))]
+    )
+
+    total_errors = 0
+    total_warnings = 0
+
+    for filepath in html_files:
+        rel = os.path.relpath(filepath, site_root)
+        errors, warnings = check_file(filepath, site_root)
+
+        if errors or warnings:
+            print(f"\n{'─' * 60}")
+            print(f"  {rel}")
+            print(f"{'─' * 60}")
+            for e in errors:
+                print(f"  ✗ ERROR   {e}")
+            for w in warnings:
+                print(f"  ⚠ WARNING {w}")
+
+        total_errors += len(errors)
+        total_warnings += len(warnings)
+
+    print(f"\n{'═' * 60}")
+    print(f"  Checked {len(html_files)} pages — "
+          f"{total_errors} error(s), {total_warnings} warning(s)")
+    print(f"{'═' * 60}\n")
+
+    if total_errors:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

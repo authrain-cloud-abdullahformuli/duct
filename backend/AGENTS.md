@@ -1,0 +1,1565 @@
+# Duct Backend — agent instructions
+
+Python reporting and synthesis backend for Duct.
+
+## Product role
+
+Per the MVP plan (duct-cloud, private), this backend is the actual product engine:
+
+- read from client-owned destinations with read-only access
+- normalize data into typed internal models
+- compute signals and comparisons
+- synthesize findings into structured output
+- deliver via email and alerts
+
+The web app owns HTML rendering. The backend produces JSON payloads only — it does not render HTML.
+
+## MVP architecture
+
+### Current stack
+
+- **AI synthesis:** Every agent runs on V1 (LangChain 1.x / `deepagents`) — the only
+  engine. Engine selection is still per request, defaulting from the
+  `generate_engine` env var, because stored preferences and requests carry the
+  string; `resolve_engine` folds any other value back to `v1`.
+
+  **The consolidation is finished.** Per the engine consolidation review
+  (duct-cloud, private), every agent moved to one harness — LangChain 1.x /
+  `deepagents` — because customers bring their own model (OpenAI / Gemini /
+  Claude / xAI / OpenRouter, an Ollama server, or any OpenAI-compatible endpoint) and the Claude Agent SDK was Anthropic-only by
+  design (upstream issue #410, closed `not planned`). Insights
+  (`agents/insights/v1/runner.py`) and content (`agents/content/v1/runner.py`)
+  are `deepagents` sessions; audit's runner is on the `create_agent` rung
+  (`build_session_agent`) driven by the same shared `DeepSession`.
+
+  **V3 (Claude Agent SDK) was removed** last, because it was the hardest: the
+  project-scoped audit ran it unconditionally, and four capabilities existed
+  nowhere else. Each was ported first — a chat loop and `run_resume` (both
+  DeepSession's, which audit now uses), the project artifact library
+  (`agents/core/artifact_tools.py`), and the competitor-research pass
+  (`agents/audit/enrichment.py`, now `create_agent` + web tools on any
+  provider). Verified live on Gemini and OpenAI against the audit rubric before
+  the delete.
+
+  One capability genuinely went with it, deliberately: a Claude *subscription*
+  (`sk-ant-oat…`) authenticates only through the CLI, and the Messages API
+  rejects it (Anthropic disabled third-party OAuth in Feb 2026). Claude needs an
+  ANTHROPIC_API_KEY everywhere now. `agents/content/persistence.py` detects the
+  token prefix and says so once rather than failing a call per turn.
+
+  **How content and insights got there**, recorded because the moves are the
+  pattern any future port follows. Content V3 was removed once its port landed. What moved, and where it went:
+  the SDK's `Agent` tool became `deepagents` sub-agents dispatched through `task`
+  (`agents/content/subagents/`, now framework-free dicts); the in-process MCP server
+  became the LangChain binder `build_content_tools_lc` with the tool bodies
+  unchanged; the CLI's `WebSearch` / `WebFetch` became `agents/core/web_tools.py`
+  — both as Duct tools, on the rule image generation already set: **a capability
+  the running model may not have is a Duct tool, not a provider feature every
+  model must support.** The one exception is a built-in that survives a real
+  tool-calling loop, and Anthropic's is the only one that does, so it is bound
+  there (versioned per model — Opus 5.5 and Sonnet 5.5 take `web_search_20260209`,
+  the rest the basic variant). Every other provider gets Duct's own `WebSearch`,
+  an ordinary function tool over an isolated grounded Gemini call
+  (`service/google/gemini/search.py`), because Gemini refuses `google_search`
+  alongside function declarations on 2.5 outright and on 3.x without a
+  `tool_config` flag that langchain-google-genai drops whenever `tool_choice` is
+  set. `tests/test_web_search.py` holds that matrix, measured, as `live` tests;
+  `AskUserQuestion` became a checkpointed `interrupt()`, so a question survives a
+  redeploy; and the thread is keyed on the conversation, so a resume continues it
+  rather than re-priming from the transcript (the DB re-prime remains for
+  conversations recorded before the thread was durable).
+
+  **Images are a second provider inside a content run, and not a fixed one.**
+  The conversation runs on whatever key the user brought for chat; the pictures
+  run on whatever *image-capable* key they brought — Gemini, OpenAI, xAI or
+  OpenRouter, in that order of preference
+  (`agents/models.IMAGE_PROVIDER_ORDER`; the gateway is last because a
+  first-party key for the same model is one hop fewer). The seam is
+  `service/images/`: one request shape, one `ImageAPIError`, one factory
+  (`image_client_for`), four backends (`service/google/gemini/client.py`,
+  `service/openai/images.py`, `service/xai/images.py`,
+  `service/openrouter/images.py`). `routes/content.py`
+  resolves the image run once per session (`agents/engines.resolve_image_run`)
+  and stashes provider + key on it; the tools spend that or decline, and the
+  decline names every provider that would unblock the user. The agent's tool
+  schema still defaults to the Gemini model id, so `image_model_for` swaps in
+  the resolved provider's default rather than refusing — the agent asked for an
+  image, not a Google image. Adding a backend means a client module, an
+  `ImageModel` entry whose prefix `provider_of` recognises, a
+  `DEFAULT_IMAGE_MODELS` row, and a branch in
+  the factory; `/providers/status` and `/models/catalogue` derive the settings
+  page's Images row from those same tables, so nothing in the browser lists a
+  model.
+
+  **The OpenRouter backend is a short list, not a catalogue.** They front 52
+  image models; `ImageModel` names four, because it is a Pydantic enum in the
+  content agent's tool schema and opening it to free-form slugs — the way the
+  *chat* catalogue deliberately does — would let a run invent a model and fail
+  on a slide. Three of the four reach vendors no first-party key here can
+  (Seedream, Flux, Recraft, the last emitting SVG); the fourth is the cheap
+  Gemini workhorse. Adding one is an enum line plus a `_CAPS` row in
+  `service/openrouter/images.py`, and that row is not optional: the four models
+  disagree about `resolution`, ratio lists and how many images one call may
+  return, so every request is clamped to the table and the clamp is logged
+  rather than sent hopefully. The ChatGPT-subscription route (`agents/core/codex.py`) is deliberately
+  not an image backend: it can draw through Codex's hosted tool, but OpenAI's
+  own docs scope subscription sign-in to Codex products and it is Plus-and-up,
+  per-minute-quota'd, and unofficial — the wrong thing to put a customer's slide
+  deck on.
+
+  **Video is the same seam, with one rule images do not need** (issue #284).
+  `service/videos/` mirrors `service/images/`: one request shape, one
+  `VideoAPIError` carrying a *code* (a filter refusal, a refused realistic face,
+  a timeout, no credit — each asks the agent for something different), one
+  factory, two backends — Veo on a Gemini key (`service/google/gemini/veo.py`)
+  and Seedance through OpenRouter (`service/openrouter/videos.py`), resolved by
+  `agents/engines.resolve_video_run` on the image rules and a `video_model`
+  saved pick. `service/videos/caps.py` fits every request to what its model
+  makes (lengths, ratios, 1080p only on an 8 s Veo clip) and says so in
+  sentences the agent relays. The rule images do not need: **a clip takes
+  minutes and costs dollars**, so `generate_video` holds no DB connection while
+  it waits, bills each clip as a `media`-scope `TOKEN_USAGE` (Veo from
+  `VIDEO_PRICE_PER_SECOND`, Seedance from the cost OpenRouter reports), and the
+  content runner caps it at three a turn (`RunLimits.per_tool_run_limits`).
+  A clip is a `content_assets` row with a `video/*` type; `content_posts.video`
+  names the take that publishes (`agents/content/video.py`), and publishing a
+  video post sends that file alone.
+
+  Two consequences, stated rather than discovered later. **Content on Claude now
+  needs an API key** — `routes/content.py` refuses the subscription credential with
+  the same 402 the browser already handles. And **the model only sees the images it
+  generates on Anthropic**: image blocks inside a tool result are accepted there and
+  rejected by the OpenAI chat API, so `VISION_PROVIDERS` decides whether the tools
+  return pictures or URLs, and the system prompt says which. Where it does see
+  them, `SeenImagePruneMiddleware` (`agents/core/lc.py`) swaps the base64 for a
+  note after the model call that looked at it: the thread is durable and the
+  Postgres saver writes the whole `messages` channel per superstep, so a
+  picture left in state would be copied into every later checkpoint.
+
+  **Insights V3 was removed** earlier for a different reason: nothing dispatched it.
+  Both live routes (`routes/generate.py`, `routes/agents.py`) drive
+  `AutonomousInsightsRunner`, while the V3 runner still claimed parity with the older
+  `GenerateInsightsAgent` fetch/synthesize pair — an interface the routes had already
+  left behind.
+
+  **`GenerateInsightsAgent` and its tool registry were removed too**, for the third
+  time for the same reason: no route dispatched them. With it went
+  `agents/insights/tools.py` (per-connector `StructuredTool` factories) and
+  `agents/insights/registry.py` (`goal_relevance` scoring that ranked a set of 12
+  entities down to 8 — selection pressure that never existed). The autonomous runner
+  reaches every entity through `FetchData(entity_id=…)` against the catalog, so the
+  catalog's dispatch key was renamed `tool` → `fetch_fn`: it names an internal
+  function, and only looked like a tool reference while those tools existed.
+
+  **A ChatGPT plan is now a live OpenAI credential**, wired where the note above
+  said it should be: `agents/core/lc.resolve_chat_model` sends a subscription
+  credential to `_ChatOpenAICodex` (`agents/core/codex.py`), so every runner gets
+  it. The credential is the *access token* the desktop shell minted — it arrives
+  in `X-Provider-OpenAI` beside `X-OpenAI-Account-Id`, `service/auth.py` packs the
+  two into one string, and the shape (a JWT, not `sk-…`) is what routes it.
+  `ProviderKey.source` is `subscription`; it is the user's own plan, never billed
+  to Duct. The refresh token never reaches the backend, `PUT /providers/openai/key`
+  refuses to store a token, and background jobs (no request, no header) still
+  need an API key. `CHATGPT_AUTH_ENABLED=false` is the kill switch: the app
+  reads it from `/api/providers/status` to hide the sign-in, and
+  `get_user_provider_keys` drops a plan token it is still sent, so a shell that
+  signed in earlier cannot keep using it — the Codex backend is undocumented
+  and the path can stop working without notice.
+
+  So a shared change is made once. Claude remains a first-class *model* through
+  V1, which is why retiring its SDK cost no model coverage.
+
+  **Which model, on whose key, is one function.** `agents/engines.resolve_run_model`
+  is engine → provider → model → key for every V1 runner — including the rule that a
+  lone bring-your-own key chooses its own provider. It lived in
+  `agents/insights/setup.py` until content became the second runner that needed it;
+  a second copy of that rule is the copy that eventually spends the wrong key.
+
+  **V2 (Google ADK) was removed.** Not on framework merit — ADK is actively developed and
+  Google-backed — but because nothing dispatched its runner: `routes/generate.py` had been
+  hardcoded to V1, so selecting "v2" in the UI silently served V1 while claiming otherwise.
+  Its differentiators (Vertex Agent Engine deploy, `adk web`, native A2A, built-in evals)
+  do not intersect this stack, and its weakest axis — provider breadth — is exactly what V1
+  exists for. Its defaults were identical to V1's, so `resolve_engine` folding a stored
+  `"v2"` back to V1 changed no behaviour. `agents/insights/schema_compat.py` outlived it
+  for a while — it was never ADK-specific — but it went with insights V3, its last caller.
+  V1 asks the provider for a typed object via `with_structured_output`, so nothing needs
+  to parse a synthesis out of raw text any more.
+- **Ingestion:** Direct Google API clients (`google-ads`, `google-analytics-data`, `google-api-python-client`). Async concurrent fetching in `service/pipeline.py`.
+- **Normalization:** Lightweight Python pipeline — raw API response → typed Pydantic/SQLModel brief models. No query layer or transforms yet.
+- **Database:** PostgreSQL on Railway — SQLModel ORM, Alembic migrations, `psycopg` driver.
+- **Auth:** JWT for users; Google OAuth for connector linking (Ads, GA4, GSC, Sign-In), and a GitHub App for GitHub, with a pasted fine-grained token where no App is configured (self-host). Project access is by membership (`project_members`), not by `projects.user_id` — always go through `service/membership.py`.
+
+  **`validate_api_key` is not an authorization boundary.** `DUCT_API_KEY` ships to
+  the browser as `NEXT_PUBLIC_DUCT_API_KEY`, so it proves "this is the Duct app"
+  and never "this caller owns that row". A router mounted behind it *looks*
+  protected and is not. Any endpoint that reads or writes a project-scoped row
+  therefore needs `get_current_user` **plus** a membership check on top:
+
+  - a project named in the request → `get_project_for_user`
+  - a row addressed by its own id → `get_project_row_for_user`, which reads the
+    project off the **row**. An endpoint that takes a row id and trusts a
+    `project_id` from the request is letting the caller vouch for themselves.
+  - a listing → scope it to the caller (`accessible_projects`), never to an
+    unfiltered query parameter.
+
+  404, not 403, for a non-member, so the reply is not an oracle for which ids
+  exist. `routes/artifacts.py` is the reference; `routes/content.py` declares
+  `get_current_user` **on the router** so endpoint 45 cannot be written without
+  it, and `tests/test_content_access.py` asserts that property directly.
+- **Email:** `service/email/` — one seam (`send_email`) over swappable providers in
+  `service/email/providers/`, the only place a mail vendor is named. `EMAIL_PROVIDER`
+  picks one; unset takes the first with credentials (Cloudflare, then SMTP) and
+  falls back to `console`, which logs, so dev/CI/self-host need no vendor account.
+  Same shape as the app's analytics seam, for the same reason: a fork swaps one file.
+  SMTP is the open-standard provider — any mail server or vendor relay — and the
+  way to read local mail as it would arrive: the "Mailpit" editor task (`brew
+  install mailpit`) catches it on `:1025` with an inbox at `http://localhost:8025`.
+  Resend's own provider was removed in favour of it (#460); Resend takes SMTP too.
+- **Observability:** PostHog for product events, error tracking and AI call
+  metadata, behind one seam (`service/analytics.py`, the only file that
+  imports PostHog): routes call `capture_event`, `get_current_user` attributes
+  the request with `identify_user` (the account UUID, the same distinct id the
+  app sends), uncaught exceptions are caught by the ASGI middleware and
+  `logger.exception` records by a root handler, and the AI callback runs in
+  privacy mode, so prompts and replies never leave. Off without
+  `POSTHOG_API_KEY`, and off on a loopback `API_PUBLIC_URL` unless
+  `POSTHOG_ENABLE_LOCALHOST` is set. And OpenTelemetry tracing of every
+  agent turn, model call and tool call (`agents/core/telemetry.py`), shipped
+  over OTLP/HTTP to whatever `OTEL_EXPORTER_OTLP_ENDPOINT` names and off when
+  it is unset. Locally that is Jaeger (`scripts/jaeger.sh`, Apache-2.0; it
+  replaced Phoenix, whose Elastic licence is not open source): the "App + API
+  + Jaeger" and "Desktop + API + Jaeger" launch compounds start it
+  and point the API at `http://localhost:4318` (the desktop window talks to
+  that same API, so it needs no exporter of its own), and every FetchData and verifier
+  dispatch is a span with its own latency. Jaeger reads the `gen_ai.*`
+  attributes, lists the spans under the `duct-backend` service, and keeps them
+  on disk for a week. Its MCP server is registered in `.mcp.json` at
+  `/api/ai/mcp/` on the UI port (16686), so an agent can read the traces of a
+  slow run instead of querying the transcript table. Every log line carries a request
+  id (`[a1b2c3d4]`, from `X-Request-Id` when the caller sends one, minted
+  otherwise, echoed in the response); an agent run logs under the id of the
+  request that created its session, so one grep follows one press of Send.
+  Each turn ends with a `turn 198.0s: 4 tool calls …` line naming the slowest
+  three, which answers "where did the time go" without a SQL script.
+- **Response headers:** `utils/security_headers.py` gives every response
+  `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
+  `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, the
+  last because nothing here is a page. An HTML response gets
+  `frame-ancestors 'none'` alone, for FastAPI's `/docs`, which loads Swagger
+  UI from a CDN. A route that needs a different value sets the header itself
+  and the middleware leaves it. Pure ASGI like `AccessLogMiddleware`, so SSE streams
+  pass through unbuffered; `tests/test_security_headers.py` holds both.
+- **Hosting:** Railway — auto-deploys from `main` via GitHub integration; `railway.json` defines Railpack build + uvicorn start.
+  `railpack.json` sits beside it and configures the **builder**, where
+  `railway.json` configures **Railway**. It exists for one line —
+  `deploy.aptPackages: ["...", "libexpat1"]` — and every character of it is
+  load bearing, including the `"..."`. Railpack builds with a mise-installed
+  CPython, then assembles a slim runtime image carrying only the apt packages
+  it inferred from the dependency graph (`libpq5`, from psycopg). That
+  interpreter is dynamically linked against `libexpat.so.1`; nothing in the
+  graph implies it, so without this the ELF loader fails before Python starts
+  and **the container dies on its first line**.
+  **`"..."` is not decoration.** Railpack arrays *replace* the inferred value
+  rather than extend it; `"..."` is its spread syntax. Writing
+  `["libexpat1"]` therefore drops `libpq5` and everything else Railpack
+  worked out.
+- **Runtime commands must name the venv binary, never `poetry run`.**
+  `startCommand` and `preDeployCommand` both run in the deploy image, and
+  `poetry` is not a real program there — it is a mise shim onto a private
+  virtualenv that mise built with the *builder* image's system interpreter.
+  Railpack copies `/mise/installs` into the runtime image but the runtime base
+  carries no system Python, so that interpreter is a dangling symlink and the
+  container dies with `Could not find platform independent libraries` /
+  `Failed to import encodings module` before poetry prints a single line.
+  Nothing in the message mentions poetry, which is why this cost three weeks
+  and two wrong fixes. The app's own `/app/.venv` is unaffected — it was built
+  by the mise CPython that *is* copied — so `/app/.venv/bin/uvicorn` and
+  `/app/.venv/bin/python` work where `poetry run` cannot. This surfaced when
+  Railpack's Debian base moved to trixie (2026-08-16); every backend deploy
+  between then and the fix failed identically, and production served a June
+  image for three months because a failed deploy leaves the old one running.
+  The other trap: the build **succeeds** and the image pushes, so Railway
+  reports a failed deployment that looks like a build failure and is not. Read
+  the *deploy* logs (`railway logs --deployment <id>`), not the build logs.
+  Also check the deployment is not `SKIPPED` — `railway.json`'s
+  `build.watchPatterns` gates whether a push builds at all, so a file it does
+  not list (this one, once) can leave a fix sitting on `main` doing nothing.
+  JSON has no comments, which is why this note lives here.
+- **CI:** GitHub Actions (`backend.yml`) — Ruff lint + pytest on every PR and push to `main`.
+- **Tests:** `make test` must stay offline and under two minutes; it is the
+  gate on every merge and the thing an agent runs after every change. Two
+  rules keep it that way. A test that needs a provider key, a network, or a
+  binary on `PATH` is marked `live` — a `skipif` on the key alone is not a
+  gate, because `get_configs()` reads `backend/.env.local`, so a developer with
+  a key there fires a paid, minutes-long call from a plain `pytest`. And the
+  V1 agent loop is driven by the fakes in `tests/fakes.py` (`ToolCallingFake`
+  and its failing variants, `fake_llm`, `tool_names`) plus the `emitted`
+  fixture in `conftest.py`: the real harness runs, only the model is canned.
+  Assert on events, tool names and payloads, not on prompt prose — a wording
+  test fails on every copy edit and catches nothing an eval would not.
+- **The offline suite cannot open a socket.** `conftest.py`'s autouse
+  `no_network` fixture raises on `socket.connect` for anything not marked
+  `live`, so a test that forgets to fake its transport fails naming the seam it
+  forgot rather than passing on the author's machine and nowhere else. It
+  blocks loopback too, deliberately: an agent sandbox or a corporate runner
+  exports `HTTPS_PROXY=http://localhost:<port>`, so a guard that waves loopback
+  through waves the whole internet through, silently, in exactly the
+  environments most likely to be holding a key.
+- **Fake at the seam the vendor gives you, and put the fake in
+  `tests/fakes.py`.** For the sync reporting connectors that is the vendor's own
+  `api()` wrapper; for the retry loop underneath them it is `service/rest.py`,
+  covered directly by `tests/test_rest_transport.py` because five connectors
+  share it and a regression there lands on all of them at once. For Google Ads
+  it is `FakeAdsClient`, which keeps the library's local machinery — `get_type`,
+  `enums`, `copy_from`, the GAPIC path helpers — and replaces only
+  `get_service`. That distinction is the point: a stub made of attribute bags
+  passes while the field is misspelled and the enum is not a member, which is
+  the whole class of bug worth catching in code that changes what a customer
+  spends. Building a real `GoogleAdsClient` refreshes OAuth against Google at
+  construction time, so `FakeAdsClient` is also the only offline way into those
+  executors at all. GA4 has the same problem for the same reason —
+  `discovery.build()` fetches the discovery document before it returns a client
+  — and `FakeDiscoveryService` answers the fluent chain by dotted call path
+  (`"properties.keyEvents.list"`). The GTM fake in `test_execution_policy.py`
+  stays where it is on purpose: it keeps container state so it can answer a read
+  that follows a write, which is a different job from replaying canned answers.
+- **A fetcher's test fakes the transport, not the client.** The client-level
+  fakes above are right for an executor, where the mutation it sends is what
+  matters. They never run the code that *builds* a read request, and that is
+  where GA4 landing pages were broken for six weeks (`StringFilter` imported
+  from the wrong module) with every test green. So each read fetcher has a
+  request-shape test one layer down: `FakeWire` replaces `httpx.request`
+  beneath `service/rest.py` so a whole Meta, Apple, Stripe, RevenueCat or
+  GitHub pull runs with the vendor's own encoding, headers and pagination real
+  (`test_rest_connector_requests.py`); `RecordingHttp` plus
+  `discovery_build_offline` let `googleapiclient` build Search Console and the
+  GA4 admin API from the discovery document it ships, so method names and
+  parameters are validated offline (`test_gsc_fetchers.py`); the GA4 Data API
+  test fakes only `BetaAnalyticsDataClient` and lets the real request types
+  build the report; and `FakeAdsClient.search_stream` answers the Google Ads
+  read fetchers with real `GoogleAdsRow` protos and logs the GAQL in `queries`
+  (`test_google_ads_fetchers.py`). When you add a fetcher, add one of these
+  with it — assert on the request that would have gone over the wire, then on
+  the parsed rows. `test_vendor_contracts.py` covers what none of them can:
+  that every lazily imported SDK name and every GAQL field still exists in the
+  installed package.
+
+### Desktop (local sidecar) mode
+
+The backend runs in two shapes from one codebase. Railway is unchanged; the
+desktop build runs the same FastAPI app as a sidecar on the user's machine —
+see the engine consolidation review (duct-cloud, private) §7–8.
+
+- **Entrypoint:** `local_server.py`. Sets `DUCT_LOCAL=1`, resolves the per-user
+  data dir, binds **127.0.0.1** on an OS-assigned port, and prints a single JSON
+  handshake line on stdout before starting uvicorn:
+  `{"duct_sidecar":1,"url":...,"port":...,"api_key":...,"data_dir":...}`.
+  The Tauri shell must read the port from that line — never assume one.
+  The shell also passes `--exit-on-stdin-eof` with a pipe only it holds, so
+  the sidecar stops itself when the shell ends however it ends (SIGTERM to
+  uvicorn, then a hard exit two seconds later). Off by default: a sidecar
+  run by hand reads a terminal or `/dev/null`, and neither may stop it.
+- **Data dir** (`utils/appdirs.py`): macOS `~/Library/Application Support/ai.getduct.desktop`,
+  Windows `%APPDATA%\Duct`, Linux `$XDG_DATA_HOME/duct`. Created `0700`.
+  Override with `--data-dir` or `DUCT_DATA_DIR`.
+- **Local mode defaults** (`Configs._apply_local_mode_defaults`): SQLite at
+  `<data_dir>/duct.db`, uploads at `<data_dir>/uploads`, `init_db_on_startup=True`
+  (no Alembic on a laptop). Each is only filled when unset, so
+  `DATABASE_URL=postgresql://…` still works for a developer running local mode.
+- **Local API key:** minted once by the desktop shell and held in its keychain,
+  handed down as `DUCT_LOCAL_API_KEY` (the JWT secret travels the same way); a
+  headless sidecar with no shell falls back to a `0600` file at
+  `<data_dir>/local-api-key`. Exported as `DUCT_API_KEY` so the existing
+  `validate_api_key` gate applies unchanged. It only stops other local processes
+  driving the sidecar (`docs/engineering/credential-storage.md`).
+- **Secrets arrive on stdin, not in the environment.** With
+  `--secrets-on-stdin` the shell writes one JSON line
+  (`{"duct_secrets":1, "DUCT_LOCAL_API_KEY": …, …}`) on the pipe it then
+  holds open for the watchdog, and `bootstrap()` reads it before anything
+  else. Precedence is that line, then the environment (the headless and
+  developer path), then the file. Once `_report_environment()` has built and
+  cached `Configs`, `scrub_secrets_from_environment()` removes every name in
+  `SECRET_ENV_NAMES` from `os.environ`, including the `DUCT_API_KEY` and
+  `JWT_SECRET` it derived — a process environment is readable by other
+  same-user processes and inherited by subprocesses. That scrub is safe only
+  because every consumer goes through `get_configs()`; a new reader of one of
+  those names from `os.environ` at request time would find it gone, so route
+  it through `Configs` instead.
+- **JSON columns must use `models/columns.py::json_column()`**, never
+  `postgresql.JSONB` directly — raw JSONB fails to compile on SQLite. The variant
+  still renders JSONB on Postgres, so it produces no Alembic diff.
+- **Never name a module `models/types.py`** — it shadows the stdlib `types`.
+
+### Before adding a table, an event kind or a log
+
+Name which existing store already records it, and propose new storage only
+when none does. Four overlap on purpose and each answers one question:
+
+| Question | Store |
+|---|---|
+| what was said, what did each tool return | `agent_events` |
+| who did what to a project, when | `activity_logs` |
+| what state is a change in right now | `execution_change_sets` |
+| what the agent knows and cannot re-derive | `project_memories` |
+
+The full list, one line per table, is
+[`docs/engineering/data-model.md`](../docs/engineering/data-model.md), and
+`tests/test_data_model_doc.py` fails when a new table is missing from it.
+Why this rule exists: on 2026-09-24 a "decision event" was designed for chat
+approve/reject rows while `activity_logs` already recorded every one of them,
+with its actor and conversation. The gap was the reader, not the record.
+
+### Database migrations
+
+Schema changes are applied **manually** with Alembic — a normal local dev step,
+distinct from an app deploy (the global "deploys go through CI/CD" rule is about
+shipping app code, not running migrations). Nothing runs migrations
+automatically: `railway.json` only starts uvicorn. CI does *verify* them —
+`backend.yml`'s `migrations` job applies the whole chain to an empty
+Postgres 16, runs `alembic check` (fails on any model/migration drift, the
+diff `--autogenerate` would have written) and undoes the newest one once.
+The offline suite runs on SQLite and cannot see any of that;
+`make check-migrations` is the same three steps against whatever throwaway
+Postgres `DATABASE_URL` names.
+
+- Apply: from `backend/`, run `alembic upgrade head`. The DB URL resolves from
+  `backend/.env.local` (the Railway TCP proxy) via `config.get_configs()`.
+- Inspect: `alembic current`, `alembic heads`, `alembic history`.
+- The proxy host is not resolvable inside the command sandbox, so migration
+  commands run with the sandbox disabled — they need outbound network to the
+  managed database's proxy domain.
+- New models must be imported in `models/__init__.py` so `SQLModel.metadata`
+  picks them up for autogenerate.
+- Migrations should be additive/reversible — always provide a working `downgrade`.
+
+### Roadmap (not in codebase yet)
+
+- **Ingestion framework:** PyAirbyte for early pilots → client-managed Airbyte later
+- **Query layer:** DuckDB + Ibis
+- **Transforms:** dbt
+- **Orchestration:** Dagster
+- **Delivery:** email through `service/email/` + Slack webhooks
+
+## Product-shape constraints
+
+- Do not build a dashboard-first product here.
+- The primary value is the brief and alert output.
+- The backend should support a thin onboarding app, not depend on a rich frontend.
+- Design all outputs for operator clarity: what changed, why it matters, what to do next.
+
+## Current directory structure
+
+- `service/google/brief.py` — Google Ads brief normalization (loads demo from `data/<connector_id>/`, default `google_ads`)
+- `service/google/schema.py` — typed Google Ads brief payload (dataclasses / JSON contract)
+- `agents/insights/prompts/` — synthesis prompts: `autonomous.py` builds the system and user prompt, `paid_ads.py` and `organic_growth.py` hold the vertical modes `get_system_prompt()` dispatches to
+- `routes/auth.py` — OAuth by connector (`/auth/connectors/{connector_id}/oauth/...`).
+  Every connect starts with a `?link=` naming the signed-in user and ends with
+  that user's page claiming the grant; both clients come home on
+  `/connections?connector=&auth_code=` (the desktop one through `/desktop-auth`
+  and the shell's deep link).
+- `routes/signin.py` — Google sign-in, and the **guest**: `POST /auth/guest`
+  mints a real `users` row keyed on an install id so an audit can run before
+  anyone signs in; `/auth/guest/link-code` + `?link=` on authorize lets the
+  Google callback link the account to that guest or merge the guest into an
+  existing one (`service/user_store.py::absorb_guest`, which walks the schema
+  for owner columns rather than keeping a list). Never make an owner column
+  nullable for this — a guest is why they need not be.
+  `?sources=onboarding` on authorize is the **onboarding bundle**: the same
+  sign-in also asking for the Search Console and Analytics *read* scopes,
+  offline grant, consent forced; the callback stores one
+  `connector_credentials` row per scope Google actually granted
+  (`service/signin_sources.py`, through the same upsert the Connections page
+  uses, `service/connector_store.py`). It exists for exactly one surface —
+  the connector prompt on the onboarding audit, for a guest — and every other
+  sign-in and every connector flow stays as it was. Never add a write scope to
+  the bundle; a connector asks for those itself, with its justification on
+  screen (`service/connector_scopes.py`).
+- `routes/audit_prefetch.py` — the crawl onboarding starts the moment a URL
+  validates (`agents/audit/prefetch.py`): root page now, the rest in the
+  background, handed to `run_pipeline` by `crawl_id`. Duct's bandwidth only;
+  inference never runs here. `POST /api/audit/documents` beside it reads up
+  to five files the user adds on the "Found it" card, keeps their text for
+  the prefetch's TTL (`agents/audit/documents.py`) and answers one result per
+  file; the run names them in `document_ids`. It parses the form itself,
+  after the token, the limiter and the declared length, because a declared
+  `File(...)` body is spooled to disk before any dependency runs.
+- `service/documents.py` — text out of a PDF (pypdf), Word or PowerPoint
+  (zip + XML, any DOCTYPE refused) or plain text, with every reader stopping
+  at a page, character and inflated-size cap. Text rather than a PDF block
+  for the model, because several providers (DeepSeek among them) read none.
+  A file that gives no text raises `DocumentError` with an `Unreadable` code
+  the app words; never a message.
+- `service/ratelimit.py` — the in-process fixed window every route goes
+  through that spends before its caller has proven much: `RateLimit.enforce`
+  is the 429 with `Retry-After`. Key an address with `client_address(request)`,
+  never `request.client.host`, which on the hosted API is the proxy in front of
+  it; keyed on that, a per-address limit is one bucket for everyone. A guest is
+  a user anyone can mint, so a route that spends on a per-user limit carries a
+  per-address one beside it. Session starts also cap live sessions per user
+  (`agents/core/session.live_session_count`), and the teaser — the one run on
+  Duct's key — is held to its lead token, its address and a follow-up budget.
+  `tests/conftest.py::fresh_rate_limits` empties every window between tests.
+- `service/clone_reference.py` — a pasted TikTok link becomes a saved
+  reference for a clone (issue #222). The link is reduced to a handle and a
+  post id and everything after uses the URL rebuilt from them; the Apify input
+  (`single_post_run_input`) takes that parsed post, one result, downloads off.
+  A post the project already saved is reused, else it goes through
+  `service/discovery.py`'s ingest and capture. The clone itself is
+  `ContentRunner.run_clone`: draft_post's system prompt, one structured call on
+  the run's own model for why the reference worked (the slides attached only on
+  `VISION_PROVIDERS`), and the FIT × PROOF discipline in the USER turn.
+  `submit_post_draft` writes `content_posts.clone_source` from the session's
+  link plus the model's verdict; the approach is derived, never typed.
+- `agents/audit/draft.py` — the project drafted from the crawl, in layers
+  (`crawl` deterministic; `documents` one structured call over the user's
+  files, only when they added some; `inferred` one structured call), emitted
+  as `PROJECT_DRAFT` when a run sets `draft_project`. The documents are read
+  in the `read_documents` step, before competitor research, and reach the
+  rest of the run only as the business context they seed: their text never
+  rides in the audit's own turn. Never infers the North Star; the agent asks
+  for it in chat.
+- `service/project_draft.py` — where each project field came from
+  (`projects.provenance`) and what may overwrite what, the server's copy of
+  the rules `app/src/lib/projectDraft.js` runs for an instant answer (a test
+  holds the ranks and field names equal). Two writers, two rule sets: a
+  draft (`POST /api/user/projects/{id}/draft`, `merge_draft`) is a machine
+  and lands only on a blank, a drafted field of equal or lower rank, never
+  on the person's; a save (the PUT, `reconcile_save`) is the person and wins
+  where they changed something, but a drafted value the client only carried
+  along cannot replace an equal one or blank a field, because that is an
+  older copy of a draft the server has since refreshed. **Every new writer
+  of project fields goes through `merge_draft`** (the MCP server, a GitHub
+  re-sync), never a direct column write; a writer the rules do not know is
+  how a guess overwrites what someone typed. A draft cannot claim `user`.
+  The one exception is the person speaking through their agent: MCP
+  `update_project` writes through `edit_fields` as `user`, whatever the field
+  held, and records what it replaced in its `activity_logs` row so
+  `POST /api/user/projects/{id}/edits/{activity_id}/undo` (`revert_fields`)
+  puts it back, skipping any field changed since (issue #512).
+  Pillars are one list, `projects.content_pillars.items`: the planner reads
+  it, the Brand tab edits it (and labels it `user`), and a draft's names land
+  there through `pillar_rows`. Drafts used to write
+  `brand_channels.content_pillars`, which nothing read, so MCP-written pillars
+  never reached a plan; a save drops that key if an old device sends it.
+- `routes/mcp_server.py` + `service/mcp_server/` — Duct as an MCP server at
+  `POST /mcp`, for the person's own agent (Claude Code, Codex, Cursor,
+  OpenCode). Stateless JSON-RPC with no SDK: five methods, no sessions, no
+  event stream. Its one credential is an MCP token (`service/mcp_tokens.py`),
+  accepted on `/mcp` only and never by `get_current_user`, and there are two
+  ways to get one. **Browser sign-in** (issue #197, `routes/mcp_oauth.py` +
+  `service/mcp_server/oauth.py`): Duct is the OAuth authorization server, so
+  an agent given only the address finds the sign-in from `/mcp`'s 401
+  (RFC 9728), registers itself (RFC 7591), opens the app's `/authorize`
+  consent page, and trades the code with PKCE for an hour-long access token
+  and a refresh token. Three rules: **registration writes no row** (the
+  client id is the registration, signed with a key derived from
+  `JWT_SECRET`, never the secret itself, or a client id would be a session);
+  **the backend renders no page** (`/oauth/authorize` parks the checked
+  request in `service/auth_exchange` and redirects to the app, and an
+  unverified client or redirect goes to the app's error state, never to the
+  address it named); and **the sidecar has none of it** (`oauth.available()`:
+  its address changes every launch and its app is `tauri://`). A
+  **personal token**, minted at `/api/user/mcp-tokens` by a signed-in
+  session, is the way in for an agent with no browser. Both are rows in
+  `mcp_tokens`, listed together with a `kind`, and DELETE ends either. Four tools, and adding a
+  fifth is a scope decision, not a refactor: `list_projects`,
+  `get_project`, `draft_project`, `update_project`. A draft goes through
+  `service/project_writes.apply_draft`, labelled `document` (or `inferred`
+  for what the agent guessed), so it never replaces the person or their
+  site. An edit (`update_project`, #512) is the person asking in so many
+  words: it can replace anything, carries `destructiveHint` so the client
+  confirms it, and is undoable from the activity feed. Each write leaves an
+  `activity_logs` row (`category="project"`). No tool calls a model on
+  Duct's side, and none approves, applies, connects or touches credentials.
+- `agents/engines.resolve_job_run` — provider and model over the keys *this
+  caller* can spend, so a user holding only an OpenAI key runs on OpenAI
+  instead of a 402 for the instance default. All three agents route through
+  it now: audit directly, insights via `agents/insights/setup.resolve_run`
+  (which serves both the live session and the scheduled brief), content via
+  `routes/content._resolve_run_model`. `resolve_run_model` remains for callers
+  that have no job to name.
+- `models/settings.py` + `service/profile.py` + `routes/profile.py` — the
+  operator profile: name, role, writing preset, the language Duct writes to
+  them in, and their own instructions. Same argument as the tier map below,
+  applied to voice. Two rules worth knowing: **the server row is the truth and
+  the request payload is the fallback** (`resolve`), so a signed-out audit
+  still gets the voice picked in the browser; and **the preset derives the
+  older `communication_style`/`report_depth` pair** rather than replacing it,
+  so every prompt that reads those is unchanged. Rendered for a run by
+  `agents/core/voice.user_context_block` into the `<user_context>` block — in
+  the USER turn, never the system prompt, because
+  `build_insights_system_prompt` is cache-stable and one per-customer string
+  in it costs the cached prefix on every call.
+- `models/settings.py` + `service/model_settings.py` — the tier map and the
+  fallback switch, keyed by user. They used to live in `localStorage` and ride
+  on each request, which meant the scheduled brief — the run whose owner is
+  definitely not watching — could not read the preference its owner had set.
+  The browser's copy is now a cache of this, and on disagreement the server
+  wins.
+- `agents/core/quota.py` — a 429 the retry loop gave up on, remembered for a
+  few minutes so the next run resolves to a tier that can serve. Keyed by
+  `(HMAC-SHA256(process salt, key)[:16], provider)` and **never by provider
+  alone**: Duct is
+  multi-tenant with bring-your-own keys, so one customer's rate limit says
+  nothing about another's. In-process and deliberately not durable — a
+  cooldown is a hint, and the worst case on a fresh worker is one wasted 429.
+  Recorded in `ReportedRetryMiddleware._give_up`, consumed by
+  `agents/tiers.resolve_tier_model`'s `cooling` set, reported to the browser
+  as `tier_skipped` on `PIPELINE_STARTED`. See
+  `docs/engineering/2026-09-08-quota-aware-tier-ladder.md`.
+- `POST /api/providers/{id}/verify` — one real completion on the provider's
+  Light model, classified into `invalid_key` / `no_billing` / `model_access`
+  / `rate_limited` / `unreachable`, or for a ChatGPT credential
+  `subscription_quota` / `subscription_revoked` / `subscription_blocked`. The
+  only endpoint that can tell a pasted key from a working one.
+- The audit agent mounts the insights agent's connector tools
+  (`agents/core/connector_tools.py`): `ListDataSources` always, `SelectAccount`
+  and `RequestConnection` when the run has a project. The system prompt holds
+  the rule (Search Console only, after the report, once); the onboarding
+  audit's user turn (`draft_project`) is the trigger, so the cached prefix is
+  identical across every other audit. The content agents mount all three
+  plus `FetchData` and `ReadConnectorNotes` (issue #552), so a plan can lean
+  on what people search for and a post on the visits it sent; their cached
+  prompt carries the same entity catalog as insights
+  (`agents/content/prompts.project_data_section`), so an entity id means one
+  thing to both.
+- `service/mcp/` + `routes/mcp_servers.py` + `agents/core/mcp_tools.py` —
+  MCP servers a user connects (issue #345). Duct is the *client* here; Duct as
+  a server is #197. Eight rules, each held by `tests/test_mcp_*.py`:
+  - **Our runtime, not the provider's.** Anthropic's `mcp_servers` and
+    OpenAI's Responses `mcp` tool serve only their own models, so the client
+    is the reference `mcp` SDK (2.x) in-process, the capability rule above,
+    not fastmcp's heavier stack. Its transport takes only an `httpx2` client,
+    so everything under `service/mcp/` speaks httpx2, and it turns a 401 into
+    a generic JSON-RPC error: `client._session` watches responses for the
+    status instead.
+  - **A server is a credential row.** `connector_type = "mcp"`, `account_id` the
+    canonical URL; no table of its own. A chat reaches only **its own user's**
+    servers, in any project, never the project owner's: unlike a vendor key, a
+    token reads the whole account behind it. Sessions are their creator's
+    alone, so whoever sees a server's data and answers its card owns it.
+  - **Only a trusted preset's `readOnlyHint` is believed** (`trust_read_only`,
+    off by default). On a server added by address every call shows the
+    approval card: a stranger's "read-only" still carries the agent's
+    arguments to the stranger. Infrastructure presets (Railway, Cloudflare)
+    stay untrusted too, because their reads return secrets. The card gets the arguments
+    whole; a call too long to show (`APPROVAL_ARGUMENT_CHARS`) is refused,
+    never cut.
+  - **Sign-in is GitHub's shape.** Start (signed in) parks the flow under the
+    OAuth `state`; the callback parks the tokens as a grant; only the user who
+    started may claim it. A client metadata document where the server takes one
+    (its URL *is* the client id, served at `/auth/mcp/client-metadata.json`),
+    dynamic registration otherwise, a pasted key when neither works. PKCE and
+    the RFC 8707 `resource` on both legs. The metadata is held to where it
+    was found: a resource that is not this server or a parent of it, or an
+    issuer other than the server the document was fetched for (RFC 8414
+    §3.3), ends the sign-in with the key prompt.
+  - **Every request goes to a public https address**, redirects included:
+    `service/mcp/http.guarded_client` runs the crawl fetcher's resolved-address
+    check. No stdio servers on the hosted API.
+  - **The registry is searched, never trusted.** `service/mcp/registry.py`
+    reads the MCP Registry (`MCP_REGISTRY_URL`, empty turns it off) and says
+    who runs each server from the name its publisher proved: a reverse-DNS
+    namespace that owns the host, or a GitHub login naming its site.
+    Official means that, the site is the tool searched for, and the host is
+    the site or one service label under it (`SERVICE_LABELS`), so a tenant of
+    any platform fails closed; nothing on one that hands out subdomains
+    (`SHARED_HOSTS`) qualifies, and a GitHub login vouches for nothing there. A server
+    connected from it is a server added by address: every call asks first.
+  - **A server says why it needs its owner.** A failed listing or a refused
+    refresh records `store.PROBLEM` in the blob (signed out, key refused, not
+    answering…); any call that works clears it, a reconnect replaces it. A
+    failed tool call records nothing, because a slow job or one tool's 403
+    says nothing about the server. `POST /servers/{id}/check` is the
+    listing on demand.
+  - **Two fixed agent tools, never one per server tool.** `ListConnectedTools`
+    (a menu, then one tool's schema on request) and `CallConnectedTool`; a
+    call that asks first pauses on `TOOL_APPROVAL_REQUIRED`. Interactive
+    insights and content sessions only, and only when the user has a server,
+    so every other prompt keeps its cached prefix.
+- `service/rss/fetch.py` — RSS and Atom feeds as a manual connector (#564):
+  one credential row holds every feed URL a project reads (one per line, at
+  most ten) and one binding carries them all, so the one-binding-per-type
+  rule never bites. Every URL is user input aimed at the network: public
+  https only, each request and redirect through `compatible._PinnedTransport`
+  (resolved once, judged, connected to the address that passed), a size cap,
+  and a feed content type or a body that plainly is one. `feedparser` is
+  handed bytes Duct fetched, never a URL. Saving reads each feed once
+  (`list_accounts`), so a page pasted instead of its feed is refused on the card.
+- `service/discovery.py` — saved TikTok references. `ingest_reference(db,
+  project_id, post)` is the one way a `ScrapedPost` becomes a
+  `discovered_reference` row (one per post per project); `capture_reference_media`
+  copies its cover and slides into project storage and records the outcome in
+  `params["media"]`, because TikTok's image URLs carry a signed expiry. The
+  Discover save runs capture after the response; `/content/discover/recapture`
+  is the backfill, called when Discover opens. A clone-from-URL flow reuses
+  both. Every media fetch goes through `service/url_safety.py`: https only, a
+  host allowlist (`MEDIA_DOMAINS`), redirects re-checked hop by hop, a size cap
+  and an image content type. The URLs arrive in the request body, so without
+  that guard a save is a request the caller aims at our network.
+- `service/apify/run_cache.py` — an identical Discover search (actor + canonical
+  input) inside 30 minutes joins the earlier Apify run instead of paying for a
+  new one. In process; the API runs one worker. The content agents' search,
+  `discover_tiktok` (`agents/content/discover.py`), goes through the same
+  policy and cache, on the owner's key, and pauses on the MCP approval card
+  (`why: spends_credits`) before every run because it spends their credits.
+  It saves nothing: a reference is still the person's save in Discover.
+- `routes/generate.py` — `POST /api/insights/generate` for interactive brief + LangChain synthesis envelope
+- `routes/content_reports.py` — the Analytics tab's **growth report**: the
+  insights agent, unattended, over the sources the person ticked, writing
+  the `GrowthReport` the app draws (`agents/insights/report.py`) rather than
+  a brief. `GET /content/analytics/report` answers templates, the sources
+  that can feed the chosen one, the latest stored copy (`stale` after
+  `REPORT_TTL`, a day) and whether a run is writing; `POST` starts one, or
+  joins the one already writing the same project and template. Nothing
+  regenerates by itself: a report is a model run on the person's key, so the
+  stale copy is served and Refresh is the only thing that spends again.
+  Stored through `ArtifactPersister` as one artifact group per project and
+  template (`kind = "growth-report"`, `GROWTH_REPORT_JSON`), so a refresh is
+  the next version and the library keeps the history. Three things worth
+  knowing before changing it:
+  - **The templates are data** (`agents/insights/report_templates.py`): a
+    question, the sources that can answer it, and the blocks to fill, each
+    naming the sources that can fill it. A block none of the chosen sources
+    can fill is left out of the plan the model gets (`report_plan_block`),
+    never left for a guess. A source is one of three kinds: a connector with
+    an insights catalog, the project's schedulers (one source, however many
+    hold accounts), or an MCP preset whose read-only tools Duct trusts
+    (OpenSEO, PostHog). A report run mounts the MCP tools with no pause, so
+    anything that would ask first answers `needs_approval` instead.
+  - **The schedulers are a FetchData entity** (`social_post_metrics`,
+    `agents/insights/catalog/publishers.py`), read through
+    `service/publishers/metrics.collect_reported_posts`, the same fan-out the
+    Analytics tab's per-post table uses, so the agent and the table cannot
+    disagree about a post's numbers. They are a vendor key on the owner, not
+    a connector on the user, so `fetchers.fetch_entity` branches to
+    `fetch_publishers` before resolving connector credentials, and
+    `setup.data_sources_block` adds their line by hand.
+  - **A refused payload gets a repair turn, never a silent loss.**
+    `AutonomousInsightsRunner.run_report` parses the closing tag against
+    `GrowthReport`; counts over the limits are clamped, anything else goes
+    back to the model as problems, up to `REPORT_REPAIR_TURNS`. The route
+    records the failure on its run entry so the tab can say what happened.
+- `service/schedules.py` + `routes/schedules.py` + `routes/schedule_jobs.py` —
+  scheduled runs (#562): one loop in `lifespan`, the same in the cloud and in
+  the desktop sidecar, over one table (`agent_schedules`). Five rules, each held
+  by `tests/test_schedules.py`: **a schedule runs only on the host that owns its
+  row** (`host`, cloud or local); **one process takes an occurrence**, by a
+  compare-and-set on `next_run_at` that holds on SQLite and Postgres alike;
+  **a run holds a lease it renews**, and a lapsed lease is recorded as
+  interrupted and retried once (a run's output is a proposal, so a retry is
+  safe); **misses coalesce**, because the next occurrence is counted from now,
+  and one older than a week is skipped; **retries are classified**: transient
+  (a model 429/5xx, the network, an interruption) once after 15 minutes,
+  deterministic (no saved key, the monthly cap, a creator who left) never, and
+  those set `needs_reason` for the page. What each run did is an
+  `activity_logs` row (category `schedule`) linked to the conversation it
+  left, never a history table. The loop imports no route: `server.py` hands it
+  `routes.schedule_jobs.JOBS`, whose plan job reuses the session route's
+  conversation and recorder and the content route's saved-key resolution. A
+  scheduled content run sets `ContentSession.unattended`: no question tool, no
+  approval-carded tool, and the feed turn tells the agent to pick the stories
+  itself. Its proposal waits on the conversation; `/content/sessions/new?
+  conversation=<id>` reopens it with Accept and Reject. A run spends its
+  creator's saved keys, else the keys their open app lent on its half-hourly
+  memory catch-up (`service/lent_keys.py`: in memory, 45 minutes, the lender's
+  own schedules only), and a missing key retries once before it says "Needs
+  you", because a laptop's loop can wake before the app lends. A run killed
+  mid-way has its conversation closed as cancelled, from the id the schedule
+  noted when the run began. **An event cadence checks, then runs** (#563):
+  `on_release` wakes hourly and asks a probe (`PROBES` in
+  `routes/schedule_jobs.py`, one GitHub request for the newest release)
+  whether its event happened. A check that finds nothing writes no history
+  row and spends nothing from the cap; its first check only records the tag
+  in `cursor`, so a new schedule never plans from an old release, and Run now
+  sets `forced` to skip the check once. A scheduled run keeps **one open
+  proposal**: when it proposes, the run before it, if still unanswered, is
+  released with a `superseded` plan decision on its thread, and the list
+  route's `waiting` says whether the newest proposal is still held. It mounts
+  a trusted preset's read-only MCP tools and nothing else
+  (`build_mcp_tools_lc(trusted_only=True)`). `SCHEDULER_ENABLED`
+  turns the loop off on a web process once a worker service runs it instead.
+- `routes/project_members.py` — project members + email invitations (`docs/engineering/2026-08-16-project-collaboration-plan.md`)
+- `service/membership.py` — project access checks (owner vs collaborator) and invite token handling
+- `data/google_ads/` — `google-ads-report.json` (demo brief), `raw/demo_raw_payload.json`
+
+## Agent-type architecture
+
+The `agents/` directory is organised by agent type. Each type is independent and has its own goals, tools, prompts, schema, and versioned runners.
+
+```
+agents/
+├── engines.py          — engine/provider/model registry + resolve_run_model (shared)
+├── models.py           — Provider, ModelName enums (shared)
+├── core/               — the ports: session registry, events, LangChain adapter (lc.py),
+│                         checkpointer, memory/artifact/connector/web tool binders,
+│                         the shared DeepSession loop, SDK shims
+├── insights/           — Insights agent (paid ads + organic growth intelligence)
+│   ├── v1/             — deepagents runner (the only insights engine)
+│   └── catalog/, goals/, schema.py, prompts/, subagents/
+├── audit/              — SEO audit agent
+│   ├── v1/             — create_agent-rung session runner (build_session_agent)
+│   ├── crawl.py        — engine-neutral: the session, the crawl, report parsing
+│   ├── enrichment.py   — competitor research; create_agent + web tools, any provider
+│   └── scoring.py      — the report's scores and counts, computed from its findings on
+│                         every submit (both engines); the prompt's tables render from it
+└── content/            — Content Studio (plans, posts, images, publishing)
+    ├── v1/             — deepagents runner (the only content engine)
+    ├── assessment.py   — the pre-publish review's checks and scoring; the agent
+    │                     scores six markers, the weights stay here
+    ├── channels.py     — one post row serves every platform; what differs is rules,
+    │                     not columns. RULES holds each platform's limit, fold,
+    │                     replies that publish, media and metrics support; the
+    │                     writer, both publish paths, the review and the app (via
+    │                     `post.channel`) all read it. A new channel is a row there
+    ├── publishing.py   — what a post sends its scheduler (service/publishers: PostBridge,
+    │                     Zernio), the media and its bookkeeping, shared
+    │                     by the agent's publish_post and the publish route (#272, then
+    │                     a button that read only local disk, were the two drifting
+    │                     apart): pick_media chooses the files (a video's cut, each
+    │                     slide's composed render), load_media reads them through
+    │                     service.storage (R2 or disk), send_post uploads and creates.
+    │                     While a scheduler holds a scheduled post, push_edit / cancel,
+    │                     which every edit, unschedule, delete and agent rewrite goes
+    │                     through so the queue never publishes stale words or a deleted
+    │                     post; once its time has passed, settle, which the post
+    │                     listing runs (throttled per project) so it reads posted or
+    │                     failed, the reason on an activity_logs row. The agent's
+    │                     publish_post sends nothing without the person's yes on the
+    │                     approval card (publish_card, why: publishes): it reads pages
+    │                     and strangers' captions, and a post in front of people is the
+    │                     one thing it cannot take back. The Publish button is that yes
+    ├── text_prompts.py — X and LinkedIn draft on their own base prompt; nothing in the
+    │                     visual playbook applies to a post that is words
+    ├── voice_rules.py  — the project's own voice (#271): writing samples, banned words
+    │                     and the client-names / protect-the-edge switches, stored in
+    │                     content_brand (no migration). The old prompt constants are the
+    │                     defaults. Values ride in the USER turn; the text writer refuses
+    │                     a banned word as it refuses an over-length post
+    ├── formats.py      — the format library: built-in recipes in data/formats/*.md
+    │                     (frontmatter on the Agent Skills shape: name is the slug,
+    │                     description says what and when, media and channels say
+    │                     where it applies) beside a project's own content_formats
+    │                     rows, one shape. A row with a built-in's slug replaces it
+    │                     for that project; deleting the row brings it back. The
+    │                     agent reads it through fetch_format_library(media, channel)
+    │                     and follows spec_markdown; the renderer inlines the whole
+    │                     caption-style registry, so a format declares no CSS
+    ├── plan_period.py  — the period a plan manages: one post per date, at most 30. The
+    │                     person picks the month in progress (default; under a week left
+    │                     rolls over to the next month) or 7, 14, 30 days (PlanRequest
+    │                     start_date + days). One plan per period: a run opened on a plan,
+    │                     or while a plan covers its start date, manages that plan; a new
+    │                     plan stops short of the next one; submit_plan updates in place
+    │                     (days with a drafted post are kept). It used to insert every
+    │                     time, so each refinement in chat left a second plan beside the
+    │                     first. app/src/lib/contentSchedule.js mirrors these rules
+    ├── best_time.py    — when a draft goes out (#266): the account's own best hour on
+    │                     that channel once five posts there have numbers, else the
+    │                     channel's default, in the reader's zone, never on top of a
+    │                     post already scheduled there. performance.py is the plan's half.
+    │                     Its route sits beside POST /content/posts/{id}/skip, whose
+    │                     reason becomes a feedback memory the next draft reads
+    ├── performance.py  — the signals one history gives a plan: type ranking (never
+    │                     likes), explore/exploit, graded bets (pillar, hook, funnel stage,
+    │                     objective), best and weakest posts, best posting times. An
+    │                     unrecorded metric is unknown, never zero; a goal measure that
+    │                     sums metrics (saves + shares) sums only the ones recorded.
+    │                     Proven is three measured posts that earned something: fewer is
+    │                     a hint (unproven), and enough that earned nothing is flat,
+    │                     tested at the floor and never scaled
+    ├── channel_mix.py  — what a plan gives each channel: the brand's content goal picks
+    │                     the measure (reach, engagement, or intent = saves + shares, since
+    │                     conversions are not measured), every channel is summarised on
+    │                     its own posts (a tweet never ranks a TikTok), and its share of
+    │                     the days moves from the last plan's toward the channels that
+    │                     return more of the goal per post: a quarter at most per plan,
+    │                     never below a post a week, only once two channels can be
+    │                     compared. A day counts for its first platform. The plan turn's
+    │                     <account_performance> block is this, rendered, and the plan
+    │                     keeps its per-channel facts as strategy.mix (mix_snapshot) so
+    │                     the board says what each channel leans on without a sentence.
+    │                     submit_plan refuses a hook its channel has not proven on more
+    │                     than a quarter of that channel's days (overreaching_hooks)
+    ├── feed.py         — planning from shipped work (#561): the repository through the
+    │                     GitHub connector and Duct's own record (briefs, applied change
+    │                     sets, shared memory), filtered in code (bots, dependency bumps,
+    │                     chores, squash commits, the disclosure level; a docs patch never
+    │                     reaches the prompt) and gated, so a quiet window costs no model
+    │                     call. The read step's payload is the app's card and an
+    │                     EventKind.FEED row. A feed day cites refs in Day.sources;
+    │                     submit_plan and revise_plan_days refuse one the run was not
+    │                     shown, or more feed days than the setup allowed, and a plan
+    │                     from goals cites nothing. The window rides on strategy.feed,
+    │                     so the next run starts where this one ended: no watermark table.
+    │                     feed_mcp.py adds Linear and Notion (#565) on the user's own
+    │                     trusted presets, read by code like GitHub (ln: and nt: refs):
+    │                     no stable tool contract exists, so it sends only the arguments
+    │                     a tool's schema declares and judges the window in code.
+    │                     feed_more.py adds the project's own feeds (RSS, rs: refs, through
+    │                     FetchData's rss_items) and milestones.py the moments no commit
+    │                     records (#564): a round GitHub star count crossed in the window,
+    │                     from the newest stargazers' dates with no stored state, and GA4's
+    │                     best complete week; both claim only what the data proves
+    ├── plan_proposal.py — a plan is proposed, then accepted: what Accept writes, merged
+    │                     against the plan as it stands at Accept. The proposal is held
+    │                     on the conversation (meta.plan_proposal) so a deploy does not
+    │                     lose it; a resumed session shows it again (replay), and the
+    │                     accept and reject routes release it and append a
+    │                     plan_decision event, which memory consolidation reads so a
+    │                     plan only proposed is never remembered as made. A change to
+    │                     some days (revise_plan_days: dates and only the fields that
+    │                     change) is a proposal too, of those days alone (only_days):
+    │                     Accept writes them onto the plan as it stands and nothing
+    │                     else. A drafted or past day is refused by name, never
+    │                     dropped at Accept
+    └── tools.py, subagents/, prompts.py, schema.py, artifacts.py, enrichment.py
+```
+
+Route convention: each agent type gets its own route prefix, and every agent's
+session lifecycle runs through the unified `routes/agents.py`:
+- `POST /api/agents/{type}/sessions` → stream → messages — every session
+- `POST /api/insights/generate` — the unattended brief
+- `POST /api/audit/run` — the audit pipeline
+- `/api/content/*` — content CRUD, brand context, the slide-render bridge; the
+  legacy `plan/stream` and `post/stream` entry points drive the same runner
+
+Cross-agent invocations are modelled at the frontend level (e.g. audit findings carry an `invoke_insights` action that pre-populates the insights wizard). Backend agents remain decoupled — no direct calls between agent types.
+
+## Agent ports — the harness boundary
+
+We rent an agent harness; we do not marry one. The full declaration (with the
+port table and the external standard behind each) lives in
+`agents/core/ports/__init__.py` — read it before adding anything that touches a
+framework. The rules it implies:
+
+- **Never write an `AgentHarness` interface.** Harnesses differ in capability,
+  not just API shape; the intersection loses the reason to use one and the
+  union means maintaining a framework. The harness stays harness-shaped inside
+  a runner, and only its *boundary* is standardized.
+- **Domain code imports no framework.** Tool bodies, prompts, schemas, goals and
+  scoring are plain Python. `agents/core/memory_tools.py` is the reference
+  shape: `_remember_sync` / `_search_sync` / `_get_sync` hold the logic, and
+  `build_memory_tools_lc` / `build_memory_tools_sdk` are thin binders.
+- **Framework imports live only in adapters** — runners, binders, and the
+  named shims. `tests/test_harness_boundaries.py` enforces this and lists the
+  allowlist; adding a file to that list is a deliberate act, not a fix for a
+  failing test.
+- **Write the adapter on the second implementation, not the first.** One
+  implementation is a guess. The human-in-the-loop port is the worked
+  example: `PauseFn` in `agents/core/session.py` was declared only once the
+  LangGraph `interrupt()` implementation (`agents/core/lc.interrupt_pause`)
+  existed beside the Future bridge. A tool body takes a `PauseFn`; the binder
+  that mounts it decides which one — the Future for an agent with no
+  checkpointer (audit, the slide-render bridge), the interrupt
+  for one with durable threads (insights v1, content v1). Same events, same
+  route, and the frontend cannot tell them apart.
+- **What the user may watch an agent do is one allowlist, in one place.**
+  Every tool call passes through `recorder_tool_hooks`; `agents/core/activity.py`
+  wraps that pair and emits `TOOL_ACTIVITY` for the tools it maps — a connector
+  pull, a web search, a page read, an image, a sub-agent dispatch — twice per
+  call (running, then the verdict), with **structured fields and no prose**, so
+  the app writes the sentence in the reader's language. Three rules:
+  - **Allowlist, never denylist — and the allowlist is nearly everything.**
+    A tool is invisible until someone writes its card, so a new tool leaks
+    nothing by default; but the standard is transparency, and the only calls
+    left off are the ones with a better row of their own: `RememberFact`
+    (the "Remembered" note, with undo), the pause tools (the cards),
+    `Create/Update/RewriteArtifact` (the artifact card), `write_todos` (the
+    strip), the execution proposal (the change-set card) and the audit's
+    report builders (its step ladder). Memory searches and reads, the
+    connector listing, opening or listing a document, every read the content
+    agent makes of what the project holds, and everything it saves, publishes
+    or logs are rows. A new tool goes on the list unless it has one of those
+    other rows — say which, in the comment above `ACTIVITY_TOOLS`.
+  - **The run's own context is a row too.** `announce_context` records the
+    CONTEXT row and emits the "Read project context · business, memory,
+    connected sources" notice in one call, so a runner cannot do one without
+    the other. Every runner calls it where it composes its opening turn;
+    a resume records the row and draws no notice (the reopened transcript
+    already has one). Memory's two events are stored as rows as well
+    (`EventKind.MEMORY_RECALLED` / `MEMORY_WRITTEN`), so what the run
+    recalled and remembered survives a reload for every agent.
+  - **No bespoke per-tool step events.** The insights runner used to emit a
+    STEP per data pull with an English label built in Python, which the ladder
+    and a separate pane both rendered; that is one line said twice and
+    untranslatable. Add a mapper, not an event.
+  - **Every runner wires the hooks.** `tests/test_tool_activity.py` fails a
+    runner that opens a `DeepSession` without `activity_hooks`, because the
+    audit runner passed no tool hooks at all for months — recording nothing,
+    showing nothing — and nothing failed. The card payload carries the notice
+    that a tool ran, never its output: the full input and result are already in
+    the transcript, and a card holding fetched page text would put
+    attacker-authored bytes in every client's memory.
+- **A durable thread is the conversation.** The insights runner keys its
+  LangGraph thread on the conversation id, so a resumed session continues the
+  thread — and a pause the thread is parked on comes back as the same SSE
+  event, flagged `replay`, when a session resumes it. Never key a thread on
+  a session id; that made "resume" a transcript the agent could not see.
+- **A failure is a code before it is a message.** `agents/core/errors.py`
+  classifies an exception once (`classify_error`), and that code decides the
+  retry (`is_retryable`), rides on the failure event (`error_payload`), and
+  picks the copy in the browser. Never emit `str(exc)` to a client, and never
+  add a regex on message text in the frontend — add a code, or a class name to
+  the classifier's table.
+- **Input during a turn is steered or queued, never refused.** A harness that
+  can hand the model a message at its next call sets `steer_queue` on its
+  session (insights does, via `SteerMiddleware`); the rest fall back to
+  `chat_queue`. The route decides; the runner reports `user_input_consumed`
+  when it dequeues so the client can drop the "queued" mark. Do not reintroduce
+  the 409.
+- **Run status is derived from the stream, in one place.** `ConversationRecorder`
+  (`agents/content/persistence.py`) already sees every event, so it is what
+  writes `agent_conversations.run_status` (`RunStatus` in
+  `agents/core/events.py`: idle / running / paused / failed / cancelled) and
+  `run_error`, and appends a `failure` event where a turn died. The list and
+  state routes carry both; a reload shows the failure where it happened, with
+  the same code. Do not set the status from a runner — a second writer is how
+  two agents end up disagreeing about one column. A session closed mid-turn is
+  recorded as `cancelled` by `recorder.close()` in `_close_and_consolidate`.
+  A process that stops writes nothing (server shutdown's `close_all_sessions`
+  never reaches a recorder, and a kill runs no shutdown), so every run still
+  `running` at the next boot is cancelled by `cancel_orphaned_runs` from the
+  lifespan. It assumes one API process; a second replica would need a lease
+  or heartbeat instead.
+- **A retry says how long, and the provider's `Retry-After` wins.**
+  `MODEL_RETRYING` carries `retry_in` (seconds, a duration — the client anchors
+  it to its own clock so skew cannot show a countdown already over), computed by
+  `retry_delay(attempt, exc)`, which reads `retry_after_seconds(exc)` from
+  `agents/core/errors.py` before falling back to the jittered schedule. A
+  provider asking for longer than `MODEL_RETRY_HEADER_MAX_DELAY` is not
+  retried at all — the failure, with its code, is more useful now than after
+  a countdown that fails anyway. The summariser's calls are billed with
+  `scope: compaction`, so they count toward the total and never drive the
+  gauge.
+- **A request too long gets one compaction and one retry.** The automatic
+  summariser works from an estimate and the provider counts for real; when
+  they disagree the request comes back as `context_window`. The insights
+  runner then calls `compact_thread` (`agents/core/lc.py`) — LangChain's own
+  `SummarizationMiddleware` forced by a one-message trigger, keeping the last
+  `COMPACT_KEEP_TOKENS`, written back "as" the tools node so the graph's next
+  step is the request that failed — emits `context_compacting` /
+  `context_compacted`, and continues from the checkpoint. A second overflow is
+  the ordinary failure. deepagents' own summarisation event is cleared in the
+  same write: it indexes into the message list the rewrite just replaced.
+  Both paths — the emergency one and the automatic summariser — put the
+  **summary text** on `context_compacted` and the recorder writes it as an
+  `EventKind.COMPACTED` row, so the transcript can show what the thread now
+  opens with, live and after a reload, instead of an unexplained gap. The
+  automatic one is deepagents', which summarises *inside* the `model` node,
+  so a node name cannot find it: `is_summarization_call` reads the
+  `lc_source: summarization` tag both summarisers put on their model call,
+  and the divider goes out when the reply that runs on the summary starts
+  streaming, not when the node's update lands after it. `compaction_summary`
+  reads the same tag off the summary message, minus either summariser's
+  framing.
+- **A model has a price or it has no cost.** `PRICING` in `agents/models.py`
+  mirrors `CONTEXT_WINDOW` (a test holds them equal) and `cost_usd()` prices a
+  call from LangChain's usage, taking cached tokens out of the input figure.
+  `TOKEN_USAGE` and the state route carry `cost_usd`, `None` when unpriced —
+  never a guess, because on BYO keys the figure is what the user pays.
+- **A model that leaves the catalogue leaves a row behind.** Replacing a
+  `ModelName` value (Opus 5 → Opus 5.5, 2026-09-29) orphans every saved tier
+  pick, `GENERATE_MODEL` and stored thread that names the old id, and
+  `resolve_engine_model` sends an id it does not know to the *provider
+  default*: a Heavy pick of Opus 5 would have run on Sonnet without a word.
+  `RETIRED_MODELS` in `agents/models.py` maps the old id to its successor —
+  never a step up in price — and keeps the old model's own price and window,
+  so a thread it served still reads what it cost. An OpenRouter slug whose
+  only successor costs more gets no successor and keeps running as picked
+  (OpenRouter passes it through). `tests/test_model_transport.py` holds all
+  three. An OpenRouter slug names a *build*, so check the vendor's changelog
+  as well as the catalogue: `deepseek/deepseek-v4-flash` still served, and
+  looked current, after DeepSeek retired the build.
+- **A model's request contract is data, not a check at a call site.**
+  `CLAUDE_BOUND_THINKING` (Fable 5.1, Opus 5.5, Sonnet 5.5) answers two
+  questions: a forced `tool_choice` is a 400, so a typed answer at the end of a
+  tool loop goes through `agents/core/research.research_answer`, never a bare
+  `ToolStrategy`; and a thinking block replayed after an earlier turn changed
+  is a 400 for accounts opened on or after 2026-08-31, so `resolve_chat_model`
+  asks the API to drop it instead. `takes_temperature` drops the sampling
+  temperature the Claude 5 family and GPT-6 refuse while they reason. A new
+  model is classified in those tables when it joins the catalogue.
+- **Before adding an agent or changing one — a prompt, a tool, a model
+  default, a middleware, a LangChain bump — read
+  [`docs/engineering/agent-engineering.md`](../docs/engineering/agent-engineering.md).**
+  It is the rulebook for agent work on this stack: each rule, the LangChain
+  primitive behind it and the test that enforces it, the add/change
+  checklists, and the ranked open gaps. Fixing a gap means adding its test and
+  striking it from that list in the same change.
+- **A change to an agent runs the eval gate.** `agent-eval.yml` runs
+  `scripts/agent_eval.py` on any PR touching `agents/` (not `agents/content/`
+  or `agents/audit/`, which no case covers yet: take the exclusion off when
+  one does), `service/memory.py`, `service/profile.py` or the lock: each case
+  in `tests/eval/cases/` three times on a PR with no re-run, six times on the
+  merge to `main`, on a synthetic account, DeepSeek V4 Flash on OpenRouter with GLM 5.3
+  Flash judging, a verdict against `tests/eval/baselines.json` (`make agent-eval`
+  locally, a few cents). A baseline is per model: a run on another model is
+  INCONCLUSIVE until `--write-baseline` records one for it. The eval runs on
+  every push to a ready PR, so open agent PRs as drafts while iterating.
+  It is in shadow until an A/A window on unchanged `main` shows no false
+  FAIL; from then on FAIL does not merge, and INCONCLUSIVE needs one line in
+  the PR saying why it is acceptable. A harness change also adds an offline
+  test of what reaches the model for the invariant it touches
+  (`tests/test_request_invariants.py` is the model), never a prompt-wording
+  test. A bug found in a real session ships with a synthetic case that fails
+  without the fix. Never raise k, lower a threshold or delete a case to turn a
+  run green: loosening the gate is its own PR, with the numbers.
+- **Read the harnesses built in the open before designing a lifecycle
+  feature.** [`docs/engineering/agent-harness-references.md`](../docs/engineering/agent-harness-references.md)
+  is the watch-list — Codex, OpenCode, pi — with the revision each was last
+  read at, findings pinned to `file:line`, and the gaps they expose in ours,
+  sized. Pauses that survive a reconnect, typed error codes, steer-versus-queue
+  input and visible compaction all have a worked answer there. Refresh the
+  table when you read one.
+- **Pick the lowest rung that works.** LangChain 1.x is layered, and the layers
+  carry different stability guarantees: `init_chat_model` and `create_agent` are
+  on the semver-stable 1.x LTS surface (no breaking changes until 2.0), while
+  `deepagents` is 0.x with no stability policy and a weekly cadence. Reaching for
+  `deepagents` where `create_agent` suffices buys churn for nothing.
+
+  The rung is a property of the agent, not of the agent *type*, and it can move
+  when the agent's job does. The autonomous insights session
+  (`agents/insights/v1/runner.py`) is on `deepagents` because it needs four
+  things `create_agent` lacks — a planning loop, subagents, skills, and the
+  `interrupt_on` upgrade path — and the phase plan spends all four. The content
+  session (`agents/content/v1/runner.py`) spends three of them from its first
+  turn: `write_todos` is the checklist the workspace renders, `research_pillar`
+  and `draft_post` are sub-agents, and the virtual scratch space holds drafts.
+  Audit's V1 runner is still on the `create_agent` rung, and content's
+  enrichment pass (`agents/content/enrichment.py`) is one too — search, fetch,
+  structured answer, no planning.
+
+  **The rung is chosen; the middleware is not.** A session graph is built by
+  `agents/core/deep_session.py` — `build_deep_session_agent` or, on the
+  `create_agent` rung, `build_session_agent` — and both mount the same
+  `session_middleware` list (pruning, call limits, fallback, reported retry,
+  steer) plus provider prompt caching. The audit was a bare `create_agent`
+  from 2026-08-16 to 2026-09-27: its `RunLimits` (added 09-06) were declared
+  and never enforced and Anthropic never cached its prefix, all tests green.
+  `tests/test_agent_assembly.py` now fails a graph built anywhere else; a
+  bounded one-shot pass (the two enrichment modules) is listed there and must
+  still pass `prompt_caching_middleware()`.
+
+  Three consumers of the 0.x pin now, so `tests/test_deepagents_harness.py`
+  matters more, not less: run it before moving the pin. `tests/test_content_v1_runner.py`
+  pins the content contract the same way `tests/test_insights_session.py` pins insights.
+- **`deepagents` is pinned exactly**, not with a caret — it changes behaviour in
+  minors (task planning became opt-in in 0.7). `tests/test_deepagents_harness.py`
+  is the upgrade gate; run it before moving the pin.
+
+## Artifact contract
+
+The app lists top-level `*.json` briefs in `data/google_ads/` (e.g. `google-ads-report.json`) for local dev; user-generated insights are returned from `POST /api/insights/generate` and stored client-side (`localStorage`).
+
+The JSON contract:
+- `source_metadata.theme` — theme key (`paid_ads`, `product_intelligence`, `organic_growth`); the app resolves accent colors from this
+- `source_metadata.generated_at` — ISO 8601 timestamp
+- All other fields follow the typed models in `service/google/schema.py`
+
+Do not write HTML from the backend. Do not reference `themes.json` or HTML templates — those have moved to the app.
+
+## Code design rules
+
+- Normalize first, synthesize second.
+- Keep typed schemas central and explicit.
+- The backend is a data pipeline, not a renderer. Output JSON; let the app handle presentation.
+- Separate ingestion, normalization, synthesis, and delivery concerns.
+- Prefer extensible evidence models so future tools can enrich the same findings.
+
+### Shared helpers — check here before writing a local copy
+
+Each of these replaced a family of divergent duplicates (23 private
+`_utcnow()` definitions, five hand-rolled retry loops). A new local copy
+re-opens that drift, so reach for these first and extend them when they
+don't fit.
+
+- `utils/dates.py` — `utcnow()`, `now_iso()`, `parse_iso()`, `last_n_days()`.
+  **Never `datetime.now()` or `datetime.utcnow()`**: every persisted timestamp
+  is UTC-aware, and naive ones compare and serialise inconsistently across
+  SQLite (desktop) and Postgres (Railway). Stdlib-only leaf module, so
+  `models/` can use `default_factory=utcnow` without an import cycle.
+- `utils/strings.py` — `slugify()`, `titleize()`.
+- `utils/formatting.py` — `money()`, `number()`, `percent()`, `multiplier()`,
+  `safe_divide()`.
+- `service/memory.py` — agent memory (`project_memories`): `remember()` is the
+  ONLY write path (it redacts secrets, drops raw ids from titles, dedupes,
+  honours the pause switch, and closes the previous value of a state key), `search()` is the only read path
+  (Postgres FTS, SQLite LIKE), and `build_memory_context()` assembles the prompt
+  blocks. Never write the table directly and never re-render the digest locally
+  — the supersession and never-raise contracts live in that module.
+  `service/memory_consolidation.py` owns the post-session extraction pass; its
+  model output is a proposal that still goes through `remember()`. Tools for
+  both harnesses are in `agents/core/memory_tools.py` and the shared prompt
+  stanza is `agents/core/prompts.py::MEMORY_DISCIPLINE`. Per-project memory goes
+  in the USER message, never the system prompt.
+  `search(time_aware=True, rank=True)` is the question-shaped read — it reads a
+  date range out of the words, treats a named kind as a filter, matches on ANY
+  term and then tightens (all terms → two → one), and ranks by relevance +
+  recency + importance + recall. Leave both off for a filter form like the
+  timeline, whose inputs are the user's explicit instructions. Retrieval makes
+  no model calls, by design. `tests/eval/memory_recall.py` holds the 50-question
+  set (`pytest tests/test_memory_retrieval.py -s` prints the per-axis report);
+  it exists because it caught the AND-everything query bug that made questions
+  retrieve nothing, so extend it before tuning retrieval by feel.
+
+  **Private memory is private whatever the role, and the rule is in the
+  service, not in the routes.** `remember()` stores a `PERSONAL_KINDS` entry
+  (identity, communication, method) as user scope even when the caller said
+  project, because an agent in a project run noticing how someone works is
+  describing that person; `feedback` is left out on purpose, since a skipped
+  draft's reason is about the project's output. A private row may be bound
+  to one project (`private_to_project=True`: "for this client, brief me in
+  Spanish"), so it carries that project's id, which is why **every project
+  read goes through `shared_rows()`, never `project_id ==` alone**. A bound
+  row is read only on runs for its project, never replaces the general one,
+  and keys its state to its person so two teammates can bind the same key.
+  `search()` never returns the preference keys the profile now owns
+  (`_PROFILE_OWNED_KEYS`). Held by `tests/test_memory.py`.
+
+  **The kinds are twelve project and four personal** (`models/memory.py`).
+  `rule` is a standing policy, keyed `rule:<topic>` so a new one replaces the
+  old, and every rule in force leads the digest's Pinned section; `outcome`
+  is what a change did, keyed by the change and the window measured. Merged
+  kinds (`LEGACY_KINDS`: milestone, process, tooling) are mapped on write and
+  in `search()`, so an old name still works; add to that map rather than
+  deleting a kind outright.
+
+  Six rules about when memory is read and written, each held by
+  `tests/test_memory_context.py`, `tests/test_memory_phase2.py` or
+  `tests/test_memory_retrieval.py`:
+
+  - **`build_memory_context()` returns its blocks in `MEMORY_BLOCKS` order and
+    applies the agent's `ContextSpec` itself.** A turn carries the result as one
+    string in the `project_memory` slot, so memory's tags stay adjacent in
+    `BLOCK_ORDER`. A block the spec switches off is never queried.
+  - **The digest budget is whole entries**, `DIGEST_MAX_CHARS` (about 1,500
+    tokens) and `DIGEST_MAX_ENTRIES`, spent in section order: pinned, open,
+    relevant to this question, recent, artifacts. An entry that does not fit is
+    left out and is not reported as recalled.
+  - **Recalled means cited or opened, never shown.** `ConversationRecorder`
+    credits the `m_…` ids a reply cites (`touch_cited`), and GetMemory credits
+    what it opens. Counting the digest fed its own ranking.
+  - **Consolidation does not depend on a close.** Close flushes early; the
+    sweep in `service/memory_consolidation.py` (every five minutes, for
+    conversations quiet for 30) is what guarantees the pass after a deploy,
+    crash or quit desktop app. It runs on `Job.MEMORY`, the owner's Light tier.
+    "Don't remember this" is stored on the conversation
+    (`record_remember_choice`), because the sweep never sees the session.
+    The sweep can spend only *saved* keys, so an owner whose keys live in the
+    desktop keychain or a browser tab is covered by keys they lend instead:
+    a closing session lends its caller's header keys (`LentKeys`), and the app
+    calls `POST /api/user/memory/catch-up` when it opens and every 30 minutes
+    (`app/src/lib/memoryCatchUp.js`). Lent keys are held in memory, never
+    stored, and spent only on projects the lender owns, because the owner pays
+    for background work. Plan tokens are never lent: a structured one-shot
+    call cannot spend them.
+  - **A thread re-reads memory at most hourly, and only when something changed.**
+    `memory_refresh` compares the conversation's `memory_primed_at` with the
+    newest memory row, excluding the thread's own writes; `routes/agents.py`
+    asks on each message, and the session holds when to ask next.
+  - **A state outside Duct is shown with its age, never as "present".** A
+    campaign's status, a budget, a rolling metric renders `seen <date> · Nd`,
+    and past its entity's shelf life (`FRESHNESS_TTL_DAYS`) `verify`, which
+    `MEMORY_DISCIPLINE` turns into a re-read before the entry is stated as
+    current. Remembering the same fact again stamps `meta.verified_at` and
+    starts the age over; a consolidation pass does not, because a transcript
+    that repeated memory is not a sighting. Derived at read time
+    (`volatility()`, `freshness()`), so no column. The freshness axis of the
+    memory eval holds the stale-assertion and false-alarm rates at zero.
+- `agents/core/turn.py` — **how every agent's user turn is built.** An agent
+  declares a `ContextSpec` in `agents/registry.py` (which shared blocks it
+  wants); a run renders a `TurnContext`; `build_turn` orders them. A new agent
+  that declares nothing gets everything — business context, the operator's
+  profile, stored agent context, prior reports, memory, data sources — which is
+  the right default, because an extra block costs a few hundred tokens and a
+  missing one costs an agent that does not know who it is answering. That was
+  not hypothetical: `display_name` reached insights and content and silently
+  missed audit for a release, because audit described the operator its own way.
+
+  Two rules this module exists to hold, both enforced by `tests/test_turn.py`:
+
+  - **Per-user and per-project text goes in the USER turn, never the system
+    prompt.** The system prompt is the cached prefix; one customer's name in it
+    gives every account a prefix of its own and loses the hit on every call of
+    every run. The test builds a profile of distinctive strings and fails if
+    any of them appear in a system prompt.
+  - **`BLOCK_ORDER` is stable-first, volatile-last, and it is a cache decision
+    rather than a formatting one.** Inside one session the order is free (turn
+    one is the prefix for turn two either way). It pays *across* runs: two
+    insights runs on the same project a week apart share a system prompt, and
+    if both turns open with byte-identical `<business_context>` and
+    `<user_context>` the cached prefix extends past the system prompt into the
+    turn. Lead with the memory digest instead and the match ends at the first
+    block, because memory moved in between. Do not "tidy" that tuple into
+    declaration order.
+
+  An agent with a block of its own may set an unlisted tag — it renders after
+  the ordered blocks and before the request. Anything a *second* agent starts
+  using belongs in `BLOCK_ORDER`, where its cache position is a decision
+  somebody made on purpose.
+
+- `scripts/session_bundle.py` — pull one stored session (the context the
+  model read, every tool call with its payload, artifact versions, memories,
+  cost) into a folder for review; `make session-bundle ID=<conversation id>`
+  or `ID=list`. Read-only, redacts on the way out, and the folder is
+  customer data: it goes in the private audit home, never here. The
+  `session-audit` skill (`.agents/skills/session-audit/`) is the review
+  procedure built on it. The pull is only as good as what the recorder
+  wrote: `EventKind.CONTEXT` (one row per `run_session`, written by the
+  runner that composed the turn — the insights runner today) holds the
+  composed opening turn, its blocks and the system prompt's fingerprint,
+  because the USER row is only the sentence the person typed. A runner
+  that assembles its own turn and does not record a CONTEXT row cannot be
+  audited against what its model saw; give it one before relying on the
+  skill for that agent.
+- `scripts/session_replay.py` — re-run a bundled session on exactly its
+  own data with the current prompt and any model (`make session-replay
+  BUNDLE=<dir>`). FetchData is seeded from the bundle and the connectors
+  are closed (`replay=` in `build_data_tools_lc`: a pull the original never
+  made returns `not_in_replay`), no recorder, no persister, no memory or
+  execution tools. It is how a prompt proposal is checked against the run
+  that motivated it before it ships, and it spends a real model call.
+- `scripts/dump_prompts.py` — **regenerate after any prompt change**
+  (`make dump-prompts`). It renders every agent's system prompt and a sample
+  assembled turn to [`docs/engineering/agent-prompts.md`](../docs/engineering/agent-prompts.md),
+  checked in, so a prompt change lands in the pull request as prose rather than
+  as a Python string edit a reviewer has to assemble in their head.
+  `prompts.yml` runs the `--check` form on a PR that touched a prompt, and
+  `make check-backend` runs it locally.
+
+  We looked at the prompt file formats (Prompty, dotprompt, POML, BAML) and did
+  not adopt one. They solve prompts-as-swappable-config, edited outside the
+  repository and hot-reloaded without a deploy. Duct's prompts are composed:
+  `agents/content/prompts.py` alone has 47 interpolation sites and 22 branches,
+  audit assembles its scoring table from `agents/audit/scoring.py` and varies
+  its tool guidance on whether the provider does vision. Moving that into
+  Handlebars or Jinja moves real logic into a template language with no types
+  and no tests. **The reviewability problem was never the storage format** — it
+  was that nobody could read the assembled result. That is what the dump fixes.
+
+  The output must stay deterministic: no timestamps, no run ids. A
+  non-deterministic byte fails `--check` on every unrelated pull request, and a
+  check that cries wolf gets switched off.
+
+- `agents/core/lc.py` — the LangChain adapter every V1 runner shares:
+  `resolve_chat_model` (model transport) and `stream_agent` (LangChain stream →
+  the `AgentEvent` vocabulary), plus `build_ask_user_tool`, the LangChain half
+  of the human-in-the-loop port. Extracted from `agents/audit/v1/runner.py` when
+  insights became the second V1 runner. A V1 runner should not talk to
+  `init_chat_model` or drive `astream` itself. A one-shot typed answer goes
+  through `structured_output`, not `with_structured_output`: it asks Claude
+  for its own JSON-schema output, since the integration's default forces a
+  tool call that Fable 5.1 refuses.
+- `agents/insights/report.py` + `prompts/autonomous.REPORT_CONTRACT` — the
+  structured deliverable beside the brief. One agent, two contracts: the
+  system prompt ends with `ARTIFACT_CONTRACT` (prose) or `REPORT_CONTRACT`
+  (blocks with inline rows), chosen by `build_insights_system_prompt(
+  deliverable=…)`, two cached prefixes rather than one per project; which
+  template and sources ride in the user turn as `<report_plan>`.
+  `VIZ_PROTOCOL` (which chart answers which question) reaches both, because
+  the HTML brief draws charts too and drew a pie of twenty queries once.
+- `agents/insights/totals.py` — **Duct adds up a pull; the model quotes the
+  sum.** `fetch_entity` puts `totals`, `rates` and per-dimension `subtotals`
+  on every row report, from the catalog's `agg`, `ratio` and `weight`, and
+  says in `totals_cover` whether they are the window's or a floor, and
+  whether the source flagged the report itself: a fetcher puts a source's
+  own caveats in `data_quality` as sentences (GA4's thresholding, sampling,
+  "(other)" roll-up and date truncation, from the response metadata), and
+  the cover points at them. A replay
+  of a real brief reasoned right and added wrong (2,504 against 2,681
+  sessions); summing is now never the model's job. A ratio metric is total
+  over total, never a mean of rates (CPA weighted by conversions would drop
+  every row that spent and converted nothing). A new averaged catalog field
+  declares `ratio` or `weight`, or `tests/test_insights_totals.py` fails.
+- `agents/core/compaction.py` — lossless payload compaction, applied to a
+  connector result before it reaches the model. Folds a homogeneous row array
+  to typed CSV; **verifies the result structurally and discards a fold that
+  lost anything**, because `lossless_only` does not gate every path in the
+  library underneath (an array of identical strings is still collapsed). Off
+  is not "the model sees everything" — off is the mid-structure cut in
+  `agents/insights/data_tools.py`, which on a 900-row pull drops about two
+  thirds of the numbers. Absent dependency degrades to plain JSON, so a
+  self-host build without the Rust extension still runs. Reached from a
+  `UserPreferences` flag (`context_compression`, default on) threaded through
+  the runner the same way `artifact_format` is.
+- `service/artifact_store.py` — versioned artifact persistence. `ArtifactPersister`
+  wraps a runner's emit and stores every `ARTIFACT_VERSION` event; an **adapter**
+  (`ArtifactVersion` + a `Callable[[dict], ArtifactVersion]`) reads one version out
+  of whatever payload that agent emits. A new agent writes an adapter — audit's
+  validates an `AuditReport`, insights' reads a written brief — and never a second
+  persistence path. Storing is the store's job; understanding the payload is the
+  adapter's.
+- `agents/tools/execution_tools.py` — the staged-execution tool surface, as a
+  binder pair (`build_execution_tools_lc` / `build_execution_mcp_server`) over
+  shared descriptions, arg schemas and domain functions. The surface is
+  deliberately asymmetric: propose, inspect and roll back exist; **approve and
+  apply do not, in either harness.** Autonomy (`ask | assisted | auto`) changes
+  how often an agent interrupts, never what may auto-apply — `service/execution/
+  policy.py` is the one place that decides, and it does not consult the model.
+- `service/connectors.py` — the registry and the adapter contract. A
+  `list_accounts` row has a canonical half the browser reads and a native half
+  it never does: `account_id` / `account_name` name the thing being **picked**
+  (the GA4 property, the GTM container — not its parent account, which several
+  rows share), and the optional `entity_url` / `entity_detail` / `entity_meta`
+  (built with `entity_facts`) are what the picker renders as a favicon, a
+  disambiguating line and short chips. Vocabulary is server-side too
+  (`ConnectorMeta.entity_noun`), so adding a connector stays one registration
+  rather than a registration plus an edit to a table in the frontend.
+  `ConnectorMeta.server_only_keys` names credential keys **no request may
+  write**, and both routes that take credentials from a body refuse them.
+  It exists for the GitHub App (`service/github/app.py`): Duct's private key
+  mints a token for any installation id it is handed, so an id a browser
+  could store is someone else's repository. The only writer is the claim
+  route, bound to the user whose signed-in session started the connect.
+  The four Google connectors' `refresh_token` is server-only for the same
+  reason and by the same route shape (issue #456): `POST
+  /api/user/connectors/connect-link` names the user, the OAuth callback parks
+  the grant, `POST /api/user/connectors/claim` stores it merged over the row
+  (`service/connector_store.store_oauth_grant`, so a reconnect keeps the MCC
+  id). **No Google token reaches a client** — not in a redirect, a response or
+  browser storage — and every reader (`/api/insights/refresh`, execution,
+  FetchData) resolves from stored rows; there is no request override left.
+  `ConnectorMeta.settings_keys` is the opposite list: non-secret keys the user
+  may change on a stored row (`PATCH /api/user/connectors/{id}`), today only
+  the Ads `login_customer_id`, shown back as `settings` on the row.
+- `service/content_metrics.py` — a content post's `perf`, read and written one
+  way. `METRIC_ALIASES` reconciles the three key conventions in the column
+  (PostBridge's `view_count`, migrated `avgWatchTime`, hand-entered `saves`;
+  Zernio's adapter writes the canonical names, and leaves out a metric it
+  reports as 0 where the platform reports none, because unknown is not zero);
+  read through `metric_value`, never `perf.get("…")`. Two writers:
+  `merge_manual_metrics` (the `/metrics` route) records typed-in metrics under
+  `manual_keys`, and `merge_synced_metrics` (the sync route and the agent's
+  `log_metrics`) skips every alias of those, so **a sync never overwrites a
+  number somebody typed.** `app/src/lib/contentMetrics.js` mirrors the table
+  and `tests/test_content_metrics.py` holds the two equal.
+- `service/rest.py` — sync HTTP transport for the reporting connectors:
+  retry, backoff, rate-limit pacing, error typing. A new connector declares
+  an `Endpoint` and an `ApiError` subclass and writes no transport code;
+  auth headers, query encoding and pagination stay vendor-side. Not for
+  `service/apify`, `service/post_bridge` or `service/zernio` — those are async, hold a
+  long-lived client, and need no retry.
+- `service/ollama.py` + `Provider.OLLAMA` — open models on the instance's own
+  Ollama server (`OLLAMA_BASE_URL`), the one chat provider with no key: the
+  server is the credential (`ProviderKey.source == "instance"`), reachable on
+  hosted and local alike once the operator sets it, and only when it holds a
+  model that calls tools. Ids are namespaced `ollama:<tag>`, checked before
+  `provider_of`'s "/" test because a Hugging Face tag has one. Three rules,
+  held by `tests/test_ollama_provider.py`: the pickers list what the server
+  holds (`/api/tags`, filtered on `/api/show`'s `tools` capability), never a
+  catalogue; every call sends `num_ctx` (`OLLAMA_CONTEXT_LENGTH`, held to the
+  model's trained length), because Ollama's own 4,096-token default silently
+  cuts the system prompt and tools; and `reasoning` goes only to a model that
+  thinks, since Ollama refuses it from one that cannot. A local model is
+  priced at zero, not unknown.
+- `service/compatible.py` + `Provider.OPENAI_COMPATIBLE` — an OpenAI-compatible
+  endpoint a user brings (vLLM, llama.cpp, LM Studio, Together, Groq):
+  ChatOpenAI at their address. Its credential is the address, an optional key
+  and the models they chose (with each one's reported context length) packed
+  into one string (`oaic1.…`), so it is stored, sent as `X-Provider-Compatible`
+  and lent to background work exactly like a key; `app/src/lib/
+  endpointCredential.js` packs the same bytes, and a shared fixture holds the
+  two equal. Ids are `compat:<the server's id>`, checked before the "/" test
+  (a vLLM model is named by its Hugging Face repo). Four rules, held by
+  `tests/test_compatible_provider.py`: **the address is user input**, so off a
+  private network it must be public https, judged on the name when entered
+  (`canonical_base_url`), and every request after is resolved once, judged
+  and connected to the address that passed, real hostname kept for TLS
+  (`_PinnedTransport`, so DNS rebinding has no second lookup to win), with
+  discovery read under a size and time cap; a private address
+  only where the network is the user's own (desktop sidecar, local dev, or
+  `PRIVATE_MODEL_ENDPOINTS`); **connecting proves a tool call**
+  (`POST /providers/openai_compatible/probe`), because a model that answers
+  in words cannot run an agent; a typed answer asks for a JSON schema first
+  (constrained decoding, which a small model follows where it ignores a forced
+  tool call) and falls back to a tool call; and the price is
+  unknown (`None`), since a hosted endpoint bills and Duct cannot say what.
+- `service/publishers/` — social schedulers as connectors (PostBridge,
+  Zernio). Nothing publishes by default: a project publishes through a
+  scheduler its owner connected, each linked account names the scheduler that
+  holds it (`content_social_links.publisher`), and a sent post records its own
+  (`content_posts.publisher`, `publisher_post_id`), because only the scheduler
+  holding a queued post can change or cancel it. `base.py` is Duct's
+  vocabulary (`Publisher` protocol, `RemotePost`, `RemoteStatus`,
+  `PublisherError`, `PostAlreadyOut`) and every caller speaks only it; each
+  adapter lives beside its client (`service/post_bridge/publisher.py`,
+  `service/zernio/publisher.py`) and translates the vendor's ids, statuses,
+  replies and metric names. What a scheduler can do differs per platform and
+  is data on its `PublisherSpec` — `replies` (PostBridge: one on X and
+  Threads; Zernio: a thread on X and Threads, a first comment on LinkedIn,
+  Instagram, Facebook), `metrics` (Zernio reports LinkedIn and X too),
+  `strips_links` (PostBridge on X) — which `channel_payload` folds into what
+  the app reads, so `channels.RULES` keeps only the platform's own facts.
+  Adding a scheduler is an adapter, a spec in `registry._SPECS`, a `VendorKey`
+  and a transport fake in `tests/fakes.py`; the routes, the agent's tools and
+  the Accounts tab read the registry. Adapters speak REST, not the vendors' MCP
+  servers: publishing runs the typed checks, the approval and the bookkeeping
+  around a call, and settling, metrics and the Analytics tab run with no model
+  in the loop at all. A scheduler Duct does not support is still reachable
+  through the MCP client (`service/mcp/`), behind its approval card.
+- `service/vendor_keys.py` — a third-party key each user brings for
+  themselves (PostBridge, Zernio, Apify). A request spends the key its project's
+  owner saved; the instance's env key only where `allow_server_provider_keys()`
+  holds, because on a hosted instance it is Duct's account and every signup
+  would be spending it. A new user-facing vendor declares one `VendorKey`
+  beside its client (with a `check`: the cheapest read that proves a pasted
+  key works) and joins `_vendor_key` in `routes/content.py`; the routes, the
+  app's `VendorKeyForm` and the tests are already generic. Never read the
+  vendor's `Configs` key directly. A vendor's 401 is about that key, so it
+  never reaches the browser as a 401: the app signs the user out on one.
+
+## Sequencing rules from the plans
+
+- Validate the brief/report shape before building heavy automation.
+- Start with one customer, one tool, one brief/report end-to-end.
+- Add connectors and orchestration only after the output format is useful.
+- Add real-time anomaly detection after the scheduled brief flow works.
+
+## What not to build yet
+
+- no custom auth in backend
+- no full Airbyte platform management
+- no heavyweight job system beyond the planned orchestration layer
+- no broad dashboard experience
+- no complex cross-tool logic before the single-source MVP is producing useful output
+
+## Configuration
+
+`config.py` is the source of truth for what the backend reads; `.env.example`
+is its documentation, and `tests/test_env_example.py` keeps the two honest.
+
+The reason that test exists is worth knowing before adding a setting: **every
+field in `Configs` has a default.** A missing variable therefore never fails —
+the feature it powers silently does nothing. That makes an undocumented setting
+undiscoverable rather than broken, which is how `.env.example` drifted to
+covering about a third of what a running instance sets.
+
+So when you add a setting:
+
+- If it is a credential (matches `api_key|_secret|_token|_dsn|password|client_id|encryption_key|jwt_secret`),
+  the test **requires** it in `.env.example`. That is not bureaucracy; it is the
+  only signal a new contributor gets.
+- If it is read from `os.environ` directly rather than through `Configs`, add it
+  to `NOT_CONFIG_FIELDS` in that test with the reason. A bare exemption is a
+  hole in the check.
+- Renaming a field means renaming it in `.env.example` too — the stale check
+  catches it, because a wrong example is worse than a missing one.
+
+Names are shared across processes deliberately. `POSTHOG_API_KEY` is read by
+this backend and by the desktop sidecar (only when the shell passes it, on the
+user's Preferences switch); `GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET` is read here
+and compiled into the Tauri shell via `option_env!`.
+One value in `.env.local` serves all of them — do not invent a `DUCT_`-prefixed
+variant for the desktop half.
+
+### Creating a migration
+
+Always create Alembic revisions with autogenerate — `alembic revision
+--autogenerate -m "..."` or `python scripts/migrations.py revision ...`. Do not
+hand-write a revision file. Autogenerate diffs the models against the live
+schema, which is the step that catches a column you added to a model and forgot
+to migrate; a hand-written revision cannot notice what you did not think of.
+Review the generated file before applying it — autogenerate is a good first
+draft and a poor final one, especially for renames and server defaults.

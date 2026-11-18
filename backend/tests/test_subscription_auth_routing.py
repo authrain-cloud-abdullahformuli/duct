@@ -1,0 +1,243 @@
+"""Which chat model does each OpenAI credential shape call for?
+
+A ChatGPT subscription credential targets ``chatgpt.com/backend-api/codex``, not
+the public OpenAI API, so it needs ``_ChatOpenAICodex`` rather than
+``ChatOpenAI``. The invariant worth protecting: **an explicit API key always
+wins** — it is the supported path, the only one that may serve end users, and
+the one with predictable latency.
+
+There is deliberately no Anthropic equivalent. Anthropic disabled `sk-ant-oat…`
+on the Messages API in Feb 2026, and the only thing that authenticates one is
+the `claude` CLI subprocess — measured at ~125s per synthesis with no token
+streaming, versus ~$0.04 to run the same call on an API key. Claude uses ANTHROPIC_API_KEY.
+
+These assert the two live primitives — ``should_use_codex`` classifying the
+credential and ``resolve_chat_model`` building the client — rather than a
+composition of them. The one place that composed them was the frozen
+``v1/agent.py``, deleted with the rest of that pipeline; nothing wires a
+ChatGPT subscription into a live insights run today.
+
+No network and no ChatGPT login required.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from agents.core import codex
+from agents.models import ModelName, Provider
+
+
+# ---------------------------------------------------------------------------
+# Credential classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("sk-proj-abc", True),
+        ("sk-abc", True),
+        # A ChatGPT OAuth access token is not an API key.
+        ("eyJhbGciOiJSUzI1NiJ9.abc", False),
+        ("", False),
+    ],
+)
+def test_an_openai_api_key_is_recognised_by_its_prefix(value, expected):
+    assert codex.is_openai_api_key(value) is expected
+
+
+# ---------------------------------------------------------------------------
+# Route selection
+# ---------------------------------------------------------------------------
+
+
+def test_an_openai_api_key_never_routes_to_the_subscription(monkeypatch):
+    """Even with a ChatGPT login present, a real key wins."""
+    monkeypatch.setattr(codex, "codex_available", lambda: True)
+    assert codex.should_use_codex("sk-proj-abc") is False
+
+
+def test_the_subscription_is_used_only_when_a_login_exists(monkeypatch):
+    monkeypatch.setattr(codex, "codex_available", lambda: True)
+    assert codex.should_use_codex("") is True
+
+    monkeypatch.setattr(codex, "codex_available", lambda: False)
+    assert codex.should_use_codex("") is False
+
+
+def test_building_a_codex_model_without_a_login_says_how_to_log_in(monkeypatch):
+    monkeypatch.setattr(codex, "codex_available", lambda: False)
+    with pytest.raises(RuntimeError, match="login_chatgpt"):
+        codex.build_codex_chat(model="gpt-5-mini")
+
+
+# ---------------------------------------------------------------------------
+# End to end through the v1 constructor
+# ---------------------------------------------------------------------------
+
+
+def _llm_for(api_key: str, provider: Provider, model: ModelName) -> str:
+    from agents.core.lc import resolve_chat_model
+
+    return type(resolve_chat_model(provider, model, api_key)).__name__
+
+
+def test_a_subscription_is_recognised_and_an_api_key_still_wins(monkeypatch):
+    """The invariant, at the level that still exists: classification."""
+    monkeypatch.setattr(codex, "codex_available", lambda: True)
+
+    assert codex.should_use_codex("") is True
+    assert codex.should_use_codex("sk-proj-x") is False
+
+    # And the client a subscription calls for is the Codex one, not ChatOpenAI.
+    assert type(codex.build_codex_chat(model="gpt-5-mini")).__name__ == "_ChatOpenAICodex"
+    assert _llm_for("sk-proj-x", Provider.OPENAI, ModelName.GPT_5_MINI) == "ChatOpenAI"
+
+
+def test_anthropic_always_uses_the_messages_api(monkeypatch):
+    """No subscription path exists for Claude on v1 — see the module docstring."""
+    monkeypatch.setattr(codex, "codex_available", lambda: True)
+    assert _llm_for("", Provider.ANTHROPIC, ModelName.CLAUDE_SONNET) == "ChatAnthropic"
+
+
+def test_other_providers_are_untouched_by_the_subscription_path(monkeypatch):
+    """Gemini and OpenRouter must not acquire a ChatGPT dependency."""
+    monkeypatch.setattr(codex, "codex_available", lambda: True)
+    assert _llm_for("k", Provider.GOOGLE_GENAI, ModelName.GEMINI_2_5_FLASH) == "ChatGoogleGenerativeAI"
+
+
+# ---------------------------------------------------------------------------
+# Which providers may claim a plan at all
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "provider",
+    [p for p in Provider if p is not Provider.OPENAI],
+)
+def test_only_openai_can_claim_a_plan(provider):
+    """A JWT in any other provider's slot is a mis-paste, never a subscription.
+
+    The regression this exists for: ``/providers/status`` asked only whether a
+    credential *looked* like a plan token, so a JWT anywhere lit the tile as
+    "Your subscription" — and on Anthropic it did, above a tooltip reading
+    "Using your ChatGPT plan". Anthropic forbids third-party use of a Claude
+    plan and rejects the token at the API, so that tile was advertising a
+    purchase that cannot be made. The label is only as honest as the provider
+    guard in front of it.
+    """
+    # Header + empty payload + a signature segment spelled so the secret
+    # scanner can see it is not one. Only the shape is under test.
+    token = "eyJhbGciOiJSUzI1NiJ9.e30.EXAMPLE"
+    assert codex.is_subscription_credential(token) is True
+    assert codex.is_plan_credential(provider, token) is False
+    assert codex.is_plan_credential(Provider.OPENAI, token) is True
+
+
+def test_an_api_key_is_never_a_plan_even_on_openai():
+    assert codex.is_plan_credential(Provider.OPENAI, "sk-proj-abc") is False
+    assert codex.is_plan_credential(Provider.OPENAI, "") is False
+
+
+# ---------------------------------------------------------------------------
+# Presence is not reachability
+# ---------------------------------------------------------------------------
+
+
+def test_a_stray_plan_token_is_not_a_key_for_anyone_else():
+    """The bug this pair of guards exists for, end to end.
+
+    ``bool(user_keys.get(provider))`` was the reachability test, so a leftover
+    ChatGPT token in the Anthropic slot reported ``reachable`` *and*
+    ``runnable`` — the tile went green and `/models/preview` promised "Heavy
+    jobs run on claude-opus-5" for a request that would come back 401.
+    """
+    from routes import providers as providers_route
+
+    token = "eyJhbGciOiJSUzI1NiJ9.e30.EXAMPLE"
+    assert codex.is_usable_credential(Provider.OPENAI, token) is True
+    assert codex.is_usable_credential(Provider.ANTHROPIC, token) is False
+
+    rows = providers_route.providers_status(
+        user_keys={Provider.ANTHROPIC: token}, user=None, db=None
+    )["providers"]
+    row = next(r for r in rows if r["id"] == Provider.ANTHROPIC.value)
+    assert row["reachable"] is False
+    assert row["source"] == "none"
+    # The user still has to go remove it, so the tile needs to be told.
+    assert row["key_mismatch"] is True
+
+    preview = providers_route.models_preview(
+        body=providers_route.TierPreviewRequest(tiers={"heavy": "claude-opus-5"}, engine="v1"),
+        user_keys={Provider.ANTHROPIC: token},
+        user=None,
+        db=None,
+    )
+    heavy = next(t for t in preview["tiers"] if t["id"] == "heavy")
+    assert heavy["runnable"] is False
+
+
+def test_an_ordinary_api_key_is_usable_everywhere():
+    # Except the OpenAI-compatible slot, which holds a packed endpoint, never a
+    # bare key (tests/test_compatible_provider.py).
+    for provider in Provider:
+        if provider is Provider.OPENAI_COMPATIBLE:
+            continue
+        assert codex.is_usable_credential(provider, "sk-whatever-123") is True
+        assert codex.is_usable_credential(provider, "  ") is False
+
+
+def test_an_unusable_credential_is_not_the_key_a_run_spends(monkeypatch):
+    """It falls through to the stored key instead of being sent and 401ing."""
+    from agents import engines
+
+    key = engines.resolve_provider_key(
+        Provider.ANTHROPIC,
+        {Provider.ANTHROPIC: "eyJhbGciOiJSUzI1NiJ9.e30.EXAMPLE"},
+        stored_keys={Provider.ANTHROPIC: "sk-ant-api03-real"},
+    )
+    assert key.key == "sk-ant-api03-real"
+    assert key.source == "stored"
+
+
+# ---------------------------------------------------------------------------
+# What a plan-backed call asks for
+# ---------------------------------------------------------------------------
+
+
+def test_a_plan_call_carries_its_reasoning_across_tool_steps():
+    """The Codex backend forces ``store=False``, and a stateless Responses call
+    keeps a reasoning item only when it came back encrypted. Without the
+    ``include`` the client dropped every reasoning block between tool calls
+    and the model re-planned from scratch at each step."""
+    from langchain_core.messages import HumanMessage
+
+    token = "eyJhbGciOiJSUzI1NiJ9.e30.EXAMPLE|acct-1"
+    llm = codex.build_codex_chat("gpt-5-mini", api_key=token)
+    payload = llm._get_request_payload([HumanMessage("hi")])
+
+    assert payload["store"] is False
+    assert list(codex.REASONING_CARRYOVER) == payload["include"]
+
+
+def test_the_thread_is_the_prompt_cache_key_on_both_openai_routes():
+    """One conversation, one cache: the key pins every call of a tool loop to
+    the machine that already holds its prefix. A plan token and an API key
+    reach different endpoints and both take it."""
+    from langchain_core.messages import HumanMessage
+
+    from agents.core.lc import PROMPT_CACHE_KEY_FIELD, resolve_chat_model
+
+    plan = resolve_chat_model(
+        Provider.OPENAI, ModelName.GPT_5_MINI, "eyJhbGciOiJSUzI1NiJ9.e30.EXAMPLE|acct-1",
+        cache_key="thread-1",
+    )
+    key = resolve_chat_model(Provider.OPENAI, ModelName.GPT_5_MINI, "sk-proj-x", cache_key="thread-1")
+    for llm in (plan, key):
+        assert llm._get_request_payload([HumanMessage("hi")])[PROMPT_CACHE_KEY_FIELD] == "thread-1"
+
+    # Other vendors key their caches on content; the kwarg must not leak to
+    # a class that would reject it.
+    other = resolve_chat_model(Provider.ANTHROPIC, ModelName.CLAUDE_SONNET, "sk-ant-x", cache_key="thread-1")
+    assert PROMPT_CACHE_KEY_FIELD not in (getattr(other, "model_kwargs", None) or {})

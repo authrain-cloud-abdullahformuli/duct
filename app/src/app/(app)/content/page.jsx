@@ -1,0 +1,405 @@
+"use client";
+
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { ChevronDown, CopyPlus, Plus } from "lucide-react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { msg } from "@lingui/core/macro";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  listPosts,
+} from "@/lib/contentApi";
+import { getProjectById } from "@/lib/projects";
+import { useActiveProjectId } from "@/hooks/useActiveProjectId";
+import BrandContextForm from "@/components/content/BrandContextForm";
+import AccountsTab from "@/components/content/AccountsTab";
+import FormatLibrary from "@/components/content/FormatLibrary";
+import StyleGallery from "@/components/content/StyleGallery";
+import PostCard from "@/components/content/PostCard";
+import CloneFromUrlDialog from "@/components/content/CloneFromUrlDialog";
+import PlanBoard from "@/components/content/PlanBoard";
+import DraftsQueue from "@/components/content/DraftsQueue";
+import ReminderSetting from "@/components/content/ReminderSetting";
+import { PlatformGlyph, platformMeta } from "@/components/content/platformGlyphs";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { DRAFT_CHANNELS, PostStatus } from "@/lib/contentEnums";
+import { Page, PageHeader } from "@/components/ui/page";
+
+// One tab shows at a time and the hub opens on the plan. Analytics brings
+// Recharts and Discover is the largest tab, so neither is downloaded until
+// someone opens it.
+const AnalyticsView = lazy(() => import("@/components/content/AnalyticsView"));
+const DiscoverPage = lazy(() => import("@/components/content/DiscoverPage"));
+
+const TABS = ["plans", "posts", "analytics", "discover", "library", "brand", "accounts"];
+// Links written while the tab was called "plan" still land on it.
+const TAB_ALIASES = { plan: "plans" };
+
+// The tab ids double as their labels in English; the catalogue needs a message
+// per id so the other languages can say something else.
+const TAB_LABELS = {
+  plans: msg`plans`,
+  posts: msg`posts`,
+  analytics: msg`analytics`,
+  discover: msg`discover`,
+  library: msg`library`,
+  brand: msg`brand`,
+  accounts: msg`accounts`,
+};
+
+export default function ContentLandingPage() {
+  const { t, i18n } = useLingui();
+  const [tab, setTab] = useState("plans");
+  const projectId = useActiveProjectId();
+  const project = useMemo(() => (projectId ? getProjectById(projectId) : null), [projectId]);
+  const projectName = project?.profile?.company?.name || project?.name || t`Project`;
+
+  // A link from outside the hub (the plan board's first-run fixes) names its
+  // tab; read once here rather than with useSearchParams, which would make the
+  // whole hub suspend for a value only the first render needs.
+  useEffect(() => {
+    const wanted = new URLSearchParams(window.location.search).get("tab");
+    const resolved = TAB_ALIASES[wanted] || wanted;
+    if (TABS.includes(resolved)) setTab(resolved);
+  }, []);
+
+  if (projectId === "") {
+    return (
+      <div className="max-w-2xl py-12 text-center">
+        <p className="text-sm text-muted-foreground"><Trans>Select a project in the sidebar to use the content agent.</Trans></p>
+      </div>
+    );
+  }
+
+  if (!projectId) {
+    return (
+      <div className="grid grid-cols-2 gap-4 @md:grid-cols-3 @3xl:grid-cols-4 @7xl:grid-cols-[repeat(auto-fill,minmax(18rem,1fr))]" role="status" aria-label={t`Loading`}>
+        {[0, 1, 2, 3].map((i) => (
+          <Skeleton key={i} className="aspect-[4/5] rounded-xl" />
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <Page className="gap-6">
+      <PageHeader title={<Trans>Content Studio</Trans>} status={projectName} />
+
+      <nav className="-mt-2 border-b border-border/60">
+        {/* Seven tabs are ~500px of text: on a phone, or a tablet with the
+            sidebar open, they scroll in place instead of widening the page. */}
+        <div className="flex items-center gap-1 overflow-x-auto">
+          {TABS.map((id) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setTab(id)}
+              className={`shrink-0 whitespace-nowrap px-3 py-2 text-sm capitalize transition-colors border-b-2 -mb-px ${
+                tab === id
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {i18n._(TAB_LABELS[id])}
+            </button>
+          ))}
+        </div>
+      </nav>
+
+      {/* Keyed on the project so a switch from the sidebar remounts the tab:
+          each one loads its project's data on mount, and the Posts tab's
+          loading flag would otherwise never reset for the new project. */}
+      <div key={projectId}>
+        {tab === "plans"     && <PlanTab      projectId={projectId} onOpenTab={setTab} />}
+        {tab === "posts"     && <PostsTab     projectId={projectId} onOpenTab={setTab} />}
+        <Suspense fallback={<Skeleton className="h-64 w-full rounded-xl" />}>
+          {tab === "analytics" && (
+            <AnalyticsView projectId={projectId} onLinkAccounts={() => setTab("accounts")} />
+          )}
+          {tab === "discover"  && <DiscoverPage projectId={projectId} />}
+        </Suspense>
+        {tab === "library"   && <LibraryTab   projectId={projectId} />}
+        {tab === "brand"     && <BrandTab     projectId={projectId} />}
+        {tab === "accounts"  && <AccountsTab  projectId={projectId} />}
+      </div>
+    </Page>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Plans tab
+// ---------------------------------------------------------------------------
+
+function PlanTab({ projectId, onOpenTab }) {
+  // The page scrolls, not the board. It used to be a fixed-height frame,
+  // `calc(100svh - 15rem)`, a guess at what sat above it: it ended short of
+  // the window, the page's own padding sat under it, and the lanes scrolled
+  // inside a page that scrolled too.
+  return <PlanBoard projectId={projectId} onOpenTab={onOpenTab} />;
+}
+
+// ---------------------------------------------------------------------------
+// Brand tab — structured form (mirrors the project-context page's pattern)
+// ---------------------------------------------------------------------------
+
+function BrandTab({ projectId }) {
+  return <BrandContextForm projectId={projectId} />;
+}
+
+// ---------------------------------------------------------------------------
+// Library tab — Formats (full CRUD)
+// ---------------------------------------------------------------------------
+
+const LIBRARY_SECTIONS = [
+  { id: "formats", label: msg`Formats` },
+  { id: "styles",  label: msg`Styles` },
+];
+
+function LibraryTab({ projectId }) {
+  const { i18n } = useLingui();
+  const [section, setSection] = useState("formats");
+  return (
+    <div className="space-y-5">
+      <div className="inline-flex rounded-lg border border-border/70 bg-muted/40 p-0.5">
+        {LIBRARY_SECTIONS.map((s) => (
+          <button
+            key={s.id}
+            type="button"
+            onClick={() => setSection(s.id)}
+            className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+              section === s.id
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {i18n._(s.label)}
+          </button>
+        ))}
+      </div>
+      {section === "formats" ? <FormatLibrary projectId={projectId} /> : <StyleGallery />}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Posts tab — all drafted/posted posts for the project
+// ---------------------------------------------------------------------------
+
+// Drafts come first and say "waiting": a draft nobody has answered is the
+// drafts queue (issue #266), and the tab opens on it while it has anything.
+const POST_FILTERS = [PostStatus.DRAFT, "all", PostStatus.POSTED, PostStatus.SCHEDULED, PostStatus.FAILED];
+
+// Filter ids are post statuses (API values); these are what the chips say.
+const FILTER_LABELS = {
+  all: msg`all`,
+  [PostStatus.POSTED]: msg`posted`,
+  [PostStatus.SCHEDULED]: msg`scheduled`,
+  [PostStatus.FAILED]: msg`failed`,
+  [PostStatus.DRAFT]: msg`waiting`,
+};
+
+function postRank(p) {
+  // Published posts first (newest), then scheduled/drafts by day index.
+  if (p.posted_at) return [0, -new Date(p.posted_at).getTime()];
+  return [1, p.day_index ?? 999];
+}
+
+function PostsTab({ projectId, onOpenTab }) {
+  const { t, i18n } = useLingui();
+  const router = useRouter();
+  const [posts, setPosts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  // null until the posts arrive: the default depends on whether any wait.
+  const [filter, setFilter] = useState(null);
+  // One channel, or every one. Posts carry their platforms; the first is the
+  // one they were drafted for.
+  const [channel, setChannel] = useState(null);
+  const [cloneOpen, setCloneOpen] = useState(false);
+
+  // The two ways into a post no plan asked for: write one for a channel the
+  // agent has a playbook for, or model one on a TikTok that already worked
+  // (issue #222). The workspace does the rest.
+  const newPostMenu = (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button size="sm">
+          <Plus aria-hidden="true" /> <Trans>New post</Trans> <ChevronDown aria-hidden="true" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-48">
+        {DRAFT_CHANNELS.map(({ id }) => (
+          <DropdownMenuItem
+            key={id}
+            onClick={() => router.push(`/content/posts/new?${new URLSearchParams({ channel: id })}`)}
+          >
+            <PlatformGlyph platform={id} className="size-4" />
+            <span>{platformMeta(id).label}</span>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+  const cloneButton = (
+    <Button size="sm" variant="outline" onClick={() => setCloneOpen(true)}>
+      <CopyPlus aria-hidden="true" /> <Trans>Clone a TikTok</Trans>
+    </Button>
+  );
+  const cloneDialog = (
+    <CloneFromUrlDialog
+      open={cloneOpen}
+      onOpenChange={setCloneOpen}
+      onClone={(url) => router.push(`/content/posts/new?${new URLSearchParams({ clone_url: url })}`)}
+    />
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const p = await listPosts(projectId);
+        if (cancelled) return;
+        const rows = Array.isArray(p) ? p : [];
+        setPosts(rows);
+        setFilter((f) => f ?? (rows.some((r) => r.status === PostStatus.DRAFT) ? PostStatus.DRAFT : "all"));
+      } catch {/* ignore */}
+      finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  const counts = posts.reduce((acc, p) => {
+    acc.all = (acc.all || 0) + 1;
+    acc[p.status] = (acc[p.status] || 0) + 1;
+    return acc;
+  }, {});
+
+  const activeFilter = filter ?? "all";
+  const filterLabel = i18n._(FILTER_LABELS[activeFilter]);
+
+  // An answer from the queue (a skip, or an approve that scheduled or posted
+  // it) moves the post to its new status here, so the counts follow at once.
+  const answered = (postId, updated) => {
+    if (!updated) return;
+    setPosts((prev) => prev.map((p) => (p.id === postId ? { ...p, ...updated } : p)));
+  };
+
+  const channels = useMemo(() => {
+    const counts = new Map();
+    for (const p of posts) for (const c of p.platforms || []) counts.set(c, (counts.get(c) || 0) + 1);
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id, count]) => ({ id, count }));
+  }, [posts]);
+  const picked = channels.some((c) => c.id === channel) ? channel : null;
+  const visible = posts
+    .filter((p) => activeFilter === "all" || p.status === activeFilter)
+    .filter((p) => !picked || (p.platforms || []).includes(picked))
+    .sort((a, b) => {
+      const [ar, av] = postRank(a);
+      const [br, bv] = postRank(b);
+      return ar - br || av - bv;
+    });
+
+  if (loading) {
+    return (
+      <div className="grid grid-cols-2 gap-4 @md:grid-cols-3 @3xl:grid-cols-4 @7xl:grid-cols-[repeat(auto-fill,minmax(18rem,1fr))]">
+        {[0, 1, 2, 3].map((i) => (
+          <Skeleton key={i} className="aspect-[4/5] rounded-xl" />
+        ))}
+      </div>
+    );
+  }
+
+  if (posts.length === 0) {
+    return (
+      <div className="rounded-2xl border border-dashed border-border/70 p-10 text-center">
+        <p className="mb-3 text-sm text-muted-foreground"><Trans>No posts yet. Write one for TikTok, LinkedIn or X, draft them from a plan, or clone a TikTok that worked.</Trans></p>
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          {newPostMenu}
+          <Button variant="outline" size="sm" onClick={() => onOpenTab?.("plans")}><Trans>Open plan board →</Trans></Button>
+          {cloneButton}
+        </div>
+        {cloneDialog}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {cloneDialog}
+      <div className="flex flex-wrap items-center gap-1.5">
+        <div className="order-last ml-auto flex items-center gap-2">{cloneButton}{newPostMenu}</div>
+        {POST_FILTERS.map((f) => {
+          const n = counts[f] || 0;
+          // The active chip stays even at zero: answering the last draft
+          // should not leave a view with no chip saying what it is.
+          if (f !== "all" && n === 0 && f !== activeFilter) return null;
+          return (
+            <button
+              key={f}
+              type="button"
+              onClick={() => setFilter(f)}
+              // Neutral when chosen: the brand orange is the page's one
+              // primary action (New post), and a filter is not that.
+              className={`rounded-full px-3 py-1 text-xs font-medium capitalize transition-colors ${
+                activeFilter === f
+                  ? "bg-foreground text-background"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {i18n._(FILTER_LABELS[f])} <span className="tabular-nums opacity-70">{n}</span>
+            </button>
+          );
+        })}
+        {channels.length > 1 && (
+          <div className="ml-2 flex items-center gap-1 border-l border-border/60 pl-3" role="group" aria-label={t`Channel`}>
+            {channels.map(({ id, count }) => {
+              const label = platformMeta(id).label;
+              const active = picked === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  aria-pressed={active}
+                  aria-label={t`${label}, ${count} posts`}
+                  title={label}
+                  onClick={() => setChannel(active ? null : id)}
+                  className={`inline-flex h-7 items-center gap-1.5 rounded-full px-2.5 text-xs font-medium transition-colors ${
+                    active ? "bg-foreground text-background" : "bg-muted text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <PlatformGlyph platform={id} className="size-3.5" />
+                  <span className="tabular-nums">{count}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {activeFilter === PostStatus.DRAFT ? (
+        <DraftsQueue
+          posts={visible}
+          projectId={projectId}
+          onAnswered={answered}
+          aside={<ReminderSetting />}
+        />
+      ) : visible.length === 0 ? (
+        <p className="rounded-xl border border-dashed border-border/60 px-4 py-10 text-center text-sm text-muted-foreground">
+          <Trans>No {filterLabel} posts.</Trans>
+        </p>
+      ) : (
+        <div className="grid grid-cols-2 gap-4 @md:grid-cols-3 @3xl:grid-cols-4 @7xl:grid-cols-[repeat(auto-fill,minmax(18rem,1fr))]">
+          {visible.map((p) => <PostCard key={p.id} post={p} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+

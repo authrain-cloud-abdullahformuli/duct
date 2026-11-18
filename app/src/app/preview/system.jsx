@@ -1,0 +1,651 @@
+"use client";
+
+// Foundations and primitives — the other two thirds of the design system.
+//
+// `catalogue.jsx` answers "what is the pattern for this job" using DESIGN.md's
+// canon. This file answers the two questions underneath it: what is the
+// material (colour, type, spacing, icons) and what are the parts (the vendored
+// `ui/*` primitives, with their variants).
+//
+// Scope is deliberate. Every primitive here is one that call sites actually
+// choose between — a Button has six variants and five sizes, so seeing them
+// together is the difference between picking one and inventing one. Primitives
+// with a single appearance and no decision to make (`separator`, `skeleton`)
+// appear inside the specimens that use them rather than as entries of their
+// own, and `sidebar` is an app shell rather than a part. This is a design
+// system, not an inventory.
+
+import { useState } from "react";
+
+import {
+  ChevronDown,
+  Ellipsis,
+  Plus,
+  Search,
+  Settings,
+  Trash2,
+} from "lucide-react";
+
+import { Badge } from "@/components/ui/badge";
+import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Card, CardDescription, CardFooter, CardHeader, CardTitle, cardLinkClass } from "@/components/ui/card";
+import { Page, PageHeader, Section, TileGrid } from "@/components/ui/page";
+import { Label } from "@/components/ui/label";
+import { Lightbox } from "@/components/ui/lightbox";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Progress } from "@/components/ui/progress";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
+import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+
+import TokenSheet from "./TokenSheet";
+
+/** A labelled row of variants, so the choice is visible as a choice. */
+function Row({ label, children }) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <div className="flex flex-wrap items-center gap-2">{children}</div>
+    </div>
+  );
+}
+
+function Stack({ children }) {
+  return <div className="flex flex-col gap-5">{children}</div>;
+}
+
+function SliderDemo() {
+  const STOPS = ["Auto", "Quick", "Balanced", "Deep", "Exhaustive"];
+  const [step, setStep] = useState(2);
+  return (
+    <Stack>
+      <Row label="Stepped">
+        <div className="w-64">
+          <div className="mb-2 flex items-baseline justify-between text-sm">
+            <span id="pv-slider-label">Thinking</span>
+            <span className="text-xs text-muted-foreground">{STOPS[step]}</span>
+          </div>
+          <Slider marks min={0} max={STOPS.length - 1} step={1} value={[step]} onValueChange={([v]) => setStep(v)} aria-labelledby="pv-slider-label" aria-valuetext={STOPS[step]} />
+        </div>
+      </Row>
+      <Row label="Continuous">
+        <Slider className="w-64" defaultValue={[40]} aria-label="Volume" />
+      </Row>
+      <Row label="Disabled">
+        <Slider className="w-64" defaultValue={[60]} disabled aria-label="Locked" />
+      </Row>
+    </Stack>
+  );
+}
+
+function PopoverDemo() {
+  const [open, setOpen] = useState(true);
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button size="sm" variant="outline">
+          Weekly brief
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="p-4">
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center justify-between">
+            <Label htmlFor="pv-pop-sw">Send on Mondays</Label>
+            <Switch id="pv-pop-sw" defaultChecked />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="pv-pop-in">Recipients</Label>
+            <Input id="pv-pop-in" defaultValue="growth@example.com" />
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/** Starts open, since a closed overlay is not a specimen — see AlertDialog and
+ *  DropdownMenu below. The button lets it be closed and reopened in place. */
+function LightboxDemo() {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="flex items-center gap-6">
+      <Button size="sm" variant="outline" onClick={() => setOpen(true)}>
+        Open image
+      </Button>
+      <Lightbox
+        open={open}
+        onOpenChange={setOpen}
+        src="/art/mosaic/otium.webp"
+        alt="Roman mosaic panel, otium"
+      />
+    </div>
+  );
+}
+
+const BUTTON_VARIANTS = ["default", "secondary", "outline", "ghost", "destructive", "link"];
+const BUTTON_SIZES = ["xs", "sm", "default", "lg"];
+
+/**
+ * Tailwind 4 derives every `p-*`/`gap-*`/`space-*` from `--spacing: 0.25rem`.
+ * Shown in `rem` as well as px because the px is only true at a 16px root — the
+ * text lens moves it, and a spacing scale that claims to be pixels is the
+ * reason someone eventually writes `p-[13px]`.
+ */
+const SPACING_STEPS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16];
+
+export const FOUNDATIONS = [
+  {
+    id: "tokens",
+    group: "Foundations",
+    title: "Colour, type and shape",
+    state: "reference",
+    note: "Read from computed style, so it is the value after the cascade — switch the frame to light to see the other half of every token. Try it under Vision: deuteranopia.",
+    render: () => <TokenSheet />,
+  },
+  {
+    id: "spacing",
+    group: "Foundations",
+    title: "Spacing",
+    state: "reference",
+    note: "One scale, from --spacing: 0.25rem. Overlay: 8px grid draws it over any scene.",
+    render: () => (
+      <div className="flex flex-col gap-2">
+        {SPACING_STEPS.map((n) => (
+          <div key={n} className="flex items-center gap-3">
+            <span className="w-8 shrink-0 font-mono text-xs text-muted-foreground tabular-nums">
+              {n}
+            </span>
+            <span
+              className="h-3 shrink-0 rounded-sm bg-primary/30"
+              style={{ width: `calc(var(--spacing, 0.25rem) * ${n})` }}
+            />
+            <span className="font-mono text-xs text-muted-foreground tabular-nums">
+              {n * 0.25}rem · {n * 4}px
+            </span>
+          </div>
+        ))}
+      </div>
+    ),
+  },
+  {
+    id: "icons",
+    group: "Foundations",
+    title: "Icons",
+    state: "reference",
+    note: "lucide-react only — no heroicons, no emoji, no one-off SVGs. Decorative icons take aria-hidden; an icon-only button takes an aria-label.",
+    render: () => (
+      <Stack>
+        <Row label="Sizes — size-3.5 in xs rows, size-4 default, size-5 in tiles">
+          <Search className="size-3.5" aria-hidden="true" />
+          <Search className="size-4" aria-hidden="true" />
+          <Search className="size-5" aria-hidden="true" />
+        </Row>
+        <Row label="Beside a label — the icon is decorative, the word is the name">
+          <Button size="sm" variant="secondary">
+            <Plus aria-hidden="true" />
+            New project
+          </Button>
+        </Row>
+        <Row label="Icon-only — allowed for repeated row-level actions, and it must be named">
+          <Button size="icon-sm" variant="ghost" aria-label="Project settings">
+            <Settings aria-hidden="true" />
+          </Button>
+          <Button size="icon-sm" variant="ghost" aria-label="Delete project">
+            <Trash2 aria-hidden="true" />
+          </Button>
+          <Button size="icon-sm" variant="ghost" aria-label="More actions">
+            <Ellipsis aria-hidden="true" />
+          </Button>
+        </Row>
+      </Stack>
+    ),
+  },
+];
+
+export const PRIMITIVES = [
+  {
+    id: "ui-button",
+    group: "Primitives",
+    title: "Button",
+    state: "6 variants · 4 sizes",
+    note: "Restyle at source through the CVA variants — a call site that pastes a class string to override one is a fork in disguise.",
+    render: () => (
+      <Stack>
+        <Row label="Variants">
+          {BUTTON_VARIANTS.map((v) => (
+            <Button key={v} size="sm" variant={v}>
+              {v}
+            </Button>
+          ))}
+        </Row>
+        <Row label="Sizes">
+          {BUTTON_SIZES.map((s) => (
+            <Button key={s} size={s}>
+              {s}
+            </Button>
+          ))}
+        </Row>
+        <Row label="States">
+          <Button size="sm">Idle</Button>
+          <Button size="sm" disabled>
+            Disabled
+          </Button>
+          <Button size="sm" variant="secondary">
+            <Plus aria-hidden="true" />
+            With icon
+          </Button>
+        </Row>
+      </Stack>
+    ),
+  },
+  {
+    id: "ui-badge",
+    group: "Primitives",
+    title: "Badge",
+    state: "8 variants",
+    note:
+      "The canonical status badge. The four status variants tint the ground and colour the text, which is the only way a mid green or amber carries a 12px label — `bg-green-500/90 text-white` measured 2.22:1. They carry their own dark pair, so a caller writes no `dark:`.",
+    render: () => (
+      <div className="flex flex-col gap-4">
+        <Row label="Status">
+          {["success", "warning", "info", "destructive"].map((v) => (
+            <Badge key={v} variant={v}>
+              {v}
+            </Badge>
+          ))}
+        </Row>
+        <Row label="Neutral">
+          {["default", "secondary", "outline", "ghost"].map((v) => (
+            <Badge key={v} variant={v}>
+              {v}
+            </Badge>
+          ))}
+        </Row>
+      </div>
+    ),
+  },
+  {
+    id: "ui-input",
+    group: "Primitives",
+    title: "Input and Label",
+    state: "4 states",
+    note: "Every control needs an accessible name. A placeholder is not one — it disappears on focus and some readers skip it.",
+    render: () => (
+      <div className="flex max-w-sm flex-col gap-4">
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="pv-name">Project name</Label>
+          <Input id="pv-name" defaultValue="Organic Growth" />
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="pv-domain">Domain</Label>
+          <Input id="pv-domain" placeholder="getduct.ai" />
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="pv-locked">Workspace</Label>
+          <Input id="pv-locked" defaultValue="Alleviate Lab" disabled />
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="pv-bad">Report email</Label>
+          <Input id="pv-bad" defaultValue="not-an-email" aria-invalid />
+          <p role="alert" className="text-xs text-destructive">
+            That address is missing an @.
+          </p>
+        </div>
+      </div>
+    ),
+  },
+  {
+    id: "ui-textarea",
+    group: "Primitives",
+    title: "Textarea",
+    state: "3 states",
+    note: "The field radius, not a capsule. Grows with what is typed up to max-h-80, then scrolls inside the field.",
+    render: () => (
+      <div className="flex max-w-sm flex-col gap-4">
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="pv-desc">Short description</Label>
+          <Textarea
+            id="pv-desc"
+            defaultValue="AI interior design and virtual staging. Upload a photo of any room and get a photorealistic redesign in seconds, across 32 styles and 34 room types."
+          />
+        </div>
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="pv-goal">Primary goal</Label>
+          <Textarea id="pv-goal" rows={2} placeholder="More trial signups from organic search" />
+        </div>
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="pv-locked-ta">Brand voice</Label>
+          <Textarea id="pv-locked-ta" defaultValue="Professional" disabled />
+        </div>
+      </div>
+    ),
+  },
+  {
+    id: "ui-card",
+    group: "Primitives",
+    title: "Card",
+    state: "4 variants",
+    note: "One hero a screen. The footer is pinned to the bottom, so a row of cards with different amounts of text shares one baseline.",
+    render: () => (
+      <TileGrid cols={2}>
+        <Card variant="hero">
+          <CardHeader>
+            <CardTitle>Connect your first source</CardTitle>
+            <CardDescription>Search Console is the easiest start.</CardDescription>
+          </CardHeader>
+          <CardFooter>
+            <Button size="sm">Connect a source</Button>
+          </CardFooter>
+        </Card>
+        <Card variant="interactive">
+          <CardHeader>
+            <CardTitle>
+              <button type="button" data-card-link className={cardLinkClass}>Google Analytics</button>
+            </CardTitle>
+            <CardDescription>Where visitors come from and what they do next, by channel and landing page.</CardDescription>
+          </CardHeader>
+          <CardFooter className="text-xs text-muted-foreground">Connected</CardFooter>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>Default</CardTitle>
+            <CardDescription>A surface that groups content.</CardDescription>
+          </CardHeader>
+          <CardFooter className="text-xs text-muted-foreground">Footer on the shared baseline</CardFooter>
+        </Card>
+        <Card variant="quiet">
+          <CardHeader>
+            <CardTitle>Quiet</CardTitle>
+            <CardDescription>Recessed, no border, for secondary content.</CardDescription>
+          </CardHeader>
+        </Card>
+      </TileGrid>
+    ),
+  },
+  {
+    id: "ui-page",
+    group: "Primitives",
+    title: "Page frame",
+    state: "header + section + grid",
+    note: "Every routed screen: one title, one line of state, actions on the right, how it works behind the \"?\". No paragraph under the title.",
+    render: () => (
+      <Page>
+        <PageHeader
+          title="Toolbox"
+          status="3 sources connected"
+          help="Connect an account once and every project can use it."
+          actions={<Button size="sm">Add a source</Button>}
+        />
+        <Section title="Connected" count={3}>
+          <TileGrid size="sm">
+            {["Search Console", "Analytics", "Stripe"].map((name) => (
+              <Card key={name} size="sm">
+                <CardTitle>{name}</CardTitle>
+                <CardFooter className="text-xs text-muted-foreground">Connected</CardFooter>
+              </Card>
+            ))}
+          </TileGrid>
+        </Section>
+      </Page>
+    ),
+  },
+  {
+    id: "ui-select",
+    group: "Primitives",
+    title: "Select",
+    state: "2 sizes",
+    note: "Never a native <select>: its option list is drawn by the OS, ignoring every class on the element.",
+    render: () => (
+      <Stack>
+        <Row label="Sizes">
+          {["sm", "default"].map((size) => (
+            <Select key={size} defaultValue="ga4">
+              <SelectTrigger size={size} aria-label={`Data source (${size})`}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="ga4">Google Analytics</SelectItem>
+                <SelectItem value="gsc">Search Console</SelectItem>
+              </SelectContent>
+            </Select>
+          ))}
+        </Row>
+        <Row label="Disabled">
+          <Select defaultValue="ga4" disabled>
+            <SelectTrigger size="sm" aria-label="Data source (disabled)">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="ga4">Google Analytics</SelectItem>
+            </SelectContent>
+          </Select>
+        </Row>
+      </Stack>
+    ),
+  },
+  {
+    id: "ui-slider",
+    group: "Primitives",
+    title: "Slider",
+    state: "stepped · continuous · disabled",
+    note: "A stepped slider takes `marks`: a dot per step on a thicker track, the covered ones in the range's ink, so the thumb is seen to land on a stop without a row of words under it. Name the current stop somewhere — beside its title, as the composer does. The thumb is the focusable part and has no text, so every slider takes an aria-label or aria-labelledby. Check that arrows move one step, Home/End reach the ends, that the thumb centres on each dot, and that the focus ring is the ring token, not an outline.",
+    render: () => <SliderDemo />,
+  },
+  {
+    id: "ui-popover",
+    group: "Primitives",
+    title: "Popover",
+    state: "open · anchored to its trigger",
+    note: "For content that is a form (a slider, a radio group, a field), not a list of commands — a DropdownMenu roves focus over its items and swallows Tab, so a slider inside one is mouse-only. Same surface as the menu so the two read as one family. Check that Tab walks every control inside and Escape returns focus to the trigger.",
+    render: () => <PopoverDemo />,
+  },
+  {
+    id: "ui-switch",
+    group: "Primitives",
+    title: "Switch",
+    state: "on · off · disabled",
+    note: "For a setting that takes effect immediately. A choice that needs saving is a checkbox in a form, not a switch.",
+    render: () => (
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center gap-2.5">
+          <Switch id="pv-sw-on" defaultChecked />
+          <Label htmlFor="pv-sw-on">Weekly brief</Label>
+        </div>
+        <div className="flex items-center gap-2.5">
+          <Switch id="pv-sw-off" />
+          <Label htmlFor="pv-sw-off">Alert on anomalies</Label>
+        </div>
+        <div className="flex items-center gap-2.5">
+          <Switch id="pv-sw-dis" disabled />
+          <Label htmlFor="pv-sw-dis">Slack delivery (connect Slack first)</Label>
+        </div>
+      </div>
+    ),
+  },
+  {
+    id: "ui-checkbox",
+    group: "Primitives",
+    title: "Checkbox",
+    state: "checked · unchecked · disabled",
+    note: "The other half of the Switch rule: a choice that is submitted with a form, not applied the moment it is touched. Sign-in's \"keep me signed in\" is the canonical one — it does nothing until the form goes.",
+    render: () => (
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center gap-2.5">
+          <Checkbox id="pv-cb-on" defaultChecked />
+          <Label htmlFor="pv-cb-on">Keep me signed in for 30 days</Label>
+        </div>
+        <div className="flex items-center gap-2.5">
+          <Checkbox id="pv-cb-off" />
+          <Label htmlFor="pv-cb-off">Include draft pages in the crawl</Label>
+        </div>
+        <div className="flex items-center gap-2.5">
+          <Checkbox id="pv-cb-dis" disabled />
+          <Label htmlFor="pv-cb-dis">Compare to last quarter (needs 90 days of data)</Label>
+        </div>
+      </div>
+    ),
+  },
+  {
+    id: "ui-tabs",
+    group: "Primitives",
+    title: "Tabs",
+    state: "default",
+    render: () => (
+      <Tabs defaultValue="overview" className="max-w-md">
+        <TabsList>
+          <TabsTrigger value="overview">Overview</TabsTrigger>
+          <TabsTrigger value="sources">Sources</TabsTrigger>
+          <TabsTrigger value="history">History</TabsTrigger>
+        </TabsList>
+        <TabsContent value="overview" className="pt-3 text-sm text-muted-foreground">
+          Nine sources connected. Last brief two days ago.
+        </TabsContent>
+        <TabsContent value="sources" className="pt-3 text-sm text-muted-foreground">
+          Search Console, Google Ads, GA4, Stripe.
+        </TabsContent>
+        <TabsContent value="history" className="pt-3 text-sm text-muted-foreground">
+          Twelve briefs since March.
+        </TabsContent>
+      </Tabs>
+    ),
+  },
+  {
+    id: "ui-table",
+    group: "Primitives",
+    title: "Table",
+    state: "with numerics",
+    note: "Numbers right-aligned and `.numeric`, so digits line up column-wise and a total can be scanned. Plain tabular-nums cannot do this — DM Sans has no tabular figures.",
+    render: () => (
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Source</TableHead>
+            <TableHead>Status</TableHead>
+            <TableHead className="text-right">Sessions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {[
+            ["Search Console", "Connected", "18,204"],
+            ["Google Ads", "Partial", "4,981"],
+            ["Stripe", "Not connected", "—"],
+          ].map(([source, status, n]) => (
+            <TableRow key={source}>
+              <TableCell className="font-medium">{source}</TableCell>
+              <TableCell className="text-muted-foreground">{status}</TableCell>
+              <TableCell className="text-right numeric">{n}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    ),
+  },
+  {
+    id: "ui-progress",
+    group: "Primitives",
+    title: "Progress",
+    state: "determinate",
+    note: "Only when the fraction is real. Unknown-length work gets PipelineProgress or a spinner, never a bar that guesses.",
+    render: () => (
+      <div className="flex max-w-sm flex-col gap-4">
+        <Progress value={18} aria-label="Crawl progress: 18%" />
+        <Progress value={64} aria-label="Crawl progress: 64%" />
+        <Progress value={100} aria-label="Crawl progress: complete" />
+      </div>
+    ),
+  },
+  {
+    id: "ui-breadcrumb",
+    group: "Primitives",
+    title: "Breadcrumb",
+    state: "default",
+    render: () => (
+      <Breadcrumb>
+        <BreadcrumbList>
+          <BreadcrumbItem>
+            <BreadcrumbLink href="#">Projects</BreadcrumbLink>
+          </BreadcrumbItem>
+          <BreadcrumbSeparator />
+          <BreadcrumbItem>
+            <BreadcrumbLink href="#">Organic Growth</BreadcrumbLink>
+          </BreadcrumbItem>
+          <BreadcrumbSeparator />
+          <BreadcrumbItem>
+            <BreadcrumbPage>Members</BreadcrumbPage>
+          </BreadcrumbItem>
+        </BreadcrumbList>
+      </Breadcrumb>
+    ),
+  },
+  {
+    id: "ui-menu",
+    group: "Primitives",
+    title: "Dropdown menu",
+    state: "open",
+    note: "Radix supplies portal, focus trap, Escape and typeahead. Never hand-roll a menu.",
+    render: () => (
+      <DropdownMenu defaultOpen modal={false}>
+        <DropdownMenuTrigger asChild>
+          <Button size="sm" variant="outline">
+            Actions
+            <ChevronDown aria-hidden="true" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start">
+          <DropdownMenuLabel>Organic Growth</DropdownMenuLabel>
+          <DropdownMenuItem>Rename</DropdownMenuItem>
+          <DropdownMenuItem>Duplicate</DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem variant="destructive">Delete project</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    ),
+  },
+  {
+    id: "ui-tooltip",
+    group: "Primitives",
+    title: "Tooltip",
+    state: "open",
+    note: "A tooltip supplements a name, it never supplies one — an icon-only button still needs its aria-label.",
+    render: () => (
+      <div className="flex items-center gap-6">
+        <Tooltip open>
+          <TooltipTrigger asChild>
+            <Button size="icon-sm" variant="ghost" aria-label="Where this credential lives">
+              <Settings aria-hidden="true" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="right">Saved to your account</TooltipContent>
+        </Tooltip>
+        <Separator orientation="vertical" className="h-6" />
+        <span className="text-xs text-muted-foreground">
+          Held open here; it opens on hover and on keyboard focus.
+        </span>
+      </div>
+    ),
+  },
+  {
+    id: "ui-lightbox",
+    group: "Primitives",
+    title: "Lightbox",
+    state: "open",
+    note: "Full-bleed image zoom, built on ui/dialog — portal, focus trap, Escape and scroll lock come free rather than a second hand-rolled fixed inset-0. Click the image, or Escape, to close.",
+    render: () => <LightboxDemo />,
+  },
+];

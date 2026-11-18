@@ -1,0 +1,3456 @@
+"""Content Studio agent routes.
+
+Streaming endpoints clone the SSE machinery from routes/audit.py:
+  POST   /api/content/plan/stream         — start a plan_month session
+  POST   /api/content/post/stream         — start a draft_post session (a clone with `clone_url`)
+  POST   /api/content/answer/{sid}        — resolve pending AskUserQuestion
+  POST   /api/content/chat/{sid}          — continued chat into an active session
+  DELETE /api/content/session/{sid}       — close session, free resources
+
+Brand context (writes Project JSONB columns):
+  GET    /api/content/brand?project_id=…
+  PUT    /api/content/brand?project_id=…
+
+Plans + posts CRUD:
+  GET    /api/content/plans?project_id=…  · GET /api/content/plans/{id}
+  POST   /api/content/plans               · DELETE /api/content/plans/{id}
+  PATCH  /api/content/plans/{id}/days/{day}
+  GET    /api/content/posts?project_id=…  · GET /api/content/posts/{id}
+  POST   /api/content/posts               · PATCH /api/content/posts/{id}
+  POST   /api/content/posts/{id}/mark-posted
+  POST   /api/content/posts/{id}/metrics  — hand-entered numbers; a sync never overwrites them
+
+Format + avatar library CRUD:
+  GET/POST/PATCH/DELETE  /api/content/formats[/{id}]
+  GET/POST/PATCH/DELETE  /api/content/avatars[/{id}]
+
+Deferred:
+  · scheduler publish + sync routes (service/publishers: PostBridge, Zernio)
+  · Uploads + assets routes — Phase 4b
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from collections.abc import AsyncGenerator
+from datetime import datetime, timezone
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Literal
+from uuid import UUID, uuid4
+
+import anyio.from_thread
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import delete, or_, select
+from sqlmodel import Session
+from starlette.status import HTTP_409_CONFLICT
+
+from agents.content.assessment import reassess_post
+from agents.content.channels import channel_payload, primary_channel, resolve as resolve_channel
+from agents.content.plan_period import PlanPeriod, requested_period
+from agents.content.voice_rules import VoiceRules, voice_problems, voice_rules_of
+from agents.content.publishing import (
+    MediaUnreadable,
+    PostAlreadyOut,
+    ProjectPublishing,
+    cancel,
+    chosen_publisher,
+    is_queued_at_publisher,
+    is_text_only,
+    load_media,
+    metrics_sync,
+    no_sync_message,
+    not_synced_yet,
+    pick_media,
+    project_publishing,
+    publish_blockers,
+    publish_failure,
+    pull_metrics,
+    push_edit,
+    record_published,
+    send_post,
+    settle,
+    went_out,
+    words_changed,
+)
+from agents.content.video import VIDEO_POST_TYPE, cut_of, take_for, video_takes
+from agents.content.events import ContentEvent
+from agents.content import formats as format_library
+from agents.content.styles import base_css, list_styles
+from agents.content.schema import (
+    ContentAnswerRequest,
+    ContentChatMessage,
+    ContentStatus,
+    DraftPostRequest,
+    PlanRequest,
+    PublishAssessment,
+)
+from agents.content.v1.runner import (
+    ContentRunner,
+    close_session,
+    create_draft_session,
+    create_plan_session,
+    get_session,
+)
+from agents.core.errors import error_payload
+from agents.engines import (
+    JobRun,
+    ProviderKeyRequired,
+    resolve_image_run,
+    resolve_job_run,
+    resolve_video_run,
+    web_search_key,
+)
+from agents.tiers import Job
+from agents.content.channels import Platform
+from agents.content.channels import OFFERED
+from agents.content.channel_config import ChannelConfig, ChannelProfile, linked_pairs, load_channel_config, save_channel_config
+from agents.content.platform_guides import MEDIA_KINDS, guide_payload
+from config import get_configs
+from db.session import get_session as db_session
+from service.model_settings import get_model_settings
+from models.content import (
+    ContentAsset,
+    ContentAvatar,
+    ContentFormat,
+    ContentPlan,
+    ContentPost,
+    ContentSocialLink,
+)
+from models.activity import ActivityLog
+from models.auth import User
+from models.project import Project
+from sqlalchemy.orm.attributes import flag_modified
+from service import storage
+from service.activity import log_activity
+from service.analytics import capture_event
+from service.auth import get_current_user, get_user_provider_keys
+from service.content_metrics import merge_manual_metrics
+from service.publishers import PublisherError, PublisherSpec, Target
+from service.publishers.metrics import collect_reported_posts
+from service.publishers.registry import NO_SCHEDULER, all_specs, publisher_for, spec_for
+from service.vendor_keys import VendorNotConnected
+from service.membership import get_project_for_user, get_project_row_for_user
+from service.project_draft import edit_fields
+from service.provider_keys import stored_keys_for
+from utils.dates import now_iso, utcnow
+
+logger = logging.getLogger(__name__)
+
+
+# Authentication is declared on the router, not on 44 individual endpoints —
+# the failure mode being closed off here is an endpoint that simply forgets. It
+# is only half the job: `validate_api_key` upstream says "this is the Duct app"
+# and this says "and a real user is asking", but neither says *which* user, and
+# every row below belongs to a project. The membership gate is what makes that
+# call, via `_project_for_user` (a project named in the request) and
+# `_row_for_user` / `_session_for_user` (a project derived from the thing being
+# touched). See backend/CLAUDE.md.
+router = APIRouter(tags=["content"], dependencies=[Depends(get_current_user)])
+
+
+# ---------------------------------------------------------------------------
+# Session tracking + pruner (mirrors routes/audit.py:38-65)
+# ---------------------------------------------------------------------------
+
+_SESSION_TTL = 1800  # 30 minutes
+_session_created_at: dict[str, float] = {}
+
+# In-process TTL cache for the scheduler-backed analytics endpoint. That call
+# paginates each connected scheduler's API (PostBridge's ≤2000 records plus
+# post-results) on every request; without this, opening the Analytics tab
+# hammers them each time.
+# refresh=true bypasses + repopulates; writes that change analytics clear it.
+_ANALYTICS_TTL = 120.0  # seconds
+_analytics_cache: dict[UUID, tuple[float, object]] = {}
+
+
+def _invalidate_analytics(project_id: UUID) -> None:
+    _analytics_cache.pop(project_id, None)
+
+
+async def _prune_stale_sessions() -> None:
+    while True:
+        await asyncio.sleep(300)
+        now = time.monotonic()
+        stale = [
+            sid for sid, created in list(_session_created_at.items())
+            if now - created > _SESSION_TTL
+        ]
+        for sid in stale:
+            logger.info("content: pruning stale session %s", sid)
+            close_session(sid)
+            _session_created_at.pop(sid, None)
+
+
+# Launched from the app lifespan in server.py — FastAPI's lifespan disables
+# router-level on_event hooks, so startup tasks are started centrally there.
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_run_model(
+    session_id: str = "", user_keys: dict | None = None, owner_id=None
+) -> JobRun:
+    """Which model a content run drives, on whose key.
+
+    The tier ladder decides it (``agents.engines.resolve_job_run``), from the
+    user's saved map: drafting is a Standard job, so a content run lands on the
+    Standard model they picked and steps down to Light when that provider has
+    no key or is out of quota. The key goes through the same gate as the rest —
+    the caller's header key, then their saved key, then the env key only where
+    that env file is their own. Content used to read the server key
+    unconditionally, which on the hosted deployment meant Duct paid for every
+    plan and draft.
+
+    Before this it resolved through ``resolve_run_model``, which knows nothing
+    about tiers — so a user who set three models watched Content Studio ignore
+    all three. A tier map that governs one agent out of three is worse than no
+    tier map, because it is a control that appears to work.
+
+    ``session_id`` is how a background worker finds the owner: the request that
+    created the session is long gone by the time the worker runs.
+
+    V1 needs a real API key — the LangChain transport cannot authenticate from
+    a Claude subscription — so the one credential the gate can return without
+    a key (the operator's ``claude`` login) is refused here with the same 402
+    the browser already handles.
+    """
+    if owner_id is None:
+        owner_id = _session_owner(session_id)
+    settings = get_model_settings(owner_id)
+    run = resolve_job_run(
+        Job.DRAFTING,
+        engine_override=settings.engine,
+        user_keys=user_keys,
+        stored_keys=stored_keys_for(owner_id),
+        tier_map=settings.tiers,
+        auto_fallback=settings.auto_fallback,
+        log_prefix="content",
+    )
+    if not run.api_key:
+        raise ProviderKeyRequired(
+            run.provider,
+            f"Content Studio needs a {run.provider.value} API key — a Claude subscription "
+            "login is not enough here. Add your key in Settings → Providers.",
+        )
+    return run
+
+
+def _session_owner(session_id: str):
+    """Who a background worker is running for.
+
+    The request that created the session is long gone by the time the worker
+    runs, so the session is the only place its owner survives.
+    """
+    if not session_id:
+        return None
+    from agents.core.session import get_session as _get_agent_session
+
+    sess = _get_agent_session(session_id)
+    return getattr(sess, "user_id", None) if sess else None
+
+
+def _attach_image_run(
+    session_id: str, user_keys: dict | None = None, owner_id=None
+) -> None:
+    """Resolve what the run may spend on images and stash it on the session.
+
+    Images are a second provider inside a content run: the conversation is on
+    whichever key the user brought for chat, the pictures on whichever
+    image-capable key they brought — Gemini, OpenAI or xAI, in that order of
+    preference. So it gets its own resolution rather than riding on the run's
+    key, and its own failure mode — no key means the image tools decline with
+    a sentence telling the user where to add one, not a dead run. A content
+    session is worth having without images; it is not worth having on our bill.
+
+    Resolved once here rather than per tool call so a run cannot start on the
+    user's key and finish on ours if the store changes underneath it.
+    """
+    from agents.core.session import get_session as _get_agent_session
+
+    sess = _get_agent_session(session_id)
+    if sess is None:
+        return
+    if owner_id is None:
+        owner_id = getattr(sess, "user_id", None)
+    # The user's saved pick, when they made one. Read here rather than passed
+    # down from the request because the run that matters most for images is the
+    # one nobody is watching, and it carries no browser state.
+    run = resolve_image_run(
+        user_keys,
+        stored_keys_for(owner_id),
+        preferred=get_model_settings(owner_id).image_model,
+    )
+    if run is None:
+        # Expected on the hosted deployment for a user who has connected no
+        # image-capable key. The tools report it in the words the user needs.
+        sess.image_provider = None
+        sess.image_api_key = ""
+        return
+    # Not "subscription": ``resolve_image_run`` refuses a plan credential
+    # outright, so the only source here that costs Duct money is the hosted key.
+    if run.source == "cloud":
+        logger.info("content: images billed to Duct (%s/%s)", run.provider.value, run.source)
+    sess.image_provider = run.provider
+    sess.image_api_key = run.api_key
+
+
+def _attach_search_key(session_id: str, run: JobRun, user_keys: dict | None = None, owner_id=None) -> None:
+    """The Gemini key behind Duct's own WebSearch, for a model with no search
+    of its own.
+
+    It used to be set only when the *images* resolved to Gemini, so a run on
+    OpenAI with OpenAI images had no web search at all, while the same user's
+    audit searched on their Gemini key. Same rule as the audit now
+    (``agents/engines.web_search_key``): the caller's key, Duct's only when
+    Duct is already paying for the run.
+    """
+    from agents.core.session import get_session as _get_agent_session
+
+    sess = _get_agent_session(session_id)
+    if sess is None:
+        return
+    if owner_id is None:
+        owner_id = getattr(sess, "user_id", None)
+    sess.gemini_api_key = web_search_key(
+        user_keys, stored_keys_for(owner_id), billed_to_duct=run.source == "cloud",
+    )
+
+
+def _attach_video_run(
+    session_id: str, user_keys: dict | None = None, owner_id=None
+) -> None:
+    """``_attach_image_run`` for clips: resolved once per runner, on the same
+    credential rules, and absent-able — no key means the video tool declines
+    with a sentence naming the keys that would unblock it."""
+    from agents.core.session import get_session as _get_agent_session
+
+    sess = _get_agent_session(session_id)
+    if sess is None:
+        return
+    if owner_id is None:
+        owner_id = getattr(sess, "user_id", None)
+    run = resolve_video_run(
+        user_keys,
+        stored_keys_for(owner_id),
+        preferred=get_model_settings(owner_id).video_model,
+    )
+    if run is None:
+        sess.video_provider = None
+        sess.video_api_key = ""
+        sess.video_model = ""
+        return
+    if run.source == "cloud":
+        logger.info("content: video billed to Duct (%s/%s)", run.provider.value, run.source)
+    sess.video_provider = run.provider
+    sess.video_api_key = run.api_key
+    sess.video_model = run.model.value
+
+
+async def _emit(queue: asyncio.Queue, body: dict[str, Any]) -> None:
+    body.setdefault("ts", now_iso())
+    await queue.put(body)
+
+
+async def _stream_queue(
+    queue: asyncio.Queue,
+    finished: asyncio.Event,
+) -> AsyncGenerator[str, None]:
+    while not finished.is_set() or not queue.empty():
+        try:
+            payload = await asyncio.wait_for(queue.get(), timeout=15)
+            yield f"data: {json.dumps(payload, default=str)}\n\n"
+        except asyncio.TimeoutError:
+            yield ": ping\n\n"
+
+
+def _project_for_user(db: Session, user: User, project_id: UUID) -> Project:
+    """A project the caller belongs to, or 404.
+
+    Replaces a bare existence check. Membership is the access model here (see
+    service/membership.py), and a non-member gets the same 404 a made-up id
+    does so the reply is not an oracle for which projects are real.
+    """
+    return get_project_for_user(project_id, user, db)
+
+
+def _row_for_user(db: Session, user: User, model, row_id: UUID, label: str):
+    """A project-scoped content row the caller may act on, or 404.
+
+    Every table in this module carries a project_id, so one helper covers
+    plans, posts, formats, avatars and assets alike.
+    """
+    return get_project_row_for_user(db, user, model, row_id, label=label)
+
+
+def _session_for_user(db: Session, user: User, session_id: str):
+    """A live drafting session the caller may drive, or 404.
+
+    Session ids are unguessable, but unguessable is not a permission: the
+    session knows its project, so that is what gets checked.
+    """
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found or expired")
+    get_project_for_user(session.project_id, user, db)
+    return session
+
+
+# ---------------------------------------------------------------------------
+# SSE: plan_month
+# ---------------------------------------------------------------------------
+
+
+def _link_conversation_artifact(session_id: str, kind: str) -> None:
+    """Bind the session's persisted conversation to the artifact it just produced
+    (post/plan) so 'click post → resume' can find it. Best-effort: a brand-new
+    draft creates its conversation before the post exists, so the id is only
+    known once the worker finishes. No-op when the session isn't tracked."""
+    sess = get_session(session_id)
+    conv_id = getattr(sess, "conversation_id", None) if sess else None
+    artifact_id = getattr(sess, "post_id" if kind == "post" else "plan_id", None) if sess else None
+    if not conv_id or not artifact_id:
+        return
+    try:
+        from agents.content.persistence import link_artifact
+        with next(db_session()) as db:
+            link_artifact(db, conv_id, kind, artifact_id)
+    except Exception:
+        logger.warning("content: failed to link conversation %s → %s %s",
+                       conv_id, kind, artifact_id, exc_info=True)
+
+
+def _runner_for(session_id: str, user_keys: dict | None) -> ContentRunner:
+    run = _resolve_run_model(session_id, user_keys)
+    _attach_image_run(session_id, user_keys)
+    _attach_video_run(session_id, user_keys)
+    _attach_search_key(session_id, run, user_keys)
+    return ContentRunner(api_key=run.api_key, provider=run.provider, model=run.model)
+
+
+def _requested_period(req: PlanRequest) -> PlanPeriod | None:
+    """The period a plan request picked, or None for the default (the month
+    in progress). A length without a start counts from today."""
+    if req.start_date is None and req.days is None:
+        return None
+    try:
+        return requested_period(req.start_date or utcnow().date(), req.days)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+async def _run_plan_worker(
+    session_id: str,
+    project_id: UUID,
+    emit_fn: Any,
+    user_keys: dict | None = None,
+    period: PlanPeriod | None = None,
+    feed: Any = None,
+) -> None:
+    try:
+        runner = _runner_for(session_id, user_keys)
+        await runner.run_plan(session_id, project_id, emit_fn, period=period, feed=feed)
+        _link_conversation_artifact(session_id, "plan")
+    except Exception as exc:
+        # A code before a message: the client picks the copy from the code
+        # and never sees str(exc) (agents/core/errors.py).
+        logger.exception("content: plan worker error for session %s", session_id)
+        await emit_fn({
+            "event":      ContentEvent.PIPELINE_FAILED,
+            "session_id": session_id,
+            **error_payload(exc),
+        })
+
+
+@router.post("/content/plan/stream")
+async def run_plan_stream(
+    req: PlanRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+    user_keys: dict = Depends(get_user_provider_keys),
+) -> StreamingResponse:
+    """Start a 30-day plan synthesis session. Returns an SSE stream covering
+    the full session lifetime (continues after PIPELINE_FINISHED so the user
+    can chat with the agent to refine the plan)."""
+    _project_for_user(db, user, req.project_id)
+    period = _requested_period(req)
+    session_id = str(uuid.uuid4())
+    _session_created_at[session_id] = time.monotonic()
+    create_plan_session(session_id, req.project_id)
+    capture_event("content_plan_generation_started")
+
+    queue: asyncio.Queue = asyncio.Queue()
+    finished = asyncio.Event()
+
+    async def emit_fn(body: dict[str, Any]) -> None:
+        await _emit(queue, body)
+
+    async def worker() -> None:
+        try:
+            await _run_plan_worker(session_id, req.project_id, emit_fn, user_keys, period=period)
+        except Exception as exc:
+            logger.exception("content: plan worker outer error")
+            await emit_fn({
+                "event":      ContentEvent.PIPELINE_FAILED,
+                "session_id": session_id,
+                **error_payload(exc),
+            })
+
+    asyncio.create_task(worker())
+
+    async def stream() -> AsyncGenerator[str, None]:
+        try:
+            async for chunk in _stream_queue(queue, finished):
+                yield chunk
+        except asyncio.CancelledError:
+            pass
+        finally:
+            close_session(session_id)
+            _session_created_at.pop(session_id, None)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":          "no-cache",
+            "Connection":             "keep-alive",
+            "X-Accel-Buffering":      "no",
+            "X-Content-Session-Id":   session_id,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# SSE: draft_post
+# ---------------------------------------------------------------------------
+
+
+async def _run_draft_worker(
+    session_id: str,
+    req: DraftPostRequest,
+    emit_fn: Any,
+    user_keys: dict | None = None,
+) -> None:
+    try:
+        runner = _runner_for(session_id, user_keys)
+        # Resolve the Day from the plan if provided; otherwise pass topic/pillar.
+        day_obj = None
+        if req.plan_id is not None and req.day_index is not None:
+            with next(db_session()) as db:
+                plan = db.get(ContentPlan, req.plan_id)
+                if plan is not None and plan.project_id != req.project_id:
+                    plan = None  # the route refuses this; a second guard costs nothing
+                if plan and 0 <= req.day_index < len(plan.days):
+                    from agents.content.schema import Day
+                    raw = plan.days[req.day_index]
+                    if isinstance(raw, dict):
+                        try:
+                            day_obj = Day.model_validate(raw)
+                        except Exception as exc:
+                            logger.warning("content: failed to parse Day[%d] from plan %s: %s",
+                                           req.day_index, req.plan_id, exc)
+        if day_obj is not None:
+            # submit_post links the post onto this day as soon as it exists.
+            sess = get_session(session_id)
+            if sess is not None:
+                sess.plan_id, sess.day_index = req.plan_id, req.day_index
+        # Primary channel: explicit request → the day's first platform → default.
+        from agents.content.channels import primary_channel
+        channel = req.channel or (primary_channel(day_obj.platforms) if day_obj else None)
+        if req.clone_url:
+            # A draft modelled on a TikTok post; the plan link-back below is
+            # the same for both, so a clone can fill a plan slot too.
+            await runner.run_clone(
+                session_id, req.project_id, emit_fn, clone_url=req.clone_url, channel=channel,
+            )
+        else:
+            await runner.run_draft(
+                session_id,
+                req.project_id,
+                emit_fn,
+                day=day_obj,
+                topic=req.topic,
+                pillar=req.pillar,
+                channel=channel,
+                # A day that already has a post opens on it for review; the
+                # drafting kickoff rewrote the saved post unasked (2026-11-08).
+                existing_post_id=day_obj.post_id if day_obj is not None else None,
+            )
+        _link_conversation_artifact(session_id, "post")
+    except Exception as exc:
+        logger.exception("content: draft worker error for session %s", session_id)
+        await emit_fn({
+            "event":      ContentEvent.PIPELINE_FAILED,
+            "session_id": session_id,
+            **error_payload(exc),
+        })
+
+
+@router.post("/content/post/stream")
+async def run_post_stream(
+    req: DraftPostRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+    user_keys: dict = Depends(get_user_provider_keys),
+) -> StreamingResponse:
+    """Start a single-post draft session. SSE stream for the lifetime."""
+    _project_for_user(db, user, req.project_id)
+    if req.plan_id is not None:
+        # The plan seeds the day and takes the post's link at the first save,
+        # so it has to be this project's: a plan id from another project
+        # would read that project's day and write the post into its board.
+        plan = _row_for_user(db, user, ContentPlan, req.plan_id, "Plan")
+        if plan.project_id != req.project_id:
+            raise HTTPException(404, "Plan not found")
+    session_id = str(uuid.uuid4())
+    _session_created_at[session_id] = time.monotonic()
+    create_draft_session(session_id, req.project_id, plan_id=req.plan_id)
+    capture_event("content_post_draft_started", {"is_clone": bool(req.clone_url)})
+
+    queue: asyncio.Queue = asyncio.Queue()
+    finished = asyncio.Event()
+
+    async def emit_fn(body: dict[str, Any]) -> None:
+        await _emit(queue, body)
+
+    async def worker() -> None:
+        try:
+            await _run_draft_worker(session_id, req, emit_fn, user_keys)
+        except Exception as exc:
+            logger.exception("content: draft worker outer error")
+            await emit_fn({
+                "event":      ContentEvent.PIPELINE_FAILED,
+                "session_id": session_id,
+                **error_payload(exc),
+            })
+
+    asyncio.create_task(worker())
+
+    async def stream() -> AsyncGenerator[str, None]:
+        try:
+            async for chunk in _stream_queue(queue, finished):
+                yield chunk
+        except asyncio.CancelledError:
+            pass
+        finally:
+            close_session(session_id)
+            _session_created_at.pop(session_id, None)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":         "no-cache",
+            "Connection":            "keep-alive",
+            "X-Accel-Buffering":     "no",
+            "X-Content-Session-Id":  session_id,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# SSE: AskUserQuestion answer + continued chat + close
+# ---------------------------------------------------------------------------
+
+
+@router.post("/content/answer/{session_id}")
+async def submit_content_answers(
+    session_id: str,
+    req: ContentAnswerRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> dict:
+    """Resolve a pending AskUserQuestion in the content session.
+
+    The V1 runner parks a question on the thread's checkpoint, so an answer is
+    a resume queued for the next loop iteration — the same shape the unified
+    messages route uses. The Future path stays for the slide-render bridge
+    and any in-process pause; the client cannot tell which it hit.
+    """
+    session = _session_for_user(db, user, session_id)
+    pending = getattr(session, "pending_pauses", None) or {}
+    if pending:
+        interrupt_id = next(iter(pending))
+        pending.pop(interrupt_id, None)
+        await session.chat_queue.put({"resume": {interrupt_id: req.answers}})
+        return {"status": "queued"}
+    fut = session.answer_future
+    if not fut or getattr(fut, "done", lambda: True)():
+        raise HTTPException(400, "No pending question for this session")
+    try:
+        fut.set_result(req.answers)
+    except asyncio.InvalidStateError as exc:
+        raise HTTPException(409, "Question already answered") from exc
+    return {"status": "ok"}
+
+
+@router.post("/content/chat/{session_id}")
+async def send_content_chat_message(
+    session_id: str,
+    req: ContentChatMessage,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> dict:
+    _session_for_user(db, user, session_id)
+    """Send a follow-up message into an active content session."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found or expired")
+    await session.chat_queue.put({"role": "user", "content": req.content})
+    capture_event("content_session_message_sent")
+    return {"status": "queued"}
+
+
+class SlideRenderResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    render_id:    str
+    image_base64: str   # the rasterized 1080×1920 PNG, base64 (no data: prefix)
+
+
+@router.post("/content/slide-render/{session_id}")
+async def submit_slide_render(
+    session_id: str,
+    req: SlideRenderResult,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> dict:
+    _session_for_user(db, user, session_id)
+    """Resolve a pending render_slide request — the browser rasterized the slide
+    and POSTs the PNG back here; we hand the bytes to the waiting agent tool.
+    An empty image_base64 signals a browser-side failure (resolves to a clean
+    tool error rather than hanging the agent for the full timeout)."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found or expired")
+    fut = session.render_futures.get(req.render_id)
+    if not fut or getattr(fut, "done", lambda: True)():
+        raise HTTPException(400, "No pending render for this id (it may have timed out)")
+    try:
+        fut.set_result(req.image_base64)
+    except asyncio.InvalidStateError as exc:
+        raise HTTPException(409, "Render already resolved") from exc
+    return {"status": "ok"}
+
+
+def _inline_local_images(html: str) -> str:
+    """Replace src="/uploads/…" with base64 data URIs so a browser rasterizing
+    the doc isn't CORS-tainted (the app + backend are different origins).
+
+    Hardened against path traversal: image_url is agent-influenceable (a slide's
+    image_url survives submit/edit), so a value like "/uploads/../../etc/passwd"
+    must NOT be read off disk. We resolve and require the path stays inside
+    uploads_dir before reading.
+    """
+    import base64
+    import re
+
+    cfg = get_configs()
+    base = Path(cfg.uploads_dir or "/app/uploads").resolve()
+
+    def _repl(m: "re.Match") -> str:
+        url = m.group(1)
+        rel = url[len("/uploads/"):]
+        try:
+            p = (base / rel).resolve()
+            if not p.is_relative_to(base) or not p.is_file():
+                return m.group(0)   # traversal / missing → leave the src untouched
+            suffix = p.suffix.lower()
+            mime = {
+                ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+            }.get(suffix, "image/png")
+            data = base64.b64encode(p.read_bytes()).decode("ascii")
+            return f'src="data:{mime};base64,{data}"'
+        except Exception:
+            return m.group(0)
+
+    return re.sub(r'src="(/uploads/[^"]+)"', _repl, html)
+
+
+@router.get("/content/slide-doc/{session_id}")
+def get_slide_render_doc(
+    session_id: str,
+    post_id: UUID,
+    slide_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> dict:
+    """Self-contained 1080×1920 single-slide HTML (images inlined as base64) for
+    the browser to rasterize — backing the render_slide bridge. Origin-clean, so
+    the client-side canvas capture isn't tainted."""
+    from agents.content.schema import Slide
+    from agents.content.templates import render_slides_html
+
+    # Two gates, not one. The caller must belong to the session's project, and
+    # the post must belong to that same session — so a member of project A
+    # cannot rasterize project B's slides, and cannot use their own session to
+    # reach a post outside it either.
+    session = _session_for_user(db, user, session_id)
+    post = _row_for_user(db, user, ContentPost, post_id, "Post")
+    if post.project_id != session.project_id:
+        raise HTTPException(404, "Post not found")
+    raw = next(
+        (s for s in (post.slides or []) if isinstance(s, dict) and s.get("slide_id") == slide_id),
+        None,
+    )
+    if raw is None:
+        raise HTTPException(404, f"Slide {slide_id} not found on this post")
+    slide = Slide.model_validate(raw)
+    html = render_slides_html(post.layout or "full-bleed", [slide])
+    return {"html": _inline_local_images(html), "width": 1080, "height": 1920}
+
+
+@router.delete("/content/session/{session_id}")
+async def close_content_session(
+    session_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> dict:
+    """Close a drafting session. Idempotent, and deliberately uniform.
+
+    Always answers ok. Closing an id that never existed is not an error — a
+    client tearing down should not have to know whether it won the race — and
+    answering differently for "not yours" would hand that same client a way to
+    probe which sessions are live. So a session the caller does not belong to
+    is simply not closed, and its prune timestamp is left alone.
+    """
+    session = get_session(session_id)
+    if session is not None:
+        try:
+            get_project_for_user(session.project_id, user, db)
+        except HTTPException:
+            return {"status": "ok"}
+        close_session(session_id)
+    _session_created_at.pop(session_id, None)
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Brand context
+# ---------------------------------------------------------------------------
+
+
+_JSONB_MAX_BYTES = 256_000
+
+
+class BrandContextIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content_brand:         dict | None = None
+    content_pillars:       dict | None = None
+    content_visual_assets: dict | None = None
+    slug:    str | None = None
+    tagline: str | None = None
+    description: str | None = None
+    # NOTE: `url` (website) is owned by project context (company.website_url);
+    # it is intentionally NOT writable here to avoid two editors clobbering one column.
+
+    @field_validator("content_brand", "content_pillars", "content_visual_assets", mode="after")
+    @classmethod
+    def _check_size(cls, v: dict | None) -> dict | None:
+        if v is not None and len(json.dumps(v, default=str)) > _JSONB_MAX_BYTES:
+            raise ValueError("Section payload too large (max 256 KB).")
+        return v
+
+    @field_validator("content_brand", mode="after")
+    @classmethod
+    def _check_voice(cls, v: dict | None) -> dict | None:
+        # The voice fields are read into every text draft, so their caps are
+        # held here too, not only by the Brand tab that normally sends them.
+        problems = voice_problems(v)
+        if problems:
+            raise ValueError(" ".join(problems))
+        return v
+
+
+class BrandContextOut(BaseModel):
+    project_id:            UUID
+    project_name:          str
+    slug:                  str
+    tagline:               str
+    description:           str
+    url:                   str
+    content_brand:         dict
+    content_pillars:       dict
+    content_visual_assets: dict
+    # The text writer's rules as they apply (content_brand.voice_rules with
+    # the defaults filled in), and the defaults themselves, so the Brand tab
+    # shows a project that never set them what it runs on and can go back.
+    voice_rules:           dict
+    voice_rules_default:   dict
+
+
+def _brand_out(p: Project) -> BrandContextOut:
+    return BrandContextOut(
+        project_id=p.id,
+        project_name=p.name,
+        slug=p.slug or "",
+        tagline=p.tagline or "",
+        description=p.description or "",
+        url=p.url or "",
+        content_brand=p.content_brand or {},
+        content_pillars=p.content_pillars or {},
+        content_visual_assets=p.content_visual_assets or {},
+        voice_rules=voice_rules_of(p.content_brand).model_dump(),
+        voice_rules_default=VoiceRules().model_dump(),
+    )
+
+
+@router.get("/content/brand")
+def get_brand_context(
+    project_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> BrandContextOut:
+    return _brand_out(_project_for_user(db, user, project_id))
+
+
+@router.put("/content/brand")
+def put_brand_context(
+    project_id: UUID,
+    body: BrandContextIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> BrandContextOut:
+    proj = _project_for_user(db, user, project_id)
+    if body.content_brand is not None:
+        proj.content_brand = body.content_brand
+    if body.content_pillars is not None:
+        # The person's own list, labelled theirs: a crawl or an outside
+        # agent's draft never replaces it (service/project_draft.py rule 1).
+        sent = body.content_pillars
+        edit_fields(proj, {"content_pillars": (sent.get("items") if isinstance(sent, dict) else sent) or []})
+    if body.content_visual_assets is not None:
+        proj.content_visual_assets = body.content_visual_assets
+    if body.slug is not None:
+        proj.slug = body.slug
+    if body.tagline is not None:
+        proj.tagline = body.tagline
+    if body.description is not None:
+        proj.description = body.description
+    proj.updated_at = datetime.now(timezone.utc)
+    db.add(proj)
+    db.commit()
+    db.refresh(proj)
+    return _brand_out(proj)
+
+
+# ---------------------------------------------------------------------------
+# Plans CRUD
+# ---------------------------------------------------------------------------
+
+
+class PlanIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: UUID
+    name:       str = ""
+    start_date: str | None = None
+    character:  dict = Field(default_factory=dict)
+    days:       list = Field(default_factory=list)
+    status:     str = "draft"
+
+
+class PlanOut(BaseModel):
+    id:         UUID
+    project_id: UUID
+    name:       str
+    start_date: str | None
+    character:  dict
+    strategy:   dict
+    days:       list
+    status:     str
+    created_at: str
+    updated_at: str
+    posts:      list[dict] | None = None
+    # The conversation managing this plan, so "Revise plan" reopens it with
+    # its history instead of a blank chat. GET /plans/{id} only, like posts.
+    active_conversation_id: UUID | None = None
+
+
+def _plan_out(p: ContentPlan, posts: list[ContentPost] | None = None) -> PlanOut:
+    return PlanOut(
+        id=p.id,
+        project_id=p.project_id,
+        name=p.name,
+        start_date=p.start_date.isoformat() if p.start_date else None,
+        character=p.character or {},
+        strategy=p.strategy or {},
+        days=p.days or [],
+        status=p.status,
+        created_at=p.created_at.isoformat(),
+        updated_at=p.updated_at.isoformat(),
+        posts=(
+            [
+                {
+                    "id":            str(post.id),
+                    "post_dir_slug": post.post_dir_slug,
+                    "pillar":        post.pillar,
+                    "topic":         post.topic,
+                    "status":        post.status,
+                    "slide_count":   post.slide_count,
+                }
+                for post in posts
+            ]
+            if posts is not None
+            else None
+        ),
+    )
+
+
+@router.get("/content/plans")
+def list_plans(
+    project_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> list[PlanOut]:
+    _project_for_user(db, user, project_id)
+    rows = db.execute(
+        select(ContentPlan)
+        .where(ContentPlan.project_id == project_id)
+        .order_by(ContentPlan.created_at.desc())
+    ).scalars().all()
+    return [_plan_out(r) for r in rows]
+
+
+@router.get("/content/plans/{plan_id}")
+def get_plan(
+    plan_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PlanOut:
+    plan = _row_for_user(db, user, ContentPlan, plan_id, "Plan")
+    posts = db.execute(
+        select(ContentPost).where(ContentPost.plan_id == plan_id).order_by(ContentPost.created_at)
+    ).scalars().all()
+    out = _plan_out(plan, posts=list(posts))
+    # Best-effort, as for a post: viewing a plan must not fail on the lookup.
+    try:
+        from agents.content.persistence import find_active_conversation
+        conv = find_active_conversation(db, artifact_type="plan", artifact_id=plan.id)
+        out.active_conversation_id = conv.id if conv else None
+    except Exception:
+        db.rollback()
+        logger.warning("content: active-conversation lookup failed for plan %s", plan_id, exc_info=True)
+    return out
+
+
+class PlanDecision(BaseModel):
+    """Accept or reject the plan a session proposed."""
+
+    model_config = ConfigDict(extra="forbid")
+    session_id: str
+    proposal_id: str
+
+
+def _proposal_for(db: Session, user: User, body: PlanDecision):
+    """The live session and the proposal the person is deciding on, or 404.
+
+    The proposal id is checked as well as the session: a card left on screen
+    from an earlier proposal must not accept the one the agent made since."""
+    session = _session_for_user(db, user, body.session_id)
+    proposal = getattr(session, "proposal", None)
+    if proposal is None or proposal.proposal_id != body.proposal_id:
+        raise HTTPException(404, "That plan proposal is no longer open.")
+    return session, proposal
+
+
+def _record_plan_decision(db: Session, session, proposal, decision: str, *, plan_id=None) -> None:
+    """Release the proposal its conversation held and say in the transcript
+    what the person decided. Memory reads that transcript: without the line,
+    a plan the agent only proposed was remembered as a pivot made."""
+    from agents.content.persistence import append_event
+    from agents.content.plan_proposal import hold_proposal
+    from agents.core.events import EventKind
+
+    conversation_id = getattr(session, "conversation_id", None)
+    if conversation_id is None:
+        return
+    try:
+        hold_proposal(db, conversation_id, None)
+        append_event(db, conversation_id, EventKind.PLAN_DECISION, {
+            "decision": decision,
+            "proposal_id": proposal.proposal_id,
+            "plan_id": str(plan_id) if plan_id else None,
+            "name": proposal.name,
+        })
+    except Exception:
+        db.rollback()
+        logger.warning("content: plan decision not recorded for conversation %s", conversation_id, exc_info=True)
+
+
+@router.post("/content/plans/accept")
+async def accept_plan(
+    body: PlanDecision,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PlanOut:
+    """Write the proposed plan: the only path that saves a plan the agent
+    wrote (agents/content/plan_proposal.py says what is kept). The session
+    learns the plan it now manages, and the viewport hears it on the stream."""
+    from agents.content.plan_proposal import ACCEPTED, apply_proposal
+
+    session, proposal = _proposal_for(db, user, body)
+    row = apply_proposal(db, proposal, now=utcnow())
+    session.plan_id = row.id
+    session.proposal = None
+    _record_plan_decision(db, session, proposal, ACCEPTED, plan_id=row.id)
+    _link_conversation_artifact(body.session_id, "plan")
+    payload = proposal.payload(ACCEPTED)
+    # The days as written, which Accept merged against the plan as it stood:
+    # a change to some days carries only those, and a day drafted while the
+    # proposal waited kept its draft.
+    payload.update(id=str(row.id), days=list(row.days or []))
+    await _emit(session.event_queue, {
+        "event": ContentEvent.PLAN_GENERATED,
+        "session_id": body.session_id,
+        "plan_id": str(row.id),
+        "payload": payload,
+    })
+    return _plan_out(row)
+
+
+@router.post("/content/plans/reject")
+async def reject_plan(
+    body: PlanDecision,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> dict:
+    """Drop the proposal. Nothing was written, so nothing is deleted; the
+    board stays as it was and the session keeps its conversation."""
+    from agents.content.plan_proposal import REJECTED
+
+    session, proposal = _proposal_for(db, user, body)
+    session.proposal = None
+    _record_plan_decision(db, session, proposal, REJECTED)
+    await _emit(session.event_queue, {
+        "event": ContentEvent.PLAN_GENERATED,
+        "session_id": body.session_id,
+        "plan_id": None,
+        # A whole plan turned down leaves nothing to show; a change to some
+        # days keeps its days, so the pane can show what was turned down.
+        "payload": {**proposal.payload(REJECTED), "days": proposal.days if proposal.only_days else []},
+    })
+    return {"ok": True}
+
+
+@router.post("/content/plans", status_code=201)
+def create_plan(
+    body: PlanIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PlanOut:
+    _project_for_user(db, user, body.project_id)
+    start = None
+    if body.start_date:
+        try:
+            start = datetime.fromisoformat(body.start_date).date()
+        except ValueError as exc:
+            raise HTTPException(400, f"Invalid start_date: {exc}") from exc
+    plan = ContentPlan(
+        project_id=body.project_id,
+        name=body.name or "30-day plan",
+        start_date=start,
+        character=body.character or {},
+        days=body.days or [],
+        status=body.status or "draft",
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return _plan_out(plan)
+
+
+class DayPatch(BaseModel):
+    model_config = ConfigDict(extra="allow")  # shallow merge of arbitrary day fields
+
+
+@router.patch("/content/plans/{plan_id}/days/{index}")
+def patch_plan_day(
+    plan_id: UUID,
+    index: int,
+    body: DayPatch,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PlanOut:
+    """Shallow-merge a single day's fields by its 0-based position in days[]."""
+    plan = _row_for_user(db, user, ContentPlan, plan_id, "Plan")
+    days = list(plan.days or [])
+    idx = index
+    if idx < 0 or idx >= len(days):
+        raise HTTPException(400, f"Index {index} out of range (plan has {len(days)} items)")
+    existing = dict(days[idx]) if isinstance(days[idx], dict) else {}
+    patch = body.model_dump(exclude_unset=True)
+    existing.update(patch)
+    days[idx] = existing
+    plan.days = days
+    plan.updated_at = datetime.now(timezone.utc)
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return _plan_out(plan)
+
+
+@router.delete("/content/plans/{plan_id}")
+def delete_plan(
+    plan_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> dict:
+    plan = _row_for_user(db, user, ContentPlan, plan_id, "Plan")
+    db.delete(plan)
+    db.commit()
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Posts CRUD
+# ---------------------------------------------------------------------------
+
+
+class PostIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id:    UUID
+    plan_id:       UUID | None = None
+    post_dir_slug: str
+    pillar:        str = ""
+    topic:         str = ""
+    topic_id:      int | None = None
+    post_type:     str = "slideshow"
+    format_slug:   str = ""   # resolved to format_id; "" leaves the post unlinked
+    avatar_id:     UUID | None = None
+    layout:        str = "full-bleed"
+    slide_count:   int = 0
+    status:        str = "pending"
+    slides:        list = Field(default_factory=list)
+    slides_html:   str = ""
+    caption:       str = ""
+    replies:       list[str] = Field(default_factory=list)
+    hashtags:      list = Field(default_factory=list)
+    title:         str = ""
+    hook_type:     str = ""
+    hook_text:     str = ""
+    hook_emotion:  str = ""
+    save_cta:      str = ""
+    image_prompts: list = Field(default_factory=list)
+    audio_note:    str = ""
+    bridge_text:   str = ""
+    strategic_note: str = ""
+    visual_brief:  str = ""
+    emotional_arc: str = ""
+    camera_ref_pool: str = ""
+    platforms:     list[Platform] = Field(default_factory=lambda: [Platform.TIKTOK])
+
+
+class PostPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id:       UUID | None = None
+    pillar:        str | None = None
+    topic:         str | None = None
+    topic_id:      int | None = None
+    post_type:     str | None = None
+    format_slug:   str | None = None
+    avatar_id:     UUID | None = None
+    layout:        str | None = None
+    slide_count:   int | None = None
+    status:        str | None = None
+    slides:        list | None = None
+    slides_html:   str | None = None
+    caption:       str | None = None
+    replies:       list[str] | None = None
+    hashtags:      list | None = None
+    title:         str | None = None
+    hook_type:     str | None = None
+    hook_text:     str | None = None
+    hook_emotion:  str | None = None
+    save_cta:      str | None = None
+    image_prompts: list | None = None
+    audio_note:    str | None = None
+    bridge_text:   str | None = None
+    strategic_note: str | None = None
+    visual_brief:  str | None = None
+    emotional_arc: str | None = None
+    camera_ref_pool: str | None = None
+    platforms:     list[Platform] | None = None
+    notes:         str | None = None
+
+
+class PostOut(BaseModel):
+    id:            UUID
+    project_id:    UUID
+    plan_id:       UUID | None
+    post_dir_slug: str
+    pillar:        str
+    topic:         str
+    topic_id:      int | None
+    post_type:     str
+    format_id:     UUID | None
+    format_slug:   str
+    format_name:   str
+    avatar_id:     UUID | None
+    thumbnail_url: str
+    layout:        str
+    slide_count:   int
+    status:        str
+    slides:        list
+    slides_html:   str
+    caption:       str
+    replies:       list
+    hashtags:      list
+    title:         str
+    hook_type:     str
+    hook_text:     str
+    hook_emotion:  str
+    save_cta:      str
+    image_prompts: list
+    audio_note:    str
+    bridge_text:   str
+    strategic_note: str
+    visual_brief:  str
+    emotional_arc: str
+    camera_ref_pool: str
+    platforms:     list
+    # The primary channel's rules (agents/content/channels.channel_payload):
+    # the limit the preview counts against, where the feed folds, how many
+    # replies publish. Sent so the app never keeps its own copy of a number.
+    channel:       dict = Field(default_factory=dict)
+    posted_at:     str | None
+    scheduled_at:  str | None
+    published_url: str
+    published_via: str
+    # The scheduler holding the post, and its id there. Set once Duct sent the
+    # post, which is when its counts sync, so the metrics form shows them
+    # rather than asking for them.
+    publisher: str = ""
+    publisher_post_id: str = ""
+    # The scheduler's reason, while the post is failed; "" otherwise, and ""
+    # when it gave none (the card words that case itself).
+    publish_error: str = ""
+    perf:          dict
+    daily_perf:    list
+    notes:         str
+    # The TikTok a cloned post was modelled on; None for any other post.
+    clone_source:  dict | None = None
+    # A video post's chosen clip (agents/content/video.cut_of), and on a detail
+    # response its takes, newest first. None / [] for any other post.
+    video:         dict | None = None
+    video_takes:   list = []
+    created_at:    str
+    updated_at:    str
+    # The active agent conversation for this post (if any) — drives "click post →
+    # resume the chat" on the detail page. None ⇒ open a fresh session.
+    active_conversation_id: UUID | None = None
+    # The pre-publish review as it stands now: fresh checks, plus the last
+    # scores if the agent has reviewed it. Detail responses only — the board
+    # lists many posts and shows none of it.
+    assessment: PublishAssessment | None = None
+
+
+def _post_out(
+    p: ContentPost,
+    *,
+    fmt: tuple[str, str] | None = None,
+    thumbnail_url: str = "",
+    active_conversation_id: UUID | None = None,
+    with_assessment: bool = False,
+    video_takes: list | None = None,
+    publish_error: str = "",
+    spec: PublisherSpec | None = None,
+) -> PostOut:
+    """Serialize a post. `fmt` is an optional (slug, name) for the linked format;
+    `spec` the scheduler it goes through (ProjectPublishing.for_post)."""
+    return PostOut(
+        active_conversation_id=active_conversation_id,
+        assessment=(
+            reassess_post(p) if with_assessment else None
+        ),
+        id=p.id,
+        project_id=p.project_id,
+        plan_id=p.plan_id,
+        post_dir_slug=p.post_dir_slug,
+        pillar=p.pillar,
+        topic=p.topic,
+        topic_id=p.topic_id,
+        post_type=p.post_type,
+        format_id=p.format_id,
+        format_slug=(fmt[0] if fmt else ""),
+        format_name=(fmt[1] if fmt else ""),
+        avatar_id=p.avatar_id,
+        thumbnail_url=thumbnail_url,
+        layout=p.layout or "full-bleed",
+        slide_count=p.slide_count,
+        status=p.status,
+        slides=p.slides or [],
+        slides_html=p.slides_html,
+        caption=p.caption,
+        replies=p.replies or [],
+        hashtags=p.hashtags or [],
+        title=p.title,
+        hook_type=p.hook_type,
+        hook_text=p.hook_text,
+        hook_emotion=p.hook_emotion,
+        save_cta=p.save_cta,
+        image_prompts=p.image_prompts or [],
+        audio_note=p.audio_note,
+        bridge_text=p.bridge_text,
+        strategic_note=p.strategic_note,
+        visual_brief=p.visual_brief,
+        emotional_arc=p.emotional_arc,
+        camera_ref_pool=p.camera_ref_pool,
+        platforms=p.platforms or [],
+        channel=channel_payload(primary_channel(p.platforms), spec),
+        posted_at=p.posted_at.isoformat() if p.posted_at else None,
+        scheduled_at=p.scheduled_at.isoformat() if p.scheduled_at else None,
+        published_url=p.published_url,
+        published_via=p.published_via,
+        publisher=p.publisher or "",
+        publisher_post_id=p.publisher_post_id or "",
+        publish_error=publish_error,
+        perf=p.perf or {},
+        daily_perf=p.daily_perf or [],
+        notes=p.notes,
+        clone_source=p.clone_source,
+        video=p.video,
+        video_takes=video_takes or [],
+        created_at=p.created_at.isoformat(),
+        updated_at=p.updated_at.isoformat(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Post enrichment — link format + derive a thumbnail
+# ---------------------------------------------------------------------------
+
+def _format_map(db: Session, project_id: UUID) -> dict:
+    """Return a by_id lookup of (slug, name) for a project's formats."""
+    rows = db.execute(
+        select(ContentFormat).where(ContentFormat.project_id == project_id)
+    ).scalars().all()
+    return {f.id: (f.slug, f.name or f.slug) for f in rows}
+
+
+def _resolve_format_id(db: Session, project_id: UUID, format_slug: str) -> UUID | None:
+    """Find the format row in this project matching a slug (e.g. 'format-d')."""
+    slug = (format_slug or "").strip().lower()
+    if not slug:
+        return None
+    row = db.execute(
+        select(ContentFormat).where(
+            ContentFormat.project_id == project_id,
+            ContentFormat.slug == slug,
+        )
+    ).scalars().first()
+    return row.id if row else None
+
+
+def _thumb_map(db: Session, post_ids: list[UUID]) -> dict[UUID, str]:
+    """Map post_id → first usable image asset url (generated or uploaded)."""
+    if not post_ids:
+        return {}
+    rows = db.execute(
+        select(ContentAsset.post_id, ContentAsset.url, ContentAsset.created_at)
+        .where(ContentAsset.post_id.in_(post_ids))
+        .where(ContentAsset.asset_type.in_(["generated", "upload"]))
+        .where(ContentAsset.url != "")
+        # A clip is not a thumbnail: the card draws an <img>. A video post's
+        # card shows its first frame when it has one, else the clip itself.
+        .where(~ContentAsset.mime_type.like("video/%"))
+        .order_by(ContentAsset.created_at.asc())
+    ).all()
+    out: dict[UUID, str] = {}
+    for pid, url, _created in rows:
+        if pid is not None and pid not in out and url:
+            out[pid] = url
+    return out
+
+
+def _fmt_for(post: ContentPost, by_id: dict) -> tuple[str, str] | None:
+    return by_id.get(post.format_id)
+
+
+def _enrich_one(db: Session, post: ContentPost) -> PostOut:
+    by_id = _format_map(db, post.project_id)
+    thumb = _thumb_map(db, [post.id]).get(post.id, "")
+    return _post_out(
+        post, fmt=_fmt_for(post, by_id), thumbnail_url=thumb, with_assessment=True,
+        video_takes=video_takes(db, post),
+        publish_error=_failure_reasons(db, post.project_id, [post]).get(post.id, ""),
+        spec=_post_spec(db, post),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Schedulers: which one serves a project, a post, a request
+# ---------------------------------------------------------------------------
+
+
+def _publishing(db: Session, proj: Project) -> ProjectPublishing:
+    return project_publishing(db, proj.id, proj.user_id)
+
+
+def _post_spec(db: Session, post: ContentPost) -> PublisherSpec | None:
+    proj = db.get(Project, post.project_id)
+    return _publishing(db, proj).for_post(post) if proj else spec_for(post.publisher)
+
+
+def _open_publisher(db: Session, proj: Project, publisher_id: str):
+    """The scheduler ``publisher_id`` on the key of the project's owner, who pays."""
+    try:
+        return publisher_for(proj.user_id, publisher_id, db)
+    except VendorNotConnected as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Scheduled posts whose time has passed (#311)
+# ---------------------------------------------------------------------------
+
+# How often one project's board may ask its schedulers about its overdue
+# scheduled posts, how many it asks about at once, and how long it waits. A
+# board re-lists on every visit and after every save; without the window each
+# listing would be a round of scheduler calls, without the cap a backlog of a
+# hundred overdue posts would hold one listing for two hundred, and without
+# the deadline a slow scheduler would be a slow board.
+_SETTLE_EVERY = 60.0     # seconds
+_SETTLE_BATCH = 10
+_SETTLE_TIMEOUT = 8.0    # seconds
+_settled_at: dict[UUID, float] = {}
+
+# The activity row a failed post's reason lives on. The post row has no column
+# for it, and a migration for one sentence that matters only until the post is
+# published again bought nothing activity_logs does not already record: what
+# happened to a post, when, and that nobody here did it.
+_POST_FAILED = "content_post.failed"
+_POST_TARGET = "content_post"
+
+
+def _settle_overdue(db: Session, proj: Project) -> None:
+    """Settle the project's scheduled posts whose time has passed against the
+    scheduler holding each, before the board lists them: posted, failed with
+    the scheduler's reason, or still waiting (publishing.settle). Best effort
+    in every direction: no key, a closed window, a scheduler error or a slow
+    answer leaves every status as it was, and the listing goes ahead."""
+    now = time.monotonic()
+    last = _settled_at.get(proj.id)
+    if last is not None and now - last < _SETTLE_EVERY:
+        return
+    overdue = db.execute(
+        select(ContentPost)
+        .where(
+            ContentPost.project_id == proj.id,
+            ContentPost.status == ContentStatus.SCHEDULED,
+            ContentPost.publisher_post_id != "",
+            # No stored time: scheduled by the agent before #272. The first
+            # answer gives it one, so it is asked about once, not every time.
+            or_(ContentPost.scheduled_at.is_(None), ContentPost.scheduled_at <= utcnow()),
+        )
+        .order_by(ContentPost.scheduled_at)
+        .limit(_SETTLE_BATCH)
+    ).scalars().all()
+    if not overdue:
+        return
+    _settled_at[proj.id] = now
+    by_publisher: dict[str, list[ContentPost]] = {}
+    for post in overdue:
+        by_publisher.setdefault(post.publisher, []).append(post)
+    for publisher_id, posts in by_publisher.items():
+        try:
+            pub = publisher_for(proj.user_id, publisher_id, db)
+        except VendorNotConnected:
+            continue   # the owner's key for this scheduler is gone; nothing to ask
+        label = pub.spec.label
+        try:
+            failed = anyio.from_thread.run(_settle_all, pub, posts)
+        except Exception:  # noqa: BLE001 — a scheduler outage must not take the board down with it
+            logger.warning("content: settling scheduled posts failed for project %s", proj.id, exc_info=True)
+            db.rollback()
+            continue
+        db.commit()
+        for post, reason in failed:
+            log_activity(
+                db, category="content", action=_POST_FAILED, source="auto",
+                project_id=proj.id, target_type=_POST_TARGET, target_id=str(post.id),
+                summary=f"{label} didn't publish “{post.topic or post.post_dir_slug}” at its scheduled time.",
+                data={"reason": reason, "publisher": publisher_id, "publisher_post_id": post.publisher_post_id},
+            )
+
+
+async def _settle_all(pub, posts: list[ContentPost]) -> list[tuple[ContentPost, str]]:
+    """Ask about every post at once, inside one deadline; return the ones
+    that failed, with the scheduler's reason. A post the scheduler errors on
+    stays as it was and the others still settle."""
+    async with pub:
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(*(settle(pub, p) for p in posts), return_exceptions=True),
+            timeout=_SETTLE_TIMEOUT,
+        )
+    failed: list[tuple[ContentPost, str]] = []
+    for post, outcome in zip(posts, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.warning("content: couldn't settle post %s: %s", post.id, outcome)
+        elif outcome is not None:
+            failed.append((post, outcome))
+    return failed
+
+
+def _failure_reasons(db: Session, project_id: UUID, posts) -> dict[UUID, str]:
+    """The scheduler's reason for each failed post among ``posts``, from the
+    newest activity row that marked it failed."""
+    failed_ids = [str(p.id) for p in posts if p.status == ContentStatus.FAILED]
+    if not failed_ids:
+        return {}
+    rows = db.execute(
+        select(ActivityLog.target_id, ActivityLog.data)
+        .where(
+            ActivityLog.project_id == project_id,
+            ActivityLog.target_type == _POST_TARGET,
+            ActivityLog.action == _POST_FAILED,
+            ActivityLog.target_id.in_(failed_ids),
+        )
+        .order_by(ActivityLog.created_at.desc())
+    ).all()
+    reasons: dict[UUID, str] = {}
+    for target_id, data in rows:
+        reasons.setdefault(UUID(target_id), str((data or {}).get("reason") or ""))
+    return reasons
+
+
+def _rerender_slides(post: ContentPost) -> None:
+    """Re-derive slides_html + image_prompts + slide_count from structured
+    slides. Called after a slides edit so the rendered preview, the flat
+    image-prompt list, and the count stay in lock-step. Staleness is implicit:
+    a slide whose image_prompt now differs from image_prompt_used renders with
+    the 'outdated' flag (see agents/content/templates.py)."""
+    from agents.content.schema import Slide
+    from agents.content.templates import derive_image_prompts, render_slides_html
+
+    parsed = [Slide.model_validate(s) for s in (post.slides or [])]
+    post.slides_html = render_slides_html(post.layout or "full-bleed", parsed)
+    post.image_prompts = derive_image_prompts(parsed)
+    post.slide_count = len(parsed)
+
+
+@router.get("/content/posts")
+def list_posts(
+    project_id: UUID,
+    plan_id: UUID | None = None,
+    status: str | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> list[PostOut]:
+    proj = _project_for_user(db, user, project_id)
+    _settle_overdue(db, proj)
+    stmt = select(ContentPost).where(ContentPost.project_id == project_id)
+    if plan_id is not None:
+        stmt = stmt.where(ContentPost.plan_id == plan_id)
+    if status:
+        stmt = stmt.where(ContentPost.status == status)
+    else:
+        # Default board view hides unsaved (pending) drafts — they live only in
+        # the live drafting workspace until the user clicks Save (pending→draft).
+        stmt = stmt.where(ContentPost.status != ContentStatus.PENDING)
+    stmt = stmt.order_by(ContentPost.updated_at.desc())
+    rows = db.execute(stmt).scalars().all()
+    by_id = _format_map(db, project_id)
+    thumbs = _thumb_map(db, [r.id for r in rows])
+    reasons = _failure_reasons(db, project_id, rows)
+    publishing = _publishing(db, proj)
+    return [
+        _post_out(
+            r, fmt=_fmt_for(r, by_id), thumbnail_url=thumbs.get(r.id, ""),
+            publish_error=reasons.get(r.id, ""), spec=publishing.for_post(r),
+        )
+        for r in rows
+    ]
+
+
+@router.get("/content/posts/{post_id}")
+def get_post(
+    post_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PostOut:
+    post = _row_for_user(db, user, ContentPost, post_id, "Post")
+    # Best-effort: the active-conversation lookup drives "click post → resume",
+    # but a persistence-table issue (e.g. migration not yet applied) must never
+    # break viewing a post — degrade to "no conversation" instead.
+    active_conversation_id = None
+    try:
+        from agents.content.persistence import find_active_conversation
+        conv = find_active_conversation(
+            db, artifact_type="post", artifact_id=post.id, project_id=post.project_id
+        )
+        active_conversation_id = conv.id if conv else None
+    except Exception:
+        db.rollback()
+        logger.warning("content: active-conversation lookup failed for post %s", post_id, exc_info=True)
+    by_id = _format_map(db, post.project_id)
+    thumb = _thumb_map(db, [post.id]).get(post.id, "")
+    return _post_out(
+        post,
+        fmt=_fmt_for(post, by_id),
+        thumbnail_url=thumb,
+        active_conversation_id=active_conversation_id,
+        with_assessment=True,
+        video_takes=video_takes(db, post),
+        publish_error=_failure_reasons(db, post.project_id, [post]).get(post.id, ""),
+        spec=_post_spec(db, post),
+    )
+
+
+class SelectVideoRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    asset_id: UUID
+
+
+@router.post("/content/posts/{post_id}/video/select")
+def select_post_video(
+    post_id: UUID,
+    body: SelectVideoRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PostOut:
+    """Make one of the post's takes its cut — the clip the player shows first
+    and publishing sends. The asset has to be a clip of *this* post: the row
+    is resolved through the post the caller is a member of, never trusted
+    from the body."""
+    post = _row_for_user(db, user, ContentPost, post_id, "Post")
+    take = take_for(db, post, body.asset_id)
+    if take is None:
+        raise HTTPException(404, "That clip isn't one of this post's takes.")
+    post.video = cut_of(take)
+    post.post_type = "video"
+    post.updated_at = datetime.now(timezone.utc)
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return _enrich_one(db, post)
+
+
+@router.post("/content/posts", status_code=201)
+def create_post(
+    body: PostIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PostOut:
+    _project_for_user(db, user, body.project_id)
+    # Upsert by (project_id, post_dir_slug) so the route is idempotent.
+    existing = db.execute(
+        select(ContentPost).where(
+            ContentPost.project_id == body.project_id,
+            ContentPost.post_dir_slug == body.post_dir_slug,
+        )
+    ).scalars().first()
+    values = {
+        **body.model_dump(),
+        "platforms": [p.value for p in body.platforms],
+    }
+    # format_slug is an input-only selector — resolve it to the FK and drop it.
+    values.pop("format_slug", None)
+    values["format_id"] = _resolve_format_id(db, body.project_id, body.format_slug)
+    # If structured slides came in without HTML, render the HTML from the template.
+    if values.get("slides") and not values.get("slides_html"):
+        from agents.content.schema import Slide
+        from agents.content.templates import derive_image_prompts, render_slides_html
+        parsed = [Slide.model_validate(s) for s in values["slides"]]
+        values["slides_html"] = render_slides_html(values.get("layout") or "full-bleed", parsed)
+        values["image_prompts"] = derive_image_prompts(parsed)
+        values["slide_count"] = len(parsed)
+    if existing is not None:
+        for k, v in values.items():
+            setattr(existing, k, v)
+        existing.updated_at = datetime.now(timezone.utc)
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+        return _enrich_one(db, existing)
+    post = ContentPost(**values)
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return _enrich_one(db, post)
+
+
+@router.patch("/content/posts/{post_id}")
+def patch_post(
+    post_id: UUID,
+    body: PostPatch,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PostOut:
+    post = _row_for_user(db, user, ContentPost, post_id, "Post")
+    queued = is_queued_at_publisher(post)
+    before_caption, before_replies = post.caption, list(post.replies or [])
+    patch = body.model_dump(exclude_unset=True)
+    if "platforms" in patch and patch["platforms"] is not None:
+        patch["platforms"] = [
+            p.value if isinstance(p, Platform) else p
+            for p in patch["platforms"]
+        ]
+    # format_slug is input-only — resolve to the FK rather than setting a column.
+    format_slug = patch.pop("format_slug", None)
+    for k, v in patch.items():
+        setattr(post, k, v)
+    if format_slug is not None:
+        post.format_id = _resolve_format_id(db, post.project_id, format_slug)
+    # When structured slides change, re-render the HTML from the template unless
+    # the caller also passed an explicit slides_html (don't clobber that).
+    if "slides" in patch and "slides_html" not in patch:
+        try:
+            _rerender_slides(post)
+        except Exception:
+            logger.exception("patch_post: failed to re-render slides for %s", post_id)
+    if queued:
+        # A sync route, so a save that never touches the scheduler stays off
+        # the event loop; only the queued case crosses to it for the one call.
+        anyio.from_thread.run(_keep_queue_in_step, db, user, post, before_caption, before_replies)
+    post.updated_at = datetime.now(timezone.utc)
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return _enrich_one(db, post)
+
+
+def _publisher_of_post(db: Session, user: User, post: ContentPost):
+    """The scheduler holding ``post``, on the key of the project's owner."""
+    proj = _project_for_user(db, user, post.project_id)
+    return _open_publisher(db, proj, post.publisher)
+
+
+async def _keep_queue_in_step(
+    db: Session, user: User, post: ContentPost, before_caption: str, before_replies: list,
+) -> None:
+    """An edit to a post a scheduler is holding reaches the scheduler before
+    it is saved here, or it is not saved at all; otherwise the queue publishes
+    words the person already changed. Moving the post out of Scheduled takes
+    it off the queue. Marking it posted by hand touches nothing there."""
+    if post.status == ContentStatus.POSTED:
+        return
+    unscheduled = post.status != ContentStatus.SCHEDULED
+    if not unscheduled and not words_changed(post, before_caption, before_replies):
+        return
+    pub = _publisher_of_post(db, user, post)
+    try:
+        async with pub:
+            if unscheduled:
+                asked_for = post.status
+                await cancel(pub, post)
+                post.status = asked_for
+            else:
+                await push_edit(pub, post)
+    except PostAlreadyOut:
+        db.rollback()
+        db.refresh(post)
+        went_out(post)
+        db.add(post)
+        db.commit()
+        label = resolve_channel(primary_channel(post.platforms)).label
+        raise HTTPException(
+            409, f"This post already went out on {label}, so the change can't reach it. It's marked posted now.",
+        ) from None
+    except PublisherError as exc:
+        db.rollback()
+        raise _publisher_http_error(exc, pub.spec) from exc
+
+
+@router.post("/content/posts/{post_id}/mark-posted")
+def mark_post_posted(
+    post_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+    published_url: str | None = None,
+) -> PostOut:
+    post = _row_for_user(db, user, ContentPost, post_id, "Post")
+    post.status = "posted"
+    post.posted_at = datetime.now(timezone.utc)
+    if published_url:
+        post.published_url = published_url
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return _enrich_one(db, post)
+
+
+class ManualMetrics(BaseModel):
+    """Numbers read off the platform's own analytics screen and typed in.
+
+    One field per metric in ``service/content_metrics.METRIC_ALIASES``, named
+    the same, which a test holds. A scheduler supplies the ones it reports, and
+    only for a post it published; everything else is known to the person alone.
+    An omitted field is left alone; ``null`` withdraws a value entered earlier.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    views:           int | None = Field(default=None, ge=0)
+    likes:           int | None = Field(default=None, ge=0)
+    comments:        int | None = Field(default=None, ge=0)
+    shares:          int | None = Field(default=None, ge=0)
+    saves:           int | None = Field(default=None, ge=0)
+    reach:           int | None = Field(default=None, ge=0)
+    avg_watch_time:  float | None = Field(default=None, ge=0)          # seconds
+    completion_rate: float | None = Field(default=None, ge=0, le=100)  # percent
+
+
+@router.post("/content/posts/{post_id}/metrics")
+def enter_post_metrics(
+    post_id: UUID,
+    body: ManualMetrics,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PostOut:
+    """Merge hand-entered metrics into perf and mark them manual.
+
+    This replaced ``/log-metrics``, which took any JSON and merged it
+    last-write-wins, so it could overwrite a typed number (or the record of
+    which ones were typed) as easily as add one. daily_perf is left to
+    ``/sync-daily``: it is the scheduler's history, and a hand-entered point in it
+    would be replaced by the next refresh anyway.
+    """
+    post = _row_for_user(db, user, ContentPost, post_id, "Post")
+    entered = body.model_dump(exclude_unset=True)
+    if not entered:
+        raise HTTPException(422, "No metrics to save.")
+    if post.status != ContentStatus.POSTED:
+        raise HTTPException(409, "Mark this post as posted before adding its numbers.")
+    post.perf = merge_manual_metrics(post.perf, entered, at=now_iso())
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return _enrich_one(db, post)
+
+
+@router.delete("/content/posts/{post_id}")
+def delete_post(
+    post_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> dict:
+    """A post a scheduler is holding comes off its queue first; deleting only
+    the row would leave the post to go out with no record of it here."""
+    post = _row_for_user(db, user, ContentPost, post_id, "Post")
+    if is_queued_at_publisher(post):
+        pub = _publisher_of_post(db, user, post)
+
+        async def _take_off_queue() -> None:
+            async with pub:
+                await cancel(pub, post)
+
+        try:
+            anyio.from_thread.run(_take_off_queue)
+        except PostAlreadyOut:
+            went_out(post)
+            db.add(post)
+            db.commit()
+            label = resolve_channel(primary_channel(post.platforms)).label
+            raise HTTPException(
+                409,
+                f"This post already went out on {label}, so deleting it here won't take it down. "
+                f"Delete it on {label}. It's marked posted here now.",
+            ) from None
+        except PublisherError as exc:
+            raise _publisher_http_error(exc, pub.spec) from exc
+    db.delete(post)
+    db.commit()
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# The drafts queue (issue #266): the Posts tab's drafts nobody has answered
+# are read from GET /content/posts?status=draft. These two are what a queue
+# card adds: when the draft should go out, and a no that teaches.
+# ---------------------------------------------------------------------------
+
+# A draft nobody has published, scheduled or turned down yet. Pending is the
+# agent's unsaved draft, still open in its workspace; draft is a kept one.
+_SKIPPABLE = (ContentStatus.PENDING, ContentStatus.DRAFT)
+
+
+class SkipReason(StrEnum):
+    """Why a draft got a no. Crosses the wire (the queue card's five chips,
+    app/src/lib/contentEnums.js); each says something different about what
+    the next draft should do, so there are few and they do not overlap."""
+
+    NOT_TRUE        = "not_true"
+    TOO_REVEALING   = "too_revealing"
+    NOT_INTERESTING = "not_interesting"
+    ALREADY_SAID    = "already_said"
+    WRONG_VOICE     = "wrong_voice"
+
+
+# How each reason reads in the memory the agent's next draft sees. The digest
+# renders a memory's title and nothing else, so the lesson is in the title.
+_SKIP_WORDS = {
+    SkipReason.NOT_TRUE:        "it was not true",
+    SkipReason.TOO_REVEALING:   "it gave too much away",
+    SkipReason.NOT_INTERESTING: "it was not interesting enough to post",
+    SkipReason.ALREADY_SAID:    "it had already been said",
+    SkipReason.WRONG_VOICE:     "it did not sound like them",
+}
+# A topic long enough to name the draft, short enough that the title keeps
+# its reason inside the memory's 200-character title.
+_SKIP_TOPIC_CHARS = 90
+
+
+class SkipRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: SkipReason
+
+
+class BestSlotOut(BaseModel):
+    at:     str
+    reason: str
+    posts:  int
+    hour:   int
+
+
+def _skip_title(post: ContentPost, reason: SkipReason) -> str:
+    channel = resolve_channel(primary_channel(post.platforms)).label
+    topic = (post.topic or "").strip()
+    if len(topic) > _SKIP_TOPIC_CHARS:
+        topic = topic[: _SKIP_TOPIC_CHARS - 1].rstrip() + "…"
+    about = f' on "{topic}"' if topic else ""
+    return f"Skipped a {channel} draft{about}: {_SKIP_WORDS[reason]}"
+
+
+@router.get("/content/best-slot")
+def best_slot(
+    project_id: UUID,
+    channel: Platform,
+    tz: str = "",
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> BestSlotOut:
+    """The next good time for a post on ``channel``, in the reader's ``tz``:
+    the account's own best hour once enough posts there have numbers, else
+    the channel's default; never on top of a post already scheduled there."""
+    from agents.content.best_time import next_slot
+
+    _project_for_user(db, user, project_id)
+    rows = [
+        p for p in db.execute(
+            select(ContentPost).where(
+                ContentPost.project_id == project_id,
+                ContentPost.status.in_([ContentStatus.POSTED, ContentStatus.SCHEDULED]),
+            )
+        ).scalars().all()
+        if primary_channel(p.platforms) == channel
+    ]
+    posted = [p for p in rows if p.status == ContentStatus.POSTED]
+    taken = [
+        (p.scheduled_at if p.scheduled_at.tzinfo else p.scheduled_at.replace(tzinfo=timezone.utc))
+        for p in rows if p.status == ContentStatus.SCHEDULED and p.scheduled_at
+    ]
+    slot = next_slot(channel, posts=posted, taken=taken, now=utcnow(), tz_name=tz)
+    return BestSlotOut(at=slot.at.isoformat(), reason=slot.reason, posts=slot.posts, hour=slot.hour)
+
+
+@router.post("/content/posts/{post_id}/skip")
+def skip_post(
+    post_id: UUID,
+    body: SkipRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PostOut:
+    """No to a draft, with the one reason that decides what the next one
+    looks like. The draft is discarded, and the reason becomes a feedback
+    memory the next draft reads, so the same miss is not proposed twice.
+    Feedback, not decision: the digest pins the five newest goals and
+    decisions, and a week of skips would have pushed the project's real ones
+    out of it. Feedback ranks high among recent entries instead."""
+    from agents.registry import AgentType
+    from models.memory import SOURCE_USER
+    from service.memory import remember
+
+    post = _row_for_user(db, user, ContentPost, post_id, "Post")
+    if post.status not in _SKIPPABLE:
+        raise HTTPException(HTTP_409_CONFLICT, "Only a draft that hasn't gone out can be skipped.")
+    post.status = ContentStatus.DISCARDED.value
+    post.updated_at = utcnow()
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    remember(
+        db,
+        kind="feedback",
+        title=_skip_title(post, body.reason),
+        body=f"The draft read: {(post.caption or '')[:400]}",
+        project_id=post.project_id,
+        user_id=user.id,
+        source_type=SOURCE_USER,
+        confidence="high",
+        agent_type=str(AgentType.TIKTOK_STUDIO),
+        meta={"skip_reason": str(body.reason), "post_id": str(post.id)},
+    )
+    return _enrich_one(db, post)
+
+
+# ---------------------------------------------------------------------------
+# Styles registry — shared, generic slide CSS (read-only, shipped in code)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/content/styles")
+def get_styles() -> dict:
+    """The shared TikTok slide style registry — base engine CSS + linkable
+    styles (captions, hook, text card). Formats link to these by key; the
+    slide-builder inlines them; the Library previews them."""
+    return {"base_css": base_css(), "styles": list_styles()}
+
+
+# ---------------------------------------------------------------------------
+# Format library CRUD
+# ---------------------------------------------------------------------------
+
+
+class FormatIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: UUID
+    slug:       str
+    name:       str = ""
+    data:       dict = Field(default_factory=dict)
+
+    @field_validator("slug")
+    @classmethod
+    def _slug_shape(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if not format_library.SLUG_RE.match(v):
+            raise ValueError("slug must be lowercase letters, digits and single hyphens")
+        return v
+
+    @field_validator("data")
+    @classmethod
+    def _data_shape(cls, v: dict) -> dict:
+        # An unknown media kind or channel would be a filter nothing matches:
+        # the format would silently never be offered. 422 now instead.
+        return format_library.validate_data(v)
+
+
+class FormatOut(BaseModel):
+    # A built-in has no row and so no id; the app edits it by POSTing its slug,
+    # which creates the project's own copy. `overrides_builtin` says a custom
+    # row is standing in for one, so deleting it is "reset", not "delete".
+    id:                UUID | None = None
+    project_id:        UUID
+    slug:              str
+    name:              str
+    source:            Literal["builtin", "custom"]
+    description:       str = ""
+    media:             list[str] = Field(default_factory=list)
+    channels:          list[str] = Field(default_factory=list)
+    overrides_builtin: bool = False
+    data:              dict
+    created_at:        str = ""
+    updated_at:        str = ""
+
+
+def _format_out(project_id: UUID, rec: dict) -> FormatOut:
+    return FormatOut(
+        id=rec.get("id"),
+        project_id=project_id,
+        slug=rec["slug"],
+        name=rec["name"],
+        source=rec["source"],
+        description=rec.get("description", ""),
+        media=rec.get("media", []),
+        channels=rec.get("channels", []),
+        overrides_builtin=bool(rec.get("overrides_builtin")),
+        data=rec.get("data") or {},
+        created_at=rec.get("created_at", ""),
+        updated_at=rec.get("updated_at", ""),
+    )
+
+
+def _row_out(f: ContentFormat) -> FormatOut:
+    return _format_out(f.project_id, format_library.custom_record(f))
+
+
+@router.get("/content/formats")
+def list_formats(
+    project_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> list[FormatOut]:
+    """The project's library: its own formats plus every built-in it has not
+    replaced (agents/content/formats.py)."""
+    _project_for_user(db, user, project_id)
+    rows = db.execute(
+        select(ContentFormat).where(ContentFormat.project_id == project_id)
+    ).scalars().all()
+    return [_format_out(project_id, rec) for rec in format_library.library(rows)]
+
+
+@router.post("/content/formats", status_code=201)
+def upsert_format(
+    body: FormatIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> FormatOut:
+    _project_for_user(db, user, body.project_id)
+    existing = db.execute(
+        select(ContentFormat).where(
+            ContentFormat.project_id == body.project_id,
+            ContentFormat.slug == body.slug,
+        )
+    ).scalars().first()
+    if existing is not None:
+        existing.name = body.name or existing.name
+        existing.data = body.data or existing.data
+        existing.updated_at = datetime.now(timezone.utc)
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+        return _row_out(existing)
+    row = ContentFormat(**body.model_dump())
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _row_out(row)
+
+
+@router.patch("/content/formats/{format_id}")
+def patch_format(
+    format_id: UUID,
+    body: FormatIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> FormatOut:
+    row = _row_for_user(db, user, ContentFormat, format_id, "Format")
+    row.slug = body.slug or row.slug
+    row.name = body.name or row.name
+    if body.data:
+        row.data = body.data
+    row.updated_at = datetime.now(timezone.utc)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _row_out(row)
+
+
+@router.delete("/content/formats/{format_id}")
+def delete_format(
+    format_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> dict:
+    row = _row_for_user(db, user, ContentFormat, format_id, "Format")
+    db.delete(row)
+    db.commit()
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Avatar library CRUD
+# ---------------------------------------------------------------------------
+
+
+class AvatarIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: UUID
+    name:       str
+    data:       dict = Field(default_factory=dict)
+
+
+class AvatarOut(BaseModel):
+    id:         UUID
+    project_id: UUID
+    name:       str
+    data:       dict
+    created_at: str
+    updated_at: str
+
+
+def _avatar_out(a: ContentAvatar) -> AvatarOut:
+    return AvatarOut(
+        id=a.id,
+        project_id=a.project_id,
+        name=a.name,
+        data=a.data or {},
+        created_at=a.created_at.isoformat(),
+        updated_at=a.updated_at.isoformat(),
+    )
+
+
+@router.get("/content/avatars")
+def list_avatars(
+    project_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> list[AvatarOut]:
+    _project_for_user(db, user, project_id)
+    rows = db.execute(
+        select(ContentAvatar).where(ContentAvatar.project_id == project_id).order_by(ContentAvatar.name)
+    ).scalars().all()
+    return [_avatar_out(r) for r in rows]
+
+
+@router.post("/content/avatars", status_code=201)
+def create_avatar(
+    body: AvatarIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> AvatarOut:
+    _project_for_user(db, user, body.project_id)
+    row = ContentAvatar(**body.model_dump())
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _avatar_out(row)
+
+
+@router.patch("/content/avatars/{avatar_id}")
+def patch_avatar(
+    avatar_id: UUID,
+    body: AvatarIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> AvatarOut:
+    row = _row_for_user(db, user, ContentAvatar, avatar_id, "Avatar")
+    if body.name:
+        row.name = body.name
+    if body.data:
+        row.data = body.data
+    row.updated_at = datetime.now(timezone.utc)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _avatar_out(row)
+
+
+@router.delete("/content/avatars/{avatar_id}")
+def delete_avatar(
+    avatar_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> dict:
+    row = _row_for_user(db, user, ContentAvatar, avatar_id, "Avatar")
+    db.delete(row)
+    db.commit()
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Asset uploads + listing (Phase 4b)
+# ---------------------------------------------------------------------------
+
+
+_ALLOWED_ASSET_TYPES = {"logo", "background", "reference", "upload", "discovered_reference"}
+_ALLOWED_MIME = {"image/png", "image/jpeg", "image/webp"}
+_MIME_TO_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+_MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+class ContentAssetOut(BaseModel):
+    id:         UUID
+    project_id: UUID
+    post_id:    UUID | None
+    asset_type: str
+    source:     str
+    url:        str
+    filename:   str
+    mime_type:  str
+    prompt:     str
+    model:      str
+    params:     dict
+    created_at: str
+
+
+def _asset_out(a: ContentAsset) -> ContentAssetOut:
+    return ContentAssetOut(
+        id=a.id,
+        project_id=a.project_id,
+        post_id=a.post_id,
+        asset_type=a.asset_type,
+        source=a.source,
+        url=a.url,
+        filename=a.filename,
+        mime_type=a.mime_type,
+        prompt=a.prompt,
+        model=a.model,
+        params=a.params or {},
+        created_at=a.created_at.isoformat(),
+    )
+
+
+@router.post("/content/uploads", status_code=201)
+async def upload_asset(
+    project_id: UUID = Form(...),
+    asset_type: str  = Form(...),
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> ContentAssetOut:
+    """Upload a logo, background, or reference image. Writes to
+    /uploads/projects/{project_id}/{asset_type}/{uuid}-{filename} and
+    inserts a content_assets row pointing at the public URL."""
+    if asset_type not in _ALLOWED_ASSET_TYPES:
+        raise HTTPException(400, f"asset_type must be one of {sorted(_ALLOWED_ASSET_TYPES)}")
+    _project_for_user(db, user, project_id)
+
+    mime = (file.content_type or "").lower()
+    if mime not in _ALLOWED_MIME:
+        raise HTTPException(400, f"content_type must be one of {sorted(_ALLOWED_MIME)}")
+
+    body = await file.read()
+    if len(body) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File too large (max {_MAX_UPLOAD_BYTES} bytes).")
+
+    ext = _MIME_TO_EXT.get(mime, "bin")
+    safe_name = (file.filename or "upload").rsplit("/", 1)[-1].replace(" ", "-")
+    asset_id  = uuid4()
+    filename  = f"{asset_id}-{safe_name}"
+    if "." not in filename.rsplit("/", 1)[-1]:
+        filename = f"{filename}.{ext}"
+
+    key = f"projects/{project_id}/{asset_type}/{filename}"
+    public_url = storage.put_image(key, body, mime)
+    row = ContentAsset(
+        id=asset_id,
+        project_id=project_id,
+        asset_type=asset_type,
+        source="upload",
+        url=public_url,
+        filename=filename,
+        mime_type=mime,
+        params={"size_bytes": len(body)},
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _asset_out(row)
+
+
+@router.get("/content/assets")
+def list_assets(
+    project_id: UUID,
+    asset_type: str | None = None,
+    post_id:    UUID | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> list[ContentAssetOut]:
+    _project_for_user(db, user, project_id)
+    stmt = select(ContentAsset).where(ContentAsset.project_id == project_id)
+    if asset_type:
+        stmt = stmt.where(ContentAsset.asset_type == asset_type)
+    if post_id:
+        stmt = stmt.where(ContentAsset.post_id == post_id)
+    stmt = stmt.order_by(ContentAsset.created_at.desc())
+    rows = db.execute(stmt).scalars().all()
+    return [_asset_out(r) for r in rows]
+
+
+@router.delete("/content/assets/{asset_id}")
+def delete_asset(
+    asset_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> dict:
+    asset = _row_for_user(db, user, ContentAsset, asset_id, "Asset")
+    if asset.url.startswith("/uploads/"):
+        cfg = get_configs()
+        base = Path(cfg.uploads_dir or "/app/uploads")
+        try:
+            (base / asset.url[len("/uploads/"):]).unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("delete_asset: failed to remove file %s: %s", asset.url, exc)
+    db.delete(asset)
+    db.commit()
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Schedulers (service/publishers/) — PostBridge, Zernio: connectors a person
+# brings. Nothing is a default: with none connected, nothing publishes.
+# ---------------------------------------------------------------------------
+
+
+class SocialAccountOut(BaseModel):
+    id:              str
+    publisher:       str   # the scheduler holding the account (PublisherSpec.id)
+    publisher_label: str
+    platform:        str
+    username:        str
+    display_name:    str = ""
+    avatar_url:      str = ""
+    needs_reconnect: bool = False
+
+
+class PublishRequest(BaseModel):
+    """Body for POST /content/posts/{id}/publish.
+
+    social_account_ids are the scheduler's own ids (GET
+    /content/social-accounts), all at ``publisher``; without one, the
+    scheduler the project linked those accounts at. Hashtags belong in the
+    caption.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    social_account_ids: list[str] = Field(default_factory=list, max_length=20)
+    publisher:          str = ""
+    scheduled_at:       datetime | None = None
+    tiktok_draft:       bool = False
+
+    @field_validator("social_account_ids", mode="before")
+    @classmethod
+    def _ids_as_text(cls, value):
+        # PostBridge's ids are numbers, and an older app sends them as such.
+        return [str(v) for v in value] if isinstance(value, list) else value
+
+
+class PublisherOut(BaseModel):
+    id:            str
+    label:         str
+    dashboard_url: str
+    # The platforms it reports numbers for, which is what the person is choosing between.
+    reports:       list[str]
+    connected:     bool   # the project's owner can publish through it
+    own_key:       bool   # through a key the owner saved (not the local env one)
+    is_owner:      bool   # the caller can connect or replace it
+
+
+@router.get("/content/publishers")
+def list_publishers(
+    project_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> list[PublisherOut]:
+    """Every scheduler Duct can publish through, and whether this project's
+    owner connected it. The Accounts tab draws its connectors from this, so
+    adding a scheduler adds no list to the app."""
+    from service.vendor_keys import KEY_OWN
+    proj = _project_for_user(db, user, project_id)
+    out: list[PublisherOut] = []
+    for spec in all_specs():
+        source = spec.key.source(proj.user_id, db)
+        out.append(PublisherOut(
+            id=spec.id, label=spec.label, dashboard_url=spec.dashboard_url,
+            reports=sorted(spec.metrics), connected=source is not None, own_key=source == KEY_OWN, is_owner=proj.user_id == user.id,
+        ))
+    return out
+
+
+@router.get("/content/social-accounts")
+async def list_social_accounts(
+    project_id: UUID,
+    platform: str | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> list[SocialAccountOut]:
+    """The accounts at every scheduler the project's owner connected. One
+    scheduler failing leaves the others listed; all of them failing is the
+    first one's error."""
+    proj = _project_for_user(db, user, project_id)
+    publishing = _publishing(db, proj)
+    if not publishing.connected:
+        raise HTTPException(400, NO_SCHEDULER)
+    out: list[SocialAccountOut] = []
+    first_error: tuple[PublisherError, PublisherSpec] | None = None
+    for spec in publishing.connected:
+        pub = _open_publisher(db, proj, spec.id)
+        try:
+            async with pub:
+                accounts = await pub.list_accounts(platform=platform)
+        except PublisherError as exc:
+            first_error = first_error or (exc, spec)
+            continue
+        out += [
+            SocialAccountOut(
+                id=a.id, publisher=spec.id, publisher_label=spec.label, platform=a.platform, username=a.username,
+                display_name=a.display_name, avatar_url=a.avatar_url, needs_reconnect=a.needs_reconnect,
+            )
+            for a in accounts
+        ]
+    if not out and first_error is not None:
+        raise _publisher_http_error(*first_error)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Vendor keys — each user brings their own scheduler and Apify key. A project
+# spends its owner's, the way it spends its owner's connectors, so only the
+# owner connects one (service/vendor_keys.py).
+# ---------------------------------------------------------------------------
+
+def _vendor_key(vendor: str):
+    from service.apify import APIFY_KEY
+    # "post-bridge" is the slug the app used before schedulers had ids of their own.
+    keys = {"post-bridge": spec_for("post_bridge").key, "apify": APIFY_KEY}
+    keys.update({spec.id: spec.key for spec in all_specs()})
+    key = keys.get(vendor)
+    if key is None:
+        raise HTTPException(404, "Unknown vendor.")
+    return key
+
+
+class VendorKeyStatusOut(BaseModel):
+    connected: bool   # the project can use this vendor
+    own_key:   bool   # through a key the owner saved (not the local env one)
+    is_owner:  bool   # the caller can connect or replace it
+
+
+class VendorKeyIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # No min_length: Pydantic's 422 is a list the app can only show as "Server
+    # error 422". The vendor judges the key; the route says what it answered.
+    api_key: str = Field(max_length=512)
+
+
+@router.get("/content/vendor-keys/{vendor}")
+def vendor_key_status(
+    vendor: str,
+    project_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> VendorKeyStatusOut:
+    from service.vendor_keys import KEY_OWN
+    key = _vendor_key(vendor)
+    proj = _project_for_user(db, user, project_id)
+    source = key.source(proj.user_id, db)
+    return VendorKeyStatusOut(
+        connected=source is not None,
+        own_key=source == KEY_OWN,
+        is_owner=proj.user_id == user.id,
+    )
+
+
+@router.put("/content/vendor-keys/{vendor}")
+async def connect_vendor_key(
+    vendor: str,
+    body: VendorKeyIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> VendorKeyStatusOut:
+    """Save the caller's key for ``vendor``, once the vendor accepts it."""
+    from service.vendor_keys import VendorKeyRejected, VendorKeyUnchecked
+    key = _vendor_key(vendor)
+    api_key = body.api_key.strip()
+    if not api_key:
+        raise HTTPException(422, f"Paste your {key.label} API key first.")
+    try:
+        await key.check(api_key)
+    except VendorKeyRejected as exc:
+        raise HTTPException(
+            422, f"{key.label} didn't accept that key. Copy it again from your {key.label} account.",
+        ) from exc
+    except VendorKeyUnchecked as exc:
+        raise HTTPException(
+            502, f"Couldn't reach {key.label} to check that key. Try again in a moment.",
+        ) from exc
+    key.save(user.id, api_key, db)
+    db.commit()
+    return VendorKeyStatusOut(connected=True, own_key=True, is_owner=True)
+
+
+@router.delete("/content/vendor-keys/{vendor}", status_code=204)
+def disconnect_vendor_key(
+    vendor: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> None:
+    _vendor_key(vendor).forget(user.id, db)
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Linked accounts — the project's persisted selection of social accounts, each
+# at the scheduler that holds it.
+# ---------------------------------------------------------------------------
+
+class LinkedAccountOut(BaseModel):
+    account_id: str
+    publisher:  str
+    platform:   str
+    username:   str
+
+
+class LinkedAccountIn(BaseModel):
+    account_id: str
+    publisher:  str = ""
+    platform:   str = ""
+    username:   str = ""
+
+    @field_validator("account_id", mode="before")
+    @classmethod
+    def _id_as_text(cls, value):
+        return str(value)
+
+
+class LinkedAccountsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: UUID
+    accounts:   list[LinkedAccountIn] = Field(default_factory=list)
+
+
+def _link_out(row: ContentSocialLink) -> LinkedAccountOut:
+    return LinkedAccountOut(
+        account_id=row.external_account_id,
+        publisher=row.publisher,
+        platform=row.platform,
+        username=row.username,
+    )
+
+
+def _links(db: Session, project_id: UUID) -> list[LinkedAccountOut]:
+    rows = db.execute(
+        select(ContentSocialLink)
+        .where(ContentSocialLink.project_id == project_id)
+        .order_by(ContentSocialLink.created_at)
+    ).scalars().all()
+    return [_link_out(r) for r in rows]
+
+
+@router.get("/content/linked-accounts")
+def list_linked_accounts(
+    project_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> list[LinkedAccountOut]:
+    """The social accounts this project has linked."""
+    _project_for_user(db, user, project_id)
+    return _links(db, project_id)
+
+
+@router.put("/content/linked-accounts")
+def save_linked_accounts(
+    body: LinkedAccountsIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> list[LinkedAccountOut]:
+    """Replace the project's linked-account set with the supplied list."""
+    proj = _project_for_user(db, user, body.project_id)
+    connected = _publishing(db, proj).connected
+    db.execute(
+        delete(ContentSocialLink).where(ContentSocialLink.project_id == body.project_id)
+    )
+    # De-dupe by scheduler and account id, last wins. An account named with no
+    # scheduler is at the owner's only one; with several, it has to say which.
+    by_id: dict[tuple[str, str], LinkedAccountIn] = {}
+    for acc in body.accounts:
+        publisher = acc.publisher or (connected[0].id if len(connected) == 1 else "")
+        if spec_for(publisher) is None:
+            raise HTTPException(422, f"Say which scheduler account {acc.account_id} is at.")
+        by_id[(publisher, acc.account_id)] = acc
+    for (publisher, account_id), acc in by_id.items():
+        db.add(ContentSocialLink(
+            project_id=body.project_id,
+            publisher=publisher,
+            external_account_id=account_id,
+            platform=acc.platform,
+            username=acc.username,
+        ))
+    db.commit()
+    # Analytics output is filtered by the linked platform set — drop its cache.
+    _invalidate_analytics(body.project_id)
+    return _links(db, body.project_id)
+
+
+# ---------------------------------------------------------------------------
+# Channels — which platforms the project posts on, through which scheduler,
+# and what the person says about each (agents/content/channel_config.py).
+# A channel with no scheduler account behind it is still a channel: the
+# person posts there by hand and the plan covers it.
+# ---------------------------------------------------------------------------
+
+class ChannelProfileIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    username: str = ""
+    display_name: str = ""
+    bio: str = ""
+    notes: str = ""
+    target_media: list[str] = Field(default_factory=list)
+
+    @field_validator("username", "display_name", "bio", "notes", mode="before")
+    @classmethod
+    def _short(cls, value):
+        return str(value or "")[:CHANNEL_TEXT_MAX]
+
+    @field_validator("target_media")
+    @classmethod
+    def _known_media(cls, value):
+        bad = [m for m in value if m not in MEDIA_KINDS]
+        if bad:
+            raise ValueError(f"unknown media kind: {', '.join(bad)}")
+        return value
+
+
+class ChannelsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: UUID
+    primary_publisher: str = ""
+    channels: dict[str, ChannelProfileIn] = Field(default_factory=dict)
+
+
+class ChannelOut(BaseModel):
+    id: str
+    label: str
+    enabled: bool
+    # Does Duct have a tuned playbook for it; is it an article rather than a post.
+    supported: bool
+    long_form: bool
+    profile: ChannelProfileIn
+    guide: dict | None
+    # The linked scheduler accounts on this platform (routes above), so the
+    # tab can say "2 accounts via Zernio" without a second read.
+    accounts: list[LinkedAccountOut]
+
+
+class ChannelsOut(BaseModel):
+    primary_publisher: str
+    chosen: bool
+    channels: list[ChannelOut]
+
+
+# A bio or a note is a paragraph, not a document.
+CHANNEL_TEXT_MAX = 2000
+
+
+def _channels_out(db: Session, proj: Project) -> ChannelsOut:
+    links = _links(db, proj.id)
+    config = load_channel_config(proj.brand_channels, linked_pairs(links))
+    out: list[ChannelOut] = []
+    for cid in OFFERED:
+        prof = config.channels.get(cid) or ChannelProfile()
+        ch = resolve_channel(cid)
+        out.append(ChannelOut(
+            id=cid, label=ch.label, enabled=prof.enabled, supported=ch.supported,
+            long_form=ch.rules.long_form,
+            profile=ChannelProfileIn(**asdict(prof)),
+            guide=guide_payload(cid),
+            accounts=[link for link in links if link.platform == cid],
+        ))
+    return ChannelsOut(primary_publisher=config.primary_publisher, chosen=config.chosen, channels=out)
+
+
+@router.get("/content/channels")
+def list_channels(
+    project_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> ChannelsOut:
+    """Every channel Duct offers, with this project's choice and words for
+    each, the guide the agent is given, and the linked accounts on it."""
+    proj = _project_for_user(db, user, project_id)
+    return _channels_out(db, proj)
+
+
+@router.put("/content/channels")
+def save_channels(
+    body: ChannelsIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> ChannelsOut:
+    """Replace the project's channel choices. The primary scheduler has to be
+    one the owner connected, or empty (nothing publishes; everything is by hand)."""
+    proj = _project_for_user(db, user, body.project_id)
+    primary = body.primary_publisher.strip()
+    if primary:
+        connected = {spec.id for spec in _publishing(db, proj).connected}
+        if primary not in connected:
+            raise HTTPException(422, "Connect that scheduler first.")
+    unknown = [cid for cid in body.channels if cid not in OFFERED]
+    if unknown:
+        raise HTTPException(422, f"Not a channel Duct offers: {', '.join(unknown)}.")
+    config = ChannelConfig(
+        primary_publisher=primary,
+        channels={cid: ChannelProfile(**prof.model_dump()) for cid, prof in body.channels.items()},
+        chosen=True,
+    )
+    proj.brand_channels = save_channel_config(proj.brand_channels, config)
+    # A new dict is assigned, which SQLAlchemy does track; the flag is for the
+    # JSON column's mutable-in-place case so a future edit-in-place still saves.
+    flag_modified(proj, "brand_channels")
+    db.add(proj)
+    db.commit()
+    db.refresh(proj)
+    return _channels_out(db, proj)
+
+
+# ---------------------------------------------------------------------------
+# Analytics — live, from every connected scheduler, for the linked accounts.
+# (Distinct from per-post `perf`, which only covers posts published via Duct.)
+# ---------------------------------------------------------------------------
+
+class AnalyticsNotice(BaseModel):
+    """A scheduler that was asked and did not answer, in words the person can act on."""
+    publisher: str
+    label:     str
+    message:   str
+
+
+def _analytics_schedulers(
+    connected: list[PublisherSpec], links: list[LinkedAccountOut], primary: str,
+) -> list[PublisherSpec]:
+    """The schedulers whose numbers the project wants: those holding a linked
+    account; with nothing linked, the primary one; with none chosen, all."""
+    holding = {link.publisher for link in links if link.publisher}
+    if holding:
+        chosen = [spec for spec in connected if spec.id in holding]
+        if chosen:
+            return chosen
+    if primary:
+        chosen = [spec for spec in connected if spec.id == primary]
+        if chosen:
+            return chosen
+    return list(connected)
+
+
+class AnalyticsRowOut(BaseModel):
+    id:                 str
+    publisher:          str
+    platform:           str
+    title:              str
+    share_url:          str
+    cover_image_url:    str
+    view_count:         int
+    like_count:         int
+    comment_count:      int
+    share_count:        int
+    platform_created_at: str | None
+    last_synced_at:     str | None
+    # Enriched from the matching local ContentPost (when published via our system).
+    pillar:             str = ""
+    format_name:        str = ""
+    published_via:      str = ""
+    post_id:            str | None = None
+
+
+class AnalyticsOut(BaseModel):
+    rows:    list[AnalyticsRowOut]
+    notices: list[AnalyticsNotice] = Field(default_factory=list)
+
+
+@router.get("/content/analytics")
+async def list_content_analytics(
+    project_id: UUID,
+    refresh: bool = False,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> AnalyticsOut:
+    """Per-post analytics for the project, read from the schedulers it uses.
+
+    A scheduler is the source of truth for the accounts it holds: it reports
+    everything published there (through Duct, its own dashboard or the
+    platform's app), with counts, the post's link and its cover. Which
+    schedulers are read: the ones holding a linked account, else the primary
+    one chosen in the Accounts tab, else every connected one. Scoped to the
+    platforms the project has linked; if nothing is linked, shows all.
+    refresh=true asks each scheduler to sync first.
+
+    A scheduler that fails answers as a notice beside the rows the others
+    gave, never as the page's error: on 2026-11-08 a stale PostBridge key hid
+    a working Zernio behind "PostBridge didn't accept the saved API key".
+    Only every asked scheduler failing is an error.
+    """
+    proj = _project_for_user(db, user, project_id)
+
+    if not refresh:
+        hit = _analytics_cache.get(project_id)
+        if hit is not None and (time.monotonic() - hit[0]) < _ANALYTICS_TTL:
+            return hit[1]
+
+    publishing = _publishing(db, proj)
+    if not publishing.connected:
+        raise HTTPException(400, NO_SCHEDULER)
+    links = _links(db, project_id)
+    linked_platforms = {link.platform for link in links if link.platform}
+    asked = _analytics_schedulers(publishing.connected, links, load_channel_config(proj.brand_channels).primary_publisher)
+
+    # One fan-out for the tab and the agent's social_post_metrics entity
+    # (service/publishers/metrics.py), narrowed to the schedulers this
+    # project uses. Every one failing is the page's error; one failing is a
+    # notice beside the rows the others gave.
+    collected = await collect_reported_posts(db, proj, refresh=refresh, specs=asked)
+    reported = collected.rows
+    if collected.all_failed:
+        spec, exc = collected.failures[0]
+        if isinstance(exc, PublisherError):
+            raise _publisher_http_error(exc, spec)
+        raise HTTPException(400, str(exc))
+    notices = [
+        AnalyticsNotice(
+            publisher=spec.id, label=spec.label,
+            message=_friendly_publisher_error(exc, spec) if isinstance(exc, PublisherError) else str(exc),
+        )
+        for spec, exc in collected.failures
+    ]
+
+    # Index this project's local posts so each analytics row can be tied back to
+    # a pillar/format and badged "via Duct" — by the handle its numbers are
+    # read by (direct), or by its post id at the scheduler.
+    local_posts = db.execute(
+        select(ContentPost).where(ContentPost.project_id == project_id)
+    ).scalars().all()
+    local_by_ref = {(p.publisher, p.publisher_metrics_id): p for p in local_posts if p.publisher_metrics_id}
+    local_by_post = {(p.publisher, p.publisher_post_id): p for p in local_posts if p.publisher_post_id}
+    fmt_by_id = _format_map(db, project_id)  # format_id → (slug, name)
+
+    # Self-heal: where the scheduler tied a row to a post id, keep the handle
+    # on the local post, so it stays matched even when that tie fails on a
+    # later load (PostBridge's post-results is intermittently flaky).
+    backfilled = False
+    for spec, r in reported:
+        lp = local_by_post.get((spec.id, r.remote_post_id)) if r.remote_post_id else None
+        if lp is not None and not lp.publisher_metrics_id:
+            lp.publisher_metrics_id = r.ref
+            local_by_ref[(spec.id, r.ref)] = lp
+            db.add(lp)
+            backfilled = True
+    if backfilled:
+        db.commit()
+
+    rows: list[AnalyticsRowOut] = []
+    for spec, r in reported:
+        if linked_platforms and r.platform not in linked_platforms:
+            continue
+        local = local_by_ref.get((spec.id, r.ref)) or local_by_post.get((spec.id, r.remote_post_id))
+        rows.append(AnalyticsRowOut(
+            id=f"{spec.id}:{r.ref}",
+            publisher=spec.id,
+            platform=r.platform,
+            title=r.title,
+            share_url=r.url,
+            cover_image_url=r.cover_url,
+            view_count=r.views,
+            like_count=r.likes,
+            comment_count=r.comments,
+            share_count=r.shares,
+            platform_created_at=r.posted_at,
+            last_synced_at=r.synced_at,
+            pillar=local.pillar if local else "",
+            format_name=(fmt_by_id.get(local.format_id, ("", ""))[1] if local else ""),
+            published_via=local.published_via if local else "",
+            post_id=str(local.id) if local else None,
+        ))
+    rows.sort(key=lambda x: x.view_count, reverse=True)
+    out = AnalyticsOut(rows=rows, notices=notices)
+    _analytics_cache[project_id] = (time.monotonic(), out)
+    return out
+
+
+@router.post("/content/posts/{post_id}/publish")
+async def publish_post_route(
+    post_id: UUID,
+    body: PublishRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PostOut:
+    """Upload the post's media to its scheduler, then create the post. What
+    goes is the agent's choice too (publishing.pick_media): a video post's cut,
+    a slideshow's composed slides, a text post's words alone."""
+    post = _row_for_user(db, user, ContentPost, post_id, "Post")
+    proj = _project_for_user(db, user, post.project_id)
+    if not body.social_account_ids:
+        raise HTTPException(400, "Pick at least one account to post from.")
+    publishing = _publishing(db, proj)
+    if body.publisher:
+        spec = spec_for(body.publisher)
+        if spec is None or spec.id not in {s.id for s in publishing.connected}:
+            raise HTTPException(400, f"{spec.label if spec else 'That scheduler'} isn't connected. {NO_SCHEDULER}")
+    else:
+        spec, why = chosen_publisher(db, post.project_id, body.social_account_ids, publishing)
+        if spec is None:
+            raise HTTPException(400, why)
+    blockers = publish_blockers(post, spec)
+    if blockers:
+        raise HTTPException(400, " ".join(blockers))
+
+    # A person can't render a slide from here, only the agent can, so a
+    # single-picture slide with no render goes as its photo rather than
+    # blocking the button; one that needs composing is named instead.
+    pick = pick_media(db, post, allow_uncomposed=True)
+    if post.post_type == VIDEO_POST_TYPE and not pick.files:
+        raise HTTPException(400, "Make a clip for this video post before publishing it.")
+    if pick.missing:
+        raise HTTPException(400, (
+            f"These slides need composing before they can go out: {', '.join(pick.missing)}. "
+            "Ask the agent to render them, then publish again."
+        ))
+    if not pick.files and not is_text_only(post):
+        raise HTTPException(400, "Generate or upload at least one image before publishing.")
+    try:
+        media = await load_media(pick.files)
+    except MediaUnreadable as exc:
+        logger.warning("publish: %s for post %s", exc, post.id)
+        raise HTTPException(500, "Some of this post's media couldn't be loaded. Try regenerating it.") from exc
+
+    pub = _open_publisher(db, proj, spec.id)
+    try:
+        async with pub:
+            remote = await send_post(
+                pub, post, media,
+                targets=[Target(a) for a in body.social_account_ids],
+                scheduled_at=body.scheduled_at,
+                tiktok_draft=body.tiktok_draft,
+            )
+    except PublisherError as exc:
+        raise _publisher_http_error(exc, spec) from exc
+
+    if why := publish_failure(remote, spec):
+        raise HTTPException(502, why)
+    record_published(post, remote, body.scheduled_at, spec)
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    _invalidate_analytics(post.project_id)
+    capture_event("content_post_published", {
+        "post_type": post.post_type, "is_scheduled": body.scheduled_at is not None, "publisher": spec.id,
+    })
+    return _enrich_one(db, post)
+
+
+async def _pull_post_metrics(db: Session, user: User, post: ContentPost) -> None:
+    """Read a published post's numbers from the scheduler holding it into the
+    row (publishing.pull_metrics), or say why not."""
+    if not post.publisher_post_id:
+        raise HTTPException(400, "Publish this post first — then we can pull metrics.")
+    spec = spec_for(post.publisher)
+    if not metrics_sync(post, spec):
+        raise HTTPException(409, no_sync_message(post, spec))
+    pub = _publisher_of_post(db, user, post)
+    try:
+        async with pub:
+            got = await pull_metrics(pub, post)
+    except PublisherError as exc:
+        raise _publisher_http_error(exc, spec) from exc
+    if got is None:
+        raise HTTPException(409, not_synced_yet(post, spec))
+
+
+@router.post("/content/posts/{post_id}/sync-metrics")
+async def sync_post_metrics(
+    post_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PostOut:
+    """The post's numbers, and their daily history, from its scheduler into
+    perf and daily_perf."""
+    post = _row_for_user(db, user, ContentPost, post_id, "Post")
+    await _pull_post_metrics(db, user, post)
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    _invalidate_analytics(post.project_id)
+    return _enrich_one(db, post)
+
+
+@router.post("/content/posts/{post_id}/sync-daily")
+async def sync_post_daily(
+    post_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> PostOut:
+    """Refresh daily_perf snapshots from the post's scheduler. The same pull
+    as /sync-metrics: one read brings both, and the app calls either."""
+    return await sync_post_metrics(post_id, user, db)
+
+
+def _publisher_http_error(exc: PublisherError, spec: PublisherSpec | None) -> HTTPException:
+    """A scheduler failure as this API's answer. Its 401 and 403 are about the
+    scheduler's key, never the Duct session, and must not reach the browser as
+    one: the app's throwForStatus signs the user out on a 401."""
+    code = exc.status_code or 0
+    status = 502 if code in (0, 401, 403) or code >= 500 else code
+    # A scheduler's 402 is its own plan (Zernio's analytics add-on), and the app
+    # reads a 402 as "connect a model".
+    if code == 402:
+        status = 409
+    return HTTPException(status, _friendly_publisher_error(exc, spec))
+
+
+def _friendly_publisher_error(exc: PublisherError, spec: PublisherSpec | None) -> str:
+    """Translate a scheduler's failure into something a user can act on.
+
+    Hides internal status codes and stack traces; only surfaces what the
+    user can do next."""
+    label = spec.label if spec else "The scheduler"
+    if exc.key_rejected:
+        return f"{label} didn't accept the saved API key. Paste a fresh one in Content → Accounts."
+    if exc.status_code == 429:
+        return "Hit the publishing rate limit — wait a minute and try again."
+    if exc.status_code == 0:
+        return "Couldn't reach the publishing service. Check your internet and try again."
+    return exc.message or "Publishing failed. Please try again in a moment."
+
+
+# ---------------------------------------------------------------------------
+# Discovery (Apify TikTok scraper)
+# ---------------------------------------------------------------------------
+
+
+class DiscoverStartIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id:    UUID
+    actor_id:      str
+    input_payload: dict = Field(default_factory=dict)
+
+
+class DiscoverStartOut(BaseModel):
+    run_id:     str
+    dataset_id: str
+    actor_id:   str
+    status:     str
+
+
+class DiscoverStatusOut(BaseModel):
+    run_id:     str
+    status:     str
+    dataset_id: str
+    started_at:  str | None = None
+    finished_at: str | None = None
+
+
+class DiscoverResultOut(BaseModel):
+    run_id:     str
+    dataset_id: str
+    count:      int
+    items:      list[dict]
+
+
+class DiscoverSaveIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: UUID
+    actor_id:   str
+    run_id:     str
+    dataset_id: str
+    request:    dict = Field(default_factory=dict)
+    post:       dict   # raw ScrapedPost — re-validated server-side
+
+
+class DiscoverRecaptureIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: UUID
+
+
+class DiscoverRecaptureOut(BaseModel):
+    queued: int
+
+
+def _session_factory(db: Session):
+    """Sessions on the request's own engine, for work that outlives the request.
+
+    A background task runs after the request's session is closed, so it opens
+    its own — on the engine the request used rather than the global one, which
+    is the same engine in production and the test's in-memory one in a test.
+    """
+    engine = db.get_bind()
+    return lambda: Session(engine)
+
+
+def _apify_client(api_key: str):
+    """The one place a Discover route builds its client; tests replace it."""
+    from service.apify import ApifyClient
+    return ApifyClient(api_key)
+
+
+def _apify_client_for(db: Session, user: User, project_id: UUID):
+    """A client on the project owner's Apify key (service/vendor_keys.py)."""
+    from service.apify import APIFY_KEY
+    from service.vendor_keys import VendorNotConnected
+    proj = _project_for_user(db, user, project_id)
+    try:
+        return _apify_client(APIFY_KEY.resolve(proj.user_id, db))
+    except VendorNotConnected as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _apify_http_error(exc) -> HTTPException:
+    """An Apify failure as this API's answer. Its 401 and 403 are about the
+    Apify key, and the app signs the user out on a 401 (see _publisher_http_error)."""
+    code = exc.status_code or 0
+    if code in (401, 403):
+        return HTTPException(502, "Apify didn't accept the saved API key. Paste a fresh one in Content → Discover.")
+    return HTTPException(502 if code == 0 or code >= 500 else code, exc.message)
+
+
+@router.post("/content/discover/start")
+async def discover_start(
+    body: DiscoverStartIn,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> DiscoverStartOut:
+    """Start an Apify actor run for TikTok discovery, or join an identical recent one.
+
+    The same actor and input inside the reuse window get the earlier run back
+    instead of a second billed run (service/apify/run_cache.py).
+    """
+    client = _apify_client_for(db, user, body.project_id)
+    from service.apify import ApifyAPIError
+    from service.apify.policy import discover_run_input
+    from service.apify.run_cache import apify_runs
+
+    try:
+        run_input = discover_run_input(body.actor_id, body.input_payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    try:
+        async with client as c:
+            run, reused = await apify_runs.start(c, body.actor_id, run_input)
+    except ApifyAPIError as exc:
+        raise _apify_http_error(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    logger.info(
+        "discover: %s run %s (actor=%s, status=%s)",
+        "reused" if reused else "started", run.id, body.actor_id, run.status.value,
+    )
+    return DiscoverStartOut(
+        run_id=run.id,
+        dataset_id=run.default_dataset_id,
+        actor_id=body.actor_id,
+        status=run.status.value,
+    )
+
+
+@router.get("/content/discover/status/{run_id}")
+async def discover_status(
+    run_id: str,
+    project_id: UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> DiscoverStatusOut:
+    """On the project owner's key, so a run is only ever read by the account
+    that started it."""
+    from service.apify import ApifyAPIError
+
+    client = _apify_client_for(db, user, project_id)
+    try:
+        async with client as c:
+            run = await c.get_run(run_id)
+    except ApifyAPIError as exc:
+        raise _apify_http_error(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return DiscoverStatusOut(
+        run_id=run.id,
+        status=run.status.value,
+        dataset_id=run.default_dataset_id,
+        started_at=run.started_at.isoformat() if run.started_at else None,
+        finished_at=run.finished_at.isoformat() if run.finished_at else None,
+    )
+
+
+@router.get("/content/discover/results/{dataset_id}")
+async def discover_results(
+    dataset_id: str,
+    project_id: UUID,
+    limit: int = 200,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> DiscoverResultOut:
+    """Fetch raw items from a finished run's dataset.
+
+    We pass items through the ScrapedPost model to drop weird rows, then
+    return the validated dicts — keeps the frontend a thin renderer.
+    """
+    from service.apify import ApifyAPIError
+
+    client = _apify_client_for(db, user, project_id)
+    try:
+        async with client as c:
+            posts = await c.get_dataset_posts(dataset_id, limit=limit)
+    except ApifyAPIError as exc:
+        raise _apify_http_error(exc) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return DiscoverResultOut(
+        run_id="",
+        dataset_id=dataset_id,
+        count=len(posts),
+        items=[p.model_dump(mode="json") for p in posts],
+    )
+
+
+@router.post("/content/discover/save", status_code=201)
+def discover_save(
+    body: DiscoverSaveIn,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> ContentAssetOut:
+    """Save one discovered post as a reference, then copy its pictures.
+
+    The row is written now. The cover and slides are copied into project
+    storage after the response, because TikTok signs its image URLs with an
+    expiry and a reference is saved to be looked at later
+    (service/discovery.py). A copy lost to a restart is picked up by
+    /content/discover/recapture.
+    """
+    from service.apify.schema import ScrapedPost
+    from service.discovery import capture_references_media, ingest_reference, needs_media
+
+    _project_for_user(db, user, body.project_id)
+    try:
+        post = ScrapedPost.model_validate(body.post)
+    except Exception as exc:  # ValidationError or anything else odd
+        raise HTTPException(400, f"Invalid scraped post payload: {exc}") from exc
+
+    asset = ingest_reference(
+        db,
+        body.project_id,
+        post,
+        provenance={
+            "actor_id":   body.actor_id,
+            "run_id":     body.run_id,
+            "dataset_id": body.dataset_id,
+            "request":    body.request,
+        },
+    )
+    if needs_media(asset.params):
+        background_tasks.add_task(
+            capture_references_media, [asset.id], open_db=_session_factory(db)
+        )
+    return _asset_out(asset)
+
+
+@router.post("/content/discover/recapture", status_code=202)
+def discover_recapture(
+    body: DiscoverRecaptureIn,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+) -> DiscoverRecaptureOut:
+    """Copy the pictures of references that do not have them yet.
+
+    The backfill: references saved before capture existed, and captures lost
+    to a restart or failed on a flaky CDN (retried up to a ceiling). Discover
+    calls it when it opens, so nobody has to remember to. Returns how many
+    were queued; the copying happens after the response.
+    """
+    from service.discovery import capture_references_media, references_missing_media
+
+    _project_for_user(db, user, body.project_id)
+    ids = references_missing_media(db, body.project_id)
+    if ids:
+        background_tasks.add_task(capture_references_media, ids, open_db=_session_factory(db))
+    return DiscoverRecaptureOut(queued=len(ids))

@@ -1,0 +1,72 @@
+/* typography — reading measure utilities.
+   Split out of globals.css; see that file for the load order.
+
+   Imported after the component partials so `.measure` can cap a block whose
+   own rule set a wider max-width. Long-form text gets `.measure`; anything
+   tabular, code, or laid out in columns must NOT — capping those just strands
+   whitespace. */
+
+.measure {
+  max-width: var(--measure);
+}
+
+/* For dense secondary copy — captions, hints — where a shorter line reads
+   better than the full measure. */
+.measure-tight {
+  max-width: var(--measure-tight);
+}
+
+/* Figures that must line up: a column of numbers, or any number that updates
+   in place.
+
+   `tabular-nums` on its own cannot do this here. DM Sans ships no `tnum`
+   feature — verified against the unsubsetted upstream, not just Google's
+   subset — and its digits run from 312 units for `1` to 684 for `0`, a 2.19x
+   spread. So `font-variant-numeric: tabular-nums` had nothing to act on:
+   analytics columns stepped raggedly and the live token counter slid sideways
+   as it counted, while the class sat there looking like it worked.
+
+   Fixing that needs a different face for the digits, not another property, so
+   this switches to the one already loaded. `font-variant-numeric` rides along
+   anyway, to keep the rule true if `--font-numeric` is ever repointed at a
+   proportional face that does carry `tnum`.
+
+   NOT for a number inside a sentence ("12 linked", "3 posts found") —
+   proportional figures are correct in running text, and mono digits there read
+   as code. Those keep plain `tabular-nums`, which is inert but says the intent
+   and becomes true the day the text face gains the feature. */
+.numeric {
+  font-family: var(--font-numeric);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Headings have a size before anyone gives them one.
+
+   `h1`–`h3` carried `text-2xl`, `text-xl`, `text-lg`, `text-sm`, `text-xs` and
+   five arbitrary pixel sizes between them, which is not a scale, it is 27
+   independent decisions — and an unstyled heading inherited body size, so the
+   ones nobody had decided about read as body text. Three sizes, one per level,
+   applied only when the element has no `text-*` of its own: Tailwind utilities
+   live in @layer utilities and win over this, so a deliberate override still
+   works and an absent one is no longer a blank.
+
+   Weight is deliberately not set here. The app carries hierarchy with weight
+   and colour (DESIGN.md), so a 12px uppercase eyebrow is still allowed to be
+   an `h3` — it is a section heading to a screen reader either way, which is
+   the half that matters and the half a font-size cannot fix. */
+@layer base {
+  h1 {
+    font-size: var(--text-2xl);
+    line-height: var(--text-2xl--line-height);
+  }
+
+  h2 {
+    font-size: var(--text-lg);
+    line-height: var(--text-lg--line-height);
+  }
+
+  h3 {
+    font-size: var(--text-base);
+    line-height: var(--text-base--line-height);
+  }
+}

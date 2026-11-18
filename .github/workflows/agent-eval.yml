@@ -1,0 +1,118 @@
+name: Agent Eval
+
+# Tier 1 of the eval gate (docs/engineering/2026-09-27-agent-eval-gating-design.md):
+# a change to an agent runs the real agent, k=3, on synthetic accounts, and
+# gets PASS / INCONCLUSIVE / FAIL against tests/eval/baselines.json. The free
+# tier (request invariants, the gate's own plumbing) runs in backend.yml with
+# every other offline test.
+#
+# DeepSeek V4 Flash on OpenRouter for the agent and GLM 5.3 Flash for the
+# judge, a different family so it is not grading its own kind. A trial is
+# about half a cent and five minutes; a run takes as long as its slowest one.
+# A draft PR runs only with the run-evals label, so iterate as a draft and
+# mark it ready once. No database: scripts/agent_eval.py points DATABASE_URL
+# at a throwaway SQLite.
+#
+# A PR gets the quick read: three trials, and an INCONCLUSIVE is reported,
+# not re-run (on 2026-09-30 unchanged agents came back 3/6 and 4/6, so the
+# re-run bought noise at double the price). A merge to main gets six trials:
+# the record an A/A window is read from, and what the next baseline is
+# checked against. Both skip a change the only case cannot see: the
+# content and audit agents are not on the insights agent's path. When a
+# case for either lands, its directory comes off the exclusions below.
+#
+# SHADOW until an A/A window shows no false FAILs on an unchanged main: the job
+# reports, and continue-on-error keeps it from blocking. Removing that line and
+# making the check required is the owner's decision, in its own PR.
+#
+# Needs the repository secret OPENROUTER_API_KEY, ideally a dedicated key with
+# a spend limit set on OpenRouter. Without it (a fork, or before it is added)
+# the job says so and passes.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    paths: &eval-paths
+      - 'backend/agents/**'
+      - '!backend/agents/content/**'
+      - '!backend/agents/audit/**'
+      - 'backend/service/memory.py'
+      - 'backend/service/profile.py'
+      - 'backend/poetry.lock'
+      - 'backend/tests/eval/**'
+      - 'backend/scripts/agent_eval.py'
+      - '.github/workflows/agent-eval.yml'
+  push:
+    branches: [main]
+    paths: *eval-paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    name: Agent eval (shadow)
+    # A draft runs only when asked, with the run-evals label.
+    if: >-
+      github.event_name != 'pull_request' ||
+      !github.event.pull_request.draft ||
+      contains(github.event.pull_request.labels.*.name, 'run-evals')
+    # On the job, not the workflow: a workflow-level group is joined before
+    # the `if` above is read, so a run that is about to skip still cancels
+    # the one in progress. On 2026-09-30 a push and "ready for review" landed
+    # a second apart, the push's synchronize event arrived last with the PR
+    # still a draft, and it cancelled the ready run and then skipped itself:
+    # no eval at all. A skipped job never joins a job-level group.
+    # A PR's newer push supersedes its older run; main's runs queue instead,
+    # since each merge's six trials are the record, not a draft of it.
+    concurrency:
+      group: agent-eval-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+
+    defaults:
+      run:
+        working-directory: backend
+
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      DUCT_EVAL_BUDGET_USD: "3"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Install backend dependencies
+        run: poetry install --with dev
+
+      - name: Run the eval gate
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "No OPENROUTER_API_KEY secret; skipping the paid eval." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            depth=(--no-rerun)
+          else
+            depth=(-k 6)
+          fi
+          poetry run python scripts/agent_eval.py "${depth[@]}" --out eval-results.jsonl
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: agent-eval-results
+          path: backend/eval-results.jsonl
+          if-no-files-found: ignore

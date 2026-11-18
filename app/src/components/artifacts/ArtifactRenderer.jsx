@@ -1,0 +1,325 @@
+"use client";
+
+// Per-content-type artifact renderers — the "source in, renderer per type"
+// dispatch. Vendor MIME types (application/vnd.duct.*) are Duct-native
+// objects rendered by app components; primitives (markdown/html/csv/mermaid)
+// get their standard treatments. Anything unknown falls back to raw text.
+
+import { lazy, memo, Suspense, useEffect, useMemo, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { Skeleton, SkeletonDocument } from "@/components/ui/skeleton";
+import { cn } from "@/lib/utils";
+
+// Both pull in Recharts, and this module is imported for `MarkdownView` and
+// `svgDataUrl` by screens that never draw a chart or a report. Loaded when an
+// artifact of that type is actually on screen.
+const AuditReportV1 = lazy(() => import("@/components/audit/AuditReportV1"));
+const ChartSpecView = lazy(() => import("./ChartSpecView"));
+const GrowthReportView = lazy(() => import("@/components/content/report/GrowthReportView"));
+
+export const CONTENT_TYPES = {
+  REPORT_JSON: "application/vnd.duct.report+json",
+  GROWTH_REPORT_JSON: "application/vnd.duct.growth-report+json",
+  TABLE_JSON: "application/vnd.duct.table+json",
+  CHART_JSON: "application/vnd.duct.chart+json",
+  DIFF_JSON: "application/vnd.duct.diff+json",
+  MERMAID: "text/vnd.mermaid",
+  MARKDOWN: "text/markdown",
+  HTML: "text/html",
+  CSV: "text/csv",
+  SVG: "image/svg+xml",
+};
+
+/** Turn SVG source into a URL an <img> can show. */
+export function svgDataUrl(source) {
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(source || "")}`;
+}
+
+/**
+ * An SVG artifact as a picture. An <img> is the one way to show
+ * agent-authored SVG that runs no script, fires no event handler and loads
+ * no external resource, whatever the source contains; inlining it would need
+ * the sanitiser MermaidView uses and still allow external image hrefs.
+ */
+export function SvgView({ source, title = "" }) {
+  return (
+    <div className="flex justify-center p-3">
+      <img src={svgDataUrl(source)} alt={title || "Figure"} className="max-h-[74vh] max-w-full" />
+    </div>
+  );
+}
+
+function safeJson(text) {
+  try {
+    return JSON.parse(text || "");
+  } catch {
+    return null;
+  }
+}
+
+const MARKDOWN_PLUGINS = [remarkGfm];
+
+/** Markdown, typeset. `className` carries the measure and the padding, because
+ *  the same renderer draws a thumbnail, a pane-width document and an inline
+ *  reply, and only the caller knows which. Memoised: a brief open beside a
+ *  streaming chat was re-parsed in full on every token of the chat. */
+export const MarkdownView = memo(function MarkdownView({ source, className = "max-w-3xl px-1 py-2" }) {
+  return (
+    // The plugin wraps inline code in literal backticks by default, which
+    // reads as unrendered markdown next to a real code style.
+    <div
+      className={cn(
+        "prose prose-sm dark:prose-invert prose-code:before:content-none prose-code:after:content-none",
+        className
+      )}
+    >
+      <ReactMarkdown remarkPlugins={MARKDOWN_PLUGINS}>{source}</ReactMarkdown>
+    </div>
+  );
+});
+
+export function MermaidView({ source }) {
+  const { t } = useLingui();
+  const [svg, setSvg] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const mermaid = (await import("mermaid")).default;
+        mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
+        const { svg: rendered } = await mermaid.render(
+          `mmd-${Math.random().toString(36).slice(2)}`,
+          source
+        );
+        // Diagram source is agent-authored (untrusted): mermaid strict mode
+        // sanitizes labels, and DOMPurify re-sanitizes the SVG output.
+        const DOMPurify = (await import("dompurify")).default;
+        // No foreignObject: strict mode renders plain-text labels, so pure
+        // SVG profiles suffice and HTML-in-SVG stays blocked.
+        const clean = DOMPurify.sanitize(rendered, {
+          USE_PROFILES: { svg: true, svgFilters: true },
+        });
+        if (alive) setSvg(clean);
+      } catch (err) {
+        if (alive) setError(err.message || t`Mermaid render failed.`);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [source, t]);
+
+  if (error) {
+    return (
+      <div>
+        <p className="app-subtle text-sm"><Trans>Diagram failed to render ({error}) — source below.</Trans></p>
+        <pre className="text-xs p-3 overflow-x-auto">{source}</pre>
+      </div>
+    );
+  }
+  if (!svg) return <p className="app-subtle text-sm p-2"><Trans>Rendering diagram…</Trans></p>;
+  // Mermaid output with securityLevel "strict" sanitizes labels/links.
+  return <div className="overflow-x-auto p-2" dangerouslySetInnerHTML={{ __html: svg }} />;
+}
+
+function DataTable({ columns, rows }) {
+  return (
+    <div className="overflow-x-auto border border-input rounded-md">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-input bg-muted/40">
+            {columns.map((c, i) => (
+              <th key={i} className="text-left font-semibold px-3 py-2 whitespace-nowrap">{String(c)}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, ri) => (
+            <tr key={ri} className="border-b border-input/50 last:border-0">
+              {row.map((cell, ci) => (
+                <td key={ci} className="px-3 py-1.5 align-top">{String(cell ?? "")}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+export function TableJsonView({ source }) {
+  const table = safeJson(source);
+  if (!table?.columns) return <pre className="text-xs p-3 overflow-x-auto">{source}</pre>;
+  return <DataTable columns={table.columns} rows={table.rows || []} />;
+}
+
+function parseCsvLine(line) {
+  // Minimal CSV: handles quoted fields with commas; good enough for exports.
+  const out = [];
+  let cur = "";
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quoted) {
+      if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (ch === '"') quoted = false;
+      else cur += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === ",") { out.push(cur); cur = ""; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+export function CsvView({ source }) {
+  const { columns, rows } = useMemo(() => {
+    const lines = (source || "").split(/\r?\n/).filter((l) => l.trim() !== "");
+    if (!lines.length) return { columns: [], rows: [] };
+    return { columns: parseCsvLine(lines[0]), rows: lines.slice(1, 501).map(parseCsvLine) };
+  }, [source]);
+  if (!columns.length) return <p className="app-subtle text-sm p-2"><Trans>Empty dataset.</Trans></p>;
+  return <DataTable columns={columns} rows={rows} />;
+}
+
+export function ChartJsonView({ source }) {
+  // Spec: {type: "line"|"bar", x: "key", series: [{key, label?}], data: [{...}], title?}
+  const spec = safeJson(source);
+  if (!spec?.data?.length || !spec?.x || !spec?.series?.length) {
+    return <pre className="text-xs p-3 overflow-x-auto">{source}</pre>;
+  }
+  return (
+    <div style={{ width: "100%", height: 360 }}>
+      <Suspense fallback={<Skeleton className="h-full w-full rounded-lg" />}>
+        <ChartSpecView spec={spec} />
+      </Suspense>
+    </div>
+  );
+}
+
+export function DiffJsonView({ source }) {
+  const { t } = useLingui();
+  // Spec: {title?, changes: [{summary, before?, after?, status?}]}
+  const spec = safeJson(source);
+  if (!spec?.changes) return <pre className="text-xs p-3 overflow-x-auto">{source}</pre>;
+  return (
+    <div className="grid gap-3">
+      {spec.title && <p className="text-sm font-medium">{spec.title}</p>}
+      {spec.changes.map((c, i) => {
+        const n = i + 1;
+        return (
+          <div key={i} className="border border-input rounded-md p-3">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-sm font-medium">{c.summary || t`Change ${n}`}</span>
+              {c.status && <span className="status-pill grey">{c.status}</span>}
+            </div>
+            {(c.before != null || c.after != null) && (
+              <div className="grid @xl:grid-cols-2 gap-2 text-xs">
+                {c.before != null && (
+                  <pre className="p-2 rounded bg-destructive/5 border border-destructive/20 overflow-x-auto whitespace-pre-wrap">{typeof c.before === "string" ? c.before : JSON.stringify(c.before, null, 2)}</pre>
+                )}
+                {c.after != null && (
+                  <pre className="p-2 rounded bg-success/5 border border-success/20 overflow-x-auto whitespace-pre-wrap">{typeof c.after === "string" ? c.after : JSON.stringify(c.after, null, 2)}</pre>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Unified-diff text ("Show changes") with per-line coloring. */
+export function UnifiedDiffView({ diff }) {
+  if (!diff?.trim()) return <p className="app-subtle text-sm p-2"><Trans>No textual changes between these versions.</Trans></p>;
+  return (
+    <pre className="text-xs p-3 overflow-x-auto leading-5 border border-input rounded-md">
+      {diff.split("\n").map((line, i) => {
+        let cls = "";
+        if (line.startsWith("+") && !line.startsWith("+++")) cls = "text-success";
+        else if (line.startsWith("-") && !line.startsWith("---")) cls = "text-destructive";
+        else if (line.startsWith("@@")) cls = "text-info";
+        return (
+          <span key={i} className={`block ${cls}`}>{line || " "}</span>
+        );
+      })}
+    </pre>
+  );
+}
+
+/**
+ * Main dispatch. `artifact` is the API row; `content` is the fetched source
+ * text (null while loading / when none exists).
+ */
+export default function ArtifactRenderer({ artifact, content }) {
+  const { t } = useLingui();
+  const ct = artifact?.content_type || "";
+  const structured = artifact?.structured_json?.structured_data || null;
+
+  // The Analytics tab's growth report: blocks the app draws from structured_json.
+  if (ct === CONTENT_TYPES.GROWTH_REPORT_JSON) {
+    const report = artifact?.structured_json || null;
+    return report ? (
+      <Suspense fallback={<SkeletonDocument className="p-2" label={t`Loading the artifact`} />}>
+        <GrowthReportView report={report} className="p-4" />
+      </Suspense>
+    ) : (
+      <p className="app-subtle text-sm p-2"><Trans>This report has nothing stored to draw.</Trans></p>
+    );
+  }
+  // Structured report (vendor type; legacy rows used application/json)
+  if (structured && (ct === CONTENT_TYPES.REPORT_JSON || ct === "application/json" || artifact.kind === "report")) {
+    return (
+      <Suspense fallback={<SkeletonDocument className="p-2" label={t`Loading the artifact`} />}>
+        <AuditReportV1 data={structured} />
+      </Suspense>
+    );
+  }
+  if (ct === CONTENT_TYPES.HTML) {
+    if (content == null) return <SkeletonDocument className="p-2" label={t`Loading the artifact`} />;
+    return (
+      <iframe
+        title={artifact.title || t`Artifact`}
+        srcDoc={content}
+        // Scripts run so a brief's chart or sortable table works; same-origin
+        // is withheld so the page runs in an opaque origin with no reach into
+        // the app, its cookies or its storage. The old pair (same-origin, no
+        // scripts) was the inert version of the unsafe combination.
+        sandbox="allow-scripts allow-modals"
+        className="block h-[74vh] w-full rounded-lg border border-border bg-card"
+      />
+    );
+  }
+  if (content == null) {
+    return artifact?.has_content ? (
+      <SkeletonDocument className="p-2" label={t`Loading the artifact`} />
+    ) : (
+      <p className="app-subtle text-sm p-2">
+        <Trans>This artifact has no stored content to render.</Trans>
+      </p>
+    );
+  }
+  switch (ct) {
+    case CONTENT_TYPES.MARKDOWN:
+      return <MarkdownView source={content} />;
+    case CONTENT_TYPES.SVG:
+      return <SvgView source={content} title={artifact?.title} />;
+    case CONTENT_TYPES.MERMAID:
+      return <MermaidView source={content} />;
+    case CONTENT_TYPES.TABLE_JSON:
+      return <TableJsonView source={content} />;
+    case CONTENT_TYPES.CSV:
+      return <CsvView source={content} />;
+    case CONTENT_TYPES.CHART_JSON:
+      return <ChartJsonView source={content} />;
+    case CONTENT_TYPES.DIFF_JSON:
+      return <DiffJsonView source={content} />;
+    default:
+      return <pre className="text-xs p-3 overflow-x-auto whitespace-pre-wrap">{content}</pre>;
+  }
+}

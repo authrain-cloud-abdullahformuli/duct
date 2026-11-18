@@ -1,0 +1,177 @@
+"""Auth-first persistence models (Google sign-in)."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from uuid import UUID, uuid4
+
+import sqlalchemy as sa
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    ForeignKey,
+    Index,
+    String,
+    UniqueConstraint,
+    text,
+)
+from models.columns import json_column, utc_datetime
+from sqlmodel import Field, SQLModel
+from utils.dates import utcnow
+
+
+class User(SQLModel, table=True):
+    __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint("email = lower(email)", name="ck_users_email_lowercase"),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True, nullable=False)
+    email: str = Field(
+        sa_column=Column(String, nullable=False, unique=True, index=True)
+    )
+    full_name: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    avatar_url: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    last_sign_in_at: datetime | None = Field(
+        default=None, sa_column=Column(utc_datetime(), nullable=True)
+    )
+    # User-scope memory off switch: nothing new is inferred or stored about how
+    # this person works. Project memory is governed separately (projects.memory_paused).
+    memory_paused: bool = Field(
+        default=False, sa_column=Column(sa.Boolean(), nullable=False, server_default=sa.false())
+    )
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(utc_datetime(), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(utc_datetime(), nullable=False),
+    )
+
+
+class AuthIdentity(SQLModel, table=True):
+    __tablename__ = "auth_identities"
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_user_id", name="uq_auth_identity_provider_user"),
+        # ``guest`` is an install, not a person: the row that lets an audit run
+        # before anyone signs in own its project (see service/user_store.py).
+        # ``openai`` is the ChatGPT account a subscription sign-in reveals —
+        # kept as a link key so a later Google sign-in with the same email
+        # merges automatically, never accepted as a login by itself.
+        CheckConstraint(
+            "provider IN ('google', 'guest', 'openai')",
+            name="ck_auth_identities_provider_allowed",
+        ),
+    )
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True, nullable=False)
+    user_id: UUID = Field(
+        sa_column=Column(
+            ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+        )
+    )
+    provider: str = Field(sa_column=Column(String, nullable=False))
+    provider_user_id: str = Field(sa_column=Column(String, nullable=False))
+    provider_email: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    raw_profile: dict | None = Field(
+        default=None, sa_column=Column(json_column(), nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(utc_datetime(), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(utc_datetime(), nullable=False),
+    )
+
+
+class OAuthState(SQLModel, table=True):
+    __tablename__ = "oauth_states"
+    __table_args__ = (
+        Index("ix_oauth_states_expires_at", "expires_at"),
+        Index(
+            "ix_oauth_states_unconsumed_expires_at",
+            "expires_at",
+            postgresql_where=text("consumed_at IS NULL"),
+        ),
+    )
+
+    state: str = Field(sa_column=Column(String, primary_key=True, nullable=False))
+    flow: str = Field(sa_column=Column(String, nullable=False, index=True))
+    code_verifier: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    # The guest this sign-in should link to, when it was started by one. Rides
+    # the state through Google because the authorize step is a bare browser
+    # navigation and carries no bearer token of its own.
+    link_user_id: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    # "Keep me signed in" from the login page, ridden the same way as
+    # link_user_id — the callback needs it to pick the JWT's lifetime, and the
+    # authorize step is a bare navigation with nowhere else to carry it.
+    remember: bool = Field(
+        default=False, sa_column=Column(sa.Boolean(), nullable=False, server_default=sa.false())
+    )
+    issued_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(utc_datetime(), nullable=False),
+    )
+    expires_at: datetime = Field(sa_column=Column(utc_datetime(), nullable=False))
+    consumed_at: datetime | None = Field(
+        default=None, sa_column=Column(utc_datetime(), nullable=True)
+    )
+
+
+
+class McpToken(SQLModel, table=True):
+    """A personal token an outside agent (Claude Code, Codex, Cursor) uses to
+    reach Duct's MCP server on someone's behalf.
+
+    It is accepted on ``/mcp`` and nowhere else, and it is never a session:
+    ``get_current_user`` reads only sign-in JWTs, so a token copied out of an
+    agent's config cannot open the app or call the rest of the API. Only its
+    SHA-256 is stored. A token is high-entropy and random, so a fast hash is
+    the right one (a password hash buys nothing against a 256-bit secret), and
+    the plaintext exists once, in the response that minted it.
+
+    An agent that signed in through the browser (``service/mcp_server/oauth``)
+    holds the same kind of row, so ``/mcp`` resolves both one way and either
+    is revoked with one button. Its row names the client it registered as and
+    adds a refresh token: its access token lives an hour, and the connection
+    as long as the agent keeps renewing it.
+    """
+
+    __tablename__ = "mcp_tokens"
+    # Unique as an index rather than a constraint: SQLite cannot add a column
+    # that carries one, and the desktop sidecar migrates on SQLite.
+    __table_args__ = (Index("uq_mcp_tokens_refresh_hash", "refresh_hash", unique=True),)
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True, nullable=False)
+    user_id: UUID = Field(
+        sa_column=Column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    )
+    # What the person called it ("Claude Code on my laptop"), so a list of
+    # tokens says which agent each one is in.
+    name: str = Field(sa_column=Column(String, nullable=False))
+    token_hash: str = Field(sa_column=Column(String, nullable=False, unique=True))
+    # The last four characters, to tell two tokens apart without the secret.
+    hint: str = Field(sa_column=Column(String, nullable=False))
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(utc_datetime(), nullable=False),
+    )
+    expires_at: datetime = Field(sa_column=Column(utc_datetime(), nullable=False))
+    last_used_at: datetime | None = Field(
+        default=None, sa_column=Column(utc_datetime(), nullable=True)
+    )
+    revoked_at: datetime | None = Field(
+        default=None, sa_column=Column(utc_datetime(), nullable=True)
+    )
+    # Null for a pasted token. For a signed-in agent, the client id it
+    # registered (which carries its name and redirect addresses), so a refresh
+    # token works only for the client it was issued to.
+    client_id: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    refresh_hash: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    # When the connection lapses unless the agent renews it first.
+    refresh_expires_at: datetime | None = Field(
+        default=None, sa_column=Column(utc_datetime(), nullable=True)
+    )

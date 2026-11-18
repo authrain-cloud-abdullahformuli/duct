@@ -1,0 +1,48 @@
+# Security headers ride on every path with the discovery links. The CSP holds
+# only what every page already satisfies: nothing frames the site, no page has
+# a <form>, <base> or <object>. script-src is deliberately absent: every page
+# runs inline scripts, and GTM injects tags whose origins live in the container
+# rather than this repository, so an allowlist written here would be a guess
+# that fails silently as lost measurement. PostHog loads its library and sends
+# its events through app.getduct.ai/ingest; a script-src or connect-src added
+# here must allow that origin, or PostHog stops without a visible error. HSTS leaves out includeSubDomains
+# until every record in the zone is known to answer over HTTPS: browsers keep
+# an HSTS max-age for its full year, even after the header is removed.
+/*
+  Link: </blog/>; rel="alternate"; type="text/html"; title="Blog"
+  Link: <https://getduct.ai/sitemap.xml>; rel="sitemap"
+  Link: <https://getduct.ai/blog/feed.xml>; rel="alternate"; type="application/rss+xml"; title="Duct Blog"
+  Link: <https://getduct.ai/changelog/feed.xml>; rel="alternate"; type="application/rss+xml"; title="Duct Changelog"
+  Strict-Transport-Security: max-age=31536000
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), display-capture=()
+  X-Frame-Options: DENY
+  Content-Security-Policy: object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'
+
+# Cloudflare serves .xml as application/xml; readers want the RSS type.
+/blog/feed.xml
+  Content-Type: application/rss+xml; charset=utf-8
+  Cache-Control: public, max-age=3600
+
+/changelog/feed.xml
+  Content-Type: application/rss+xml; charset=utf-8
+  Cache-Control: public, max-age=3600
+
+/llms.txt
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=3600
+
+# Cloudflare Pages revalidates every asset on every view by default. The
+# shots, art, cards, icons and post images change only with a deliberate reshoot, so a
+# repeat visitor can keep them for a week instead of asking each time.
+/assets/media/*
+  Cache-Control: public, max-age=604800
+/assets/art/*
+  Cache-Control: public, max-age=604800
+/assets/og/*
+  Cache-Control: public, max-age=604800
+/assets/icons/*
+  Cache-Control: public, max-age=604800
+/blog/assets/*
+  Cache-Control: public, max-age=604800

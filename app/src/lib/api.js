@@ -1,0 +1,515 @@
+import { providerKeyHeaders } from "./providerKeys.js";
+import { consumeSseStream } from "./sse.js";
+// Bearer JWT minted by Google Sign-In. Optional: signed-out sessions omit it and
+// the backend personalises only when a valid token is present.
+import { authToken } from "./authFetch.js";
+
+const configuredBase = process.env.NEXT_PUBLIC_API_BASE?.trim();
+const normalizedConfiguredBase = configuredBase?.replace(/\/+$/, "");
+const isProduction = process.env.NODE_ENV === "production";
+
+/**
+ * In production, require an explicit API base URL.
+ * This prevents silently sending real users to localhost when env vars are missing.
+ */
+const hostedBase = normalizedConfiguredBase || (isProduction ? "" : "http://localhost:8002");
+
+// The control-plane calls that open a session and push a message into it both
+// return as soon as the backend has queued the work — the answer arrives on
+// the SSE stream, never in their response. So they are fast or they are
+// broken, and an un-timed `fetch` against a server that accepted the socket
+// and then stopped answering simply never settles: the composer stays
+// disabled and the thread spins with nothing on screen to say why. Never put
+// this on the stream itself, which is meant to stay open for the whole run.
+const CONTROL_CALL_TIMEOUT_MS = 30_000;
+
+/** `AbortSignal.timeout`, or nothing where the runtime lacks it (jsdom, older
+ *  Safari) — a missing timeout is the old behaviour, not a crash. */
+function controlCallSignal() {
+  return typeof AbortSignal?.timeout === "function" ? AbortSignal.timeout(CONTROL_CALL_TIMEOUT_MS) : undefined;
+}
+
+/**
+ * Origin every request is sent to.
+ *
+ * `let`, not `const`, on purpose: the desktop shell bundles its own backend and
+ * only learns its loopback port at runtime, so `useLocalBackend()` repoints this
+ * once at boot (see `localBackend.js`). ES module live bindings mean every
+ * `${BASE}/…` call site picks the new value up with no change of its own —
+ * which is why callers must read `BASE` at call time and never copy it into
+ * their own module-level constant.
+ */
+export let BASE = hostedBase;
+
+/**
+ * The desktop shell's bundled backend, as a session can refer to it.
+ *
+ * Not its URL: the sidecar binds port 0 and gets a new port every launch, so
+ * the URL identifies a *run*, not a backend. Its database and its JWT secret
+ * both live in one per-install data directory, so one install has exactly one
+ * local backend and this constant names it for as long as that install lasts.
+ */
+export const LOCAL_BACKEND_ID = "local";
+
+/**
+ * Which backend `BASE` currently points at, stable enough to pin a session to.
+ *
+ * A session token is signed by whoever minted it, and the shell can talk to
+ * either the sidecar or the hosted API. Storing this alongside the token is
+ * what lets `authFetch` tell "you are signed out" from "this token belongs to
+ * the other backend" — the second used to arrive as a 401 and retire a session
+ * that was never bad. Empty when no base is configured, which reads as
+ * "unknown" rather than as a mismatch.
+ */
+let backendId = hostedBase;
+
+export function backendIdentity() {
+  return backendId;
+}
+
+/** Must match backend DUCT_API_KEY. Prefer a Next server proxy in production so this is not public. */
+let apiKey = process.env.NEXT_PUBLIC_DUCT_API_KEY || "";
+
+/** The `X-API-Key` for the active backend. Shared so every api module agrees. */
+export function backendApiKey() {
+  return apiKey;
+}
+
+/**
+ * Point the app at the desktop shell's local sidecar instead of the hosted API.
+ *
+ * Called once, before the first request, by the desktop boot gate. The local
+ * key is generated per install and read from the OS-protected data dir, so it
+ * is not a secret shared with anyone else.
+ */
+export function useLocalBackend({ url, apiKey: localKey }) {
+  BASE = String(url || "").replace(/\/+$/, "");
+  apiKey = localKey || "";
+  backendId = LOCAL_BACKEND_ID;
+}
+
+function backendApiHeaders(extra = {}) {
+  const headers = { ...extra };
+  const key = backendApiKey();
+  if (key) {
+    headers["X-API-Key"] = key;
+  }
+  return headers;
+}
+
+/**
+ * Headers that prove both halves: the X-API-Key says "this is the Duct app",
+ * the Bearer token says which user is asking. Anything reading or writing
+ * project-scoped data needs the second — the key is public, it ships in this
+ * bundle. Exported so `contentApi` and friends share this one definition
+ * rather than each keeping a key-only copy.
+ *
+ * The rule: if the request spends model tokens, reaches a vendor with anyone's
+ * credentials, or reads project data, use this one. `backendApiHeaders` is for
+ * the handful of routes that are genuinely public catalogue reads — engine
+ * status, insight modes.
+ */
+export function backendAuthedHeaders(extra = {}) {
+  const headers = backendApiHeaders(extra);
+  const token = authToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  return headers;
+}
+
+export async function generateReport(params) {
+  const res = await fetch(`${BASE}/api/insights/generate`, {
+    method: "POST",
+    headers: { ...backendAuthedHeaders({ "Content-Type": "application/json" }), ...(await providerKeyHeaders()) },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Server error ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Re-pull a saved insight's data. The backend reads each connector from the
+ * signed-in account's stored connections; nothing in this tab is sent along,
+ * so a refresh works from any tab, browser or the desktop app.
+ */
+export async function refreshInsightBriefs(routine) {
+  const body = {
+    connections: routine?.connections || [],
+    date_preset: routine?.date_preset || "30",
+    date_from: routine?.custom_date_from || "",
+    date_to: routine?.custom_date_to || "",
+    targets: routine?.targets || {},
+  };
+  const res = await fetch(`${BASE}/api/insights/refresh`, {
+    method: "POST",
+    headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Server error ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function streamInsightChat({
+  chatPayload,
+  messages,
+  message,
+  onToken,
+  onDone,
+  onError,
+}) {
+  const res = await fetch(`${BASE}/api/insights/chat`, {
+    method: "POST",
+    // The chat runs on the caller's own model key (routes/chat.py), so it
+    // carries the keys this browser or the desktop keychain holds.
+    headers: { ...backendAuthedHeaders({ "Content-Type": "application/json" }), ...(await providerKeyHeaders()) },
+    body: JSON.stringify({
+      chat_payload: chatPayload,
+      messages,
+      message,
+    }),
+  });
+
+  if (!res.ok) {
+    // A 402 names the key to add; show its sentence, never the raw JSON.
+    const text = await res.text();
+    let detail = "";
+    try {
+      detail = JSON.parse(text)?.detail;
+    } catch {
+      /* not JSON */
+    }
+    onError?.(typeof detail === "string" && detail ? detail : text || `Chat error ${res.status}`);
+    return;
+  }
+
+  if (!res.body) {
+    onError?.("Streaming response body is not available.");
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const payload = line.slice(6).trim();
+      if (payload === "[DONE]") {
+        onDone?.();
+        return;
+      }
+      try {
+        const parsed = JSON.parse(payload);
+        if (parsed.token) onToken?.(parsed.token);
+        if (parsed.error) {
+          onError?.(parsed.error);
+          return;
+        }
+      } catch {
+        // Skip malformed frames.
+      }
+    }
+  }
+  onDone?.();
+}
+
+export async function generateReportStream(params, { onEvent, signal } = {}) {
+  const res = await fetch(`${BASE}/api/insights/generate/stream`, {
+    method: "POST",
+    headers: { ...backendAuthedHeaders({ "Content-Type": "application/json" }), ...(await providerKeyHeaders()) },
+    body: JSON.stringify(params),
+    signal,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Server error ${res.status}`);
+  }
+  if (!res.body) {
+    throw new Error("Streaming response body is not available.");
+  }
+
+  let finalPayload = null;
+  let streamError = null;
+
+  await consumeSseStream(res.body, (event) => {
+    onEvent?.(event);
+    if (event.event === "pipeline_finished") {
+      finalPayload = event.payload;
+    } else if (event.event === "pipeline_failed") {
+      streamError = event.error || "Report generation failed.";
+    }
+  }, signal);
+
+  if (streamError) throw new Error(streamError);
+  if (finalPayload) return finalPayload;
+  throw new Error("Stream ended before returning a final report payload.");
+}
+
+// ---------------------------------------------------------------------------
+// Unified agent session API  (/api/agents)
+// ---------------------------------------------------------------------------
+//
+// These send the Bearer token. Create reads the caller off the request and
+// stamps them on the session, which is what everything user-scoped downstream
+// keys off — artifact persistence, project memory, the autonomy level the run
+// operates at. Without it the backend saw an anonymous caller and those
+// features silently did nothing (the checks are all `if user_id`). The
+// remaining three carry it because a session belongs to whoever created it.
+//
+// A signed-out caller still works and still gets None: that is the lead-magnet
+// teaser audit, which owns no project and persists nothing.
+
+/** List all available agent types. */
+export async function listAgents() {
+  const res = await fetch(`${BASE}/api/agents`, { headers: backendApiHeaders() });
+  if (!res.ok) throw new Error(`Failed to list agents: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Create an agent session and start the pipeline.
+ * Returns { session_id, stream_url, agent_type }.
+ * Then connect to openAgentStream(agentType, sessionId) for SSE events.
+ */
+export async function createAgentSession(agentType, params) {
+  // The provider headers ride on session creation for every agent, not just
+  // insights: the backend resolves the run's key here, and a request without
+  // them is a request the hosted deployment has no key it is allowed to spend.
+  const res = await fetch(`${BASE}/api/agents/${encodeURIComponent(agentType)}/sessions`, {
+    method: "POST",
+    headers: {
+      ...backendAuthedHeaders({ "Content-Type": "application/json" }),
+      ...(await providerKeyHeaders()),
+    },
+    body: JSON.stringify(params),
+    signal: controlCallSignal(),
+  });
+  if (!res.ok) {
+    throw await sessionCreateError(res);
+  }
+  return res.json(); // { session_id, stream_url, agent_type }
+}
+
+/**
+ * A structured failure (e.g. ProviderKeyRequired's 402, `{detail, code, ...}`)
+ * carries its `code` on the thrown Error so the caller can route it through
+ * the same ErrorCode → copy table a pipeline failure uses, instead of
+ * dumping the raw JSON body as the message.
+ */
+async function sessionCreateError(res) {
+  const text = await res.text();
+  let message = text || `Server error ${res.status}`;
+  let code = "";
+  try {
+    const body = JSON.parse(text);
+    if (body && typeof body === "object") {
+      message = body.detail || message;
+      code = body.code || "";
+    }
+  } catch {
+    /* not JSON — plain text error, message stands */
+  }
+  const err = new Error(message);
+  if (code) err.code = code;
+  return err;
+}
+
+/**
+ * Open the SSE stream for an active session.
+ * Returns the raw ReadableStream body — consume with a reader loop.
+ */
+export async function openAgentStream(agentType, sessionId, { signal, afterSegment = 0 } = {}) {
+  // A tab that hydrated the transcript first says how far its rows reach, so
+  // the backlog the backend buffered while it was away starts after them.
+  const after = afterSegment > 0 ? `?after_segment=${encodeURIComponent(afterSegment)}` : "";
+  const url = `${BASE}/api/agents/${encodeURIComponent(agentType)}/sessions/${encodeURIComponent(sessionId)}/stream${after}`;
+  const res = await fetch(url, { headers: backendAuthedHeaders(), signal });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `Stream error ${res.status}`);
+  }
+  return res.body;
+}
+
+/**
+ * Send a message into an active agent session.
+ *
+ * type="chat"   — follow-up text or content blocks with images
+ * type="answer" — the reply to whatever the session is parked on. Pass the
+ *                 pause's `interrupt_id` when it has one, so the right card is
+ *                 resolved when two are pending.
+ */
+export async function sendAgentMessage(agentType, sessionId, message) {
+  // message: { type: "chat"|"answer", content?, context_version_id?, answers?, interrupt_id? }
+  const res = await fetch(
+    `${BASE}/api/agents/${encodeURIComponent(agentType)}/sessions/${encodeURIComponent(sessionId)}/messages`,
+    {
+      method: "POST",
+      headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(message),
+      signal: controlCallSignal(),
+    }
+  );
+  if (!res.ok) throw new Error(`Message failed: ${res.status}`);
+  return res.json();
+}
+
+/** A live session's state: { pending: [...pauses], has_pending_question, report_versions }.
+ * Read after reattaching to a session whose stream had already delivered the
+ * pause — the card has to be put back from somewhere. */
+export async function getAgentSessionState(agentType, sessionId) {
+  const res = await fetch(
+    `${BASE}/api/agents/${encodeURIComponent(agentType)}/sessions/${encodeURIComponent(sessionId)}`,
+    { headers: backendAuthedHeaders() }
+  );
+  if (!res.ok) throw new Error(`Get session state failed: ${res.status}`);
+  return res.json();
+}
+
+/** Close an agent session and free server-side resources. */
+export async function closeAgentSession(agentType, sessionId) {
+  await fetch(
+    `${BASE}/api/agents/${encodeURIComponent(agentType)}/sessions/${encodeURIComponent(sessionId)}`,
+    { method: "DELETE", headers: backendAuthedHeaders() }
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Persisted conversations (chat history / resume)
+// ---------------------------------------------------------------------------
+//
+// All four send the Bearer token, not just the API key. A conversation belongs
+// to a project, and the backend gates these on project membership — the shared
+// X-API-Key is baked into this bundle and says nothing about who is asking.
+// Every caller is inside the signed-in app shell, so a token is always present.
+
+/** List an agent's conversations (resume lookup / history). Returns an array of
+ * conversation summaries. Pass filters: { projectId, artifactType, artifactId }.
+ * Omitting projectId lists across the caller's own projects. */
+export async function listAgentConversations(agentType, { projectId, artifactType, artifactId, includeArchived } = {}) {
+  const qs = new URLSearchParams();
+  if (projectId) qs.set("project_id", projectId);
+  if (artifactType) qs.set("artifact_type", artifactType);
+  if (artifactId) qs.set("artifact_id", artifactId);
+  if (includeArchived) qs.set("include_archived", "true");
+  const res = await fetch(
+    `${BASE}/api/agents/${encodeURIComponent(agentType)}/conversations?${qs.toString()}`,
+    { headers: backendAuthedHeaders() }
+  );
+  if (!res.ok) throw new Error(`List conversations failed: ${res.status}`);
+  return res.json();
+}
+
+/** Fetch a conversation + its event log for UI rehydration.
+ * Returns { conversation, events: [{ seq, kind, data, created_at }] }. */
+export async function getAgentConversation(agentType, conversationId) {
+  const res = await fetch(
+    `${BASE}/api/agents/${encodeURIComponent(agentType)}/conversations/${encodeURIComponent(conversationId)}`,
+    { headers: backendAuthedHeaders() }
+  );
+  if (!res.ok) throw new Error(`Get conversation failed: ${res.status}`);
+  return res.json();
+}
+
+/** What a conversation's durable thread is doing: { status, pauses, todos }.
+ * `status` is "paused" (the pauses are the cards to put back on screen),
+ * "unfinished", "idle", or "unsupported" for an agent whose state lives only
+ * in a process. Read on open so a parked question is visible before any
+ * session exists. */
+export async function getAgentThreadState(agentType, conversationId) {
+  const res = await fetch(
+    `${BASE}/api/agents/${encodeURIComponent(agentType)}/conversations/${encodeURIComponent(conversationId)}/state`,
+    { headers: backendAuthedHeaders() }
+  );
+  if (!res.ok) throw new Error(`Get thread state failed: ${res.status}`);
+  return res.json();
+}
+
+/** Pin (or rename) a conversation. Pinning only changes list order. */
+export async function patchAgentConversation(agentType, conversationId, patch) {
+  const res = await fetch(
+    `${BASE}/api/agents/${encodeURIComponent(agentType)}/conversations/${encodeURIComponent(conversationId)}`,
+    {
+      method: "PATCH",
+      headers: backendAuthedHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(patch),
+    }
+  );
+  if (!res.ok) throw new Error(`Patch conversation failed: ${res.status}`);
+  return res.json();
+}
+
+/** Archive a conversation (start-fresh support). */
+export async function archiveAgentConversation(agentType, conversationId) {
+  const res = await fetch(
+    `${BASE}/api/agents/${encodeURIComponent(agentType)}/conversations/${encodeURIComponent(conversationId)}/archive`,
+    { method: "POST", headers: backendAuthedHeaders() }
+  );
+  if (!res.ok) throw new Error(`Archive conversation failed: ${res.status}`);
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Lead magnet
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate a lead magnet access token.
+ * Token is sent in the POST body — not as a query param — to avoid it appearing
+ * in server logs, browser history, or Referer headers.
+ * Returns { website_url } or throws if the token is invalid / expired.
+ */
+export async function validateLeadToken(token) {
+  const res = await fetch(`${BASE}/api/lead-magnet/validate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (!res.ok) throw new Error("Invalid or expired lead token");
+  return res.json();
+}
+
+/**
+ * Persist the completed audit report against a lead magnet record.
+ * First write wins — 409 means it was already saved (silent success).
+ * Never throws; failures are logged but don't disrupt the user's report view.
+ */
+export async function saveLeadReport(token, report) {
+  try {
+    await fetch(`${BASE}/api/lead-magnet/report`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, report }),
+    });
+  } catch {
+    // Fire-and-forget: network errors shouldn't interrupt the user experience
+  }
+}
+
+/**
+ * Record a lead's interest in paid execution (demand-validation test).
+ * `services` is an array of keys: "ai_ready_fixes" | "content_rewrites" | "translation".
+ * Resolves true on success, throws on failure so the modal can show an error state.
+ */
+export async function expressExecutionInterest(token, { services, findingIds = null, note = null }) {
+  const res = await fetch(`${BASE}/api/lead-magnet/execution-interest`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, services, finding_ids: findingIds, note }),
+  });
+  if (!res.ok) throw new Error("Could not record execution interest");
+  return true;
+}

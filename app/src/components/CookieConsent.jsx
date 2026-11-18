@@ -1,0 +1,71 @@
+"use client";
+
+import { useEffect, useRef } from "react";
+import { Trans } from "@lingui/react/macro";
+
+import { Button } from "@/components/ui/button";
+import { useHoldCorner } from "@/components/ui/corner-notice";
+
+/**
+ * The consent question, as a bar rather than a blocking overlay: the page stays
+ * readable while it is open, and Decline sits at the same size and the same
+ * click distance as Accept — the part the AEPD actually checks.
+ *
+ * Presentational only. `ProductAnalytics` owns the decision and the tags.
+ */
+export function CookieConsent({ onAccept, onDecline }) {
+  const heading = useRef(null);
+  // One question at a time along the bottom edge: this one is the law's.
+  useHoldCorner();
+
+  // Move focus to the question when it appears, or a screen reader is never
+  // told it is there — the same thing the site build does on `showBanner`.
+  useEffect(() => {
+    heading.current?.focus();
+  }, []);
+
+  return (
+    <section
+      role="dialog"
+      aria-modal="false"
+      aria-labelledby="consent-title"
+      className="fixed inset-x-4 bottom-4 z-50 mx-auto flex max-w-3xl flex-wrap items-center gap-6 rounded-xl border border-border bg-card p-5 shadow-lg"
+    >
+      <div className="min-w-0 flex-1 basis-80">
+        <h2
+          id="consent-title"
+          ref={heading}
+          tabIndex={-1}
+          className="mb-1.5 text-sm font-semibold text-foreground outline-none"
+        >
+          <Trans>Cookies, honestly</Trans>
+        </h2>
+        <p className="text-sm leading-relaxed text-muted-foreground">
+          <Trans>
+            We use PostHog to see which pages earn a signup and
+            where Duct gets in your way, including replays of visits with everything
+            you type hidden. Decline turns PostHog off, and Duct works exactly the
+            same. Google Analytics also counts visits and sets its own cookies,
+            whichever you choose. Nothing is sold.{" "}
+            <a
+              href="https://getduct.ai/privacy"
+              target="_blank"
+              rel="noreferrer noopener"
+              className="text-foreground underline underline-offset-2"
+            >
+              Privacy Policy
+            </a>
+          </Trans>
+        </p>
+      </div>
+      <div className="flex w-full shrink-0 gap-2.5 sm:w-auto">
+        <Button variant="outline" className="flex-1 sm:flex-none" onClick={onDecline}>
+          <Trans>Decline</Trans>
+        </Button>
+        <Button className="flex-1 sm:flex-none" onClick={onAccept}>
+          <Trans>Accept</Trans>
+        </Button>
+      </div>
+    </section>
+  );
+}

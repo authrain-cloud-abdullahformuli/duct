@@ -1,0 +1,1526 @@
+"""LangChain adapter — model transport and stream translation for V1 runners.
+
+Two harness-shaped pieces every V1 runner needs, in one place because there are
+now two runners (audit, insights) that need them. Both started life inside
+``agents/audit/v1/runner.py``; a third copy is how the twenty-three private
+``_utcnow()`` definitions started, so they moved here on the second consumer
+rather than the third.
+
+What lives here and what does not:
+
+* ``resolve_chat_model`` is the LangChain half of the **model transport** port
+  (``agents/core/ports``). Named ``resolve_chat_model``, not ``resolve_model``,
+  because ``agents/models.py`` already owns that name for a different job
+  (string → ``ModelName``).
+* ``stream_agent`` is the LangChain half of the **events out** port: it drives
+  a compiled LangGraph agent and translates its stream into Duct's ``AgentEvent``
+  vocabulary, so the frontend cannot tell which harness served a run.
+* ``interrupt_pause`` is the LangGraph half of the **human-in-the-loop** port:
+  a tool calls it, the thread parks in its checkpoint, and ``stream_agent``
+  surfaces the pause as the SSE event the UI already renders. The resume is a
+  ``Command`` driven back through ``stream_agent`` by the runner's chat loop.
+
+Everything agent-specific stays in the runner — what the prompt says, which
+tools are bound, what an artifact payload means. This module knows only how to
+talk to LangChain.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+import re
+import time
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from langchain.agents.middleware import AgentMiddleware, SummarizationMiddleware
+from langchain.chat_models import init_chat_model
+from langchain_anthropic import ChatAnthropic
+from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_core.messages import HumanMessage
+from langchain_core.tools import StructuredTool
+from langgraph.config import get_stream_writer
+from langgraph.types import Command, interrupt
+from pydantic import BaseModel, Field
+
+from agents.core.codex import build_codex_chat, is_subscription_credential
+from agents.core.errors import ErrorCode, classify_error, is_retryable, retry_after_seconds
+from agents.core.quota import note_exhausted
+from agents.core.events import AgentEvent, StepStatus
+from agents.core.session import (
+    take_client_id,
+    ASK_USER_TIMEOUT,
+    BaseAgentSession,
+    PauseFn,
+    make_future_pause,
+)
+from agents.core.stream import DuctArtifactStreamParser
+from agents.core.telemetry import OP_INVOKE_AGENT, model_span
+from agents.models import (
+    cost_usd,
+    context_window_for,
+    GATEWAY_BASE_URL,
+    ModelName,
+    Provider,
+    binds_thinking_to_conversation,
+    compatible_model_id,
+    compatible_served_id,
+    get_api_key_kwargs,
+    is_compatible_model,
+    is_ollama_model,
+    langchain_provider,
+    ollama_model_id,
+    ollama_tag,
+    takes_temperature,
+)
+from agents.thinking import thinking_kwargs
+
+logger = logging.getLogger(__name__)
+
+# Cap on clarifying questions in one AskUserQuestion call. Matches the V3
+# runners, so a user sees the same maximum whichever engine served the run.
+MAX_QUESTIONS = 3
+
+
+# ---------------------------------------------------------------------------
+# Human-in-the-loop — the LangChain half of the AskUser port
+# ---------------------------------------------------------------------------
+
+class AskUserArgs(BaseModel):
+    """Arguments for the AskUserQuestion tool."""
+
+    questions: list[dict] = Field(
+        description=(
+            "Clarifying questions for the user. Each item: "
+            '{"question": str, "header": str, "options": [{"label": str, "description": str}], '
+            '"multiSelect": bool}. The options are drawn as a list of rows the '
+            "person picks from, so write them to scan: `label` is the choice itself "
+            "in two to five words; `description` is optional, one clause under "
+            "twelve words saying what sets this option apart, never the label again "
+            "and never the argument for it. An 'Other' row with free text is added "
+            "for you; do not write one."
+        )
+    )
+
+
+async def interrupt_pause(event: str, payload: dict, *, timeout: float | None = None) -> dict:
+    """The checkpointed ``PauseFn``: park the thread on a LangGraph interrupt.
+
+    The payload carries the SSE event name so ``stream_agent`` can emit it
+    verbatim when the interrupt surfaces — the tool that paused does not emit
+    anything itself. The run resumes when the runner streams a
+    ``Command(resume={interrupt_id: answer})`` on the same thread, and the answer
+    becomes this call's return value.
+
+    Two properties of ``interrupt()`` matter to callers. It needs a checkpointer,
+    so a binder must only hand this out for an agent that has one. And the task
+    that paused re-runs from its start on resume, so whatever a tool does before
+    calling this happens twice — keep it to idempotent reads. ``timeout`` is
+    ignored: a checkpointed pause waits as long as the thread exists.
+    """
+    del timeout  # the whole point: no clock on a parked thread
+    # A plain string, not the AgentEvent member: the checkpointer serialises
+    # the payload with msgpack and warns on (soon refuses) an unregistered type.
+    answer = interrupt({"event": str(event), **payload})
+    return answer if isinstance(answer, dict) else {}
+
+
+def bind_tool_lc(coroutine: Any, *, name: str, description: str, args_schema: type) -> StructuredTool:
+    """One async function as a LangChain tool. The binder a domain module
+    reaches for instead of importing the framework itself: the content
+    runner's ``research_trends`` is a closure over the run, and the only
+    framework-shaped thing about it is this call."""
+    return StructuredTool.from_function(
+        coroutine=coroutine, name=name, description=description, args_schema=args_schema
+    )
+
+
+def build_ask_user_tool(
+    session: BaseAgentSession,
+    session_id: str,
+    emit: Callable,
+    *,
+    pause: PauseFn | None = None,
+    log_prefix: str = "agent-v1",
+    timeout: float = ASK_USER_TIMEOUT,
+    description: str = (
+        "Ask the user up to 3 clarifying questions when their answer would "
+        "materially change your conclusions. Use sparingly and early; never ask "
+        "about information already provided."
+    ),
+) -> StructuredTool:
+    """AskUserQuestion as a LangChain tool, parked on the pause port.
+
+    The tool call blocks until the user answers, which is what keeps the agent
+    loop paused — the same behaviour V3 gets from its ``can_use_tool`` hook.
+    ``pause`` defaults to the in-process Future bridge (right for an agent with
+    no checkpointer, like audit v1); a runner with durable threads passes
+    ``interrupt_pause`` so the question outlives the process that asked it.
+    """
+    pause = pause or make_future_pause(
+        session, session_id, emit, timeout=timeout, log_prefix=log_prefix
+    )
+
+    async def ask_user_question(questions: list[dict]) -> str:
+        answers = await pause(
+            AgentEvent.QUESTIONS_REQUIRED,
+            {"questions": questions[:MAX_QUESTIONS]},
+            timeout=timeout,
+        )
+        if not answers:
+            return (
+                "The user did not answer in time. Continue using the information "
+                "you already have; do not ask again."
+            )
+        return "\n".join(f"{k}: {v}" for k, v in answers.items())
+
+    return StructuredTool.from_function(
+        coroutine=ask_user_question,
+        name="AskUserQuestion",
+        description=description,
+        args_schema=AskUserArgs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Model transport
+# ---------------------------------------------------------------------------
+
+def default_base_url(provider: Provider) -> str:
+    """Installation-level endpoint override for gateway providers.
+
+    Read here rather than threaded through every route because it is an
+    install-wide setting, not a per-request one — and because agents/models.py
+    stays a config-free leaf module. Direct vendors never consult it.
+    """
+    from config import get_configs
+    if provider is Provider.OLLAMA:
+        return get_configs().ollama_base_url or ""
+    if provider not in GATEWAY_BASE_URL:
+        return ""
+    return getattr(get_configs(), "openrouter_base_url", "") or ""
+
+
+def _ollama_context_length(model: ModelName | str) -> int:
+    """The context Duct asks Ollama to load for this model, and budgets in.
+
+    The configured length (``OLLAMA_CONTEXT_LENGTH``), held to the length the
+    model was trained on when the server says what that is.
+    """
+    from config import get_configs
+    from service.ollama import model_or_none
+
+    wanted = get_configs().ollama_context_length
+    info = model_or_none(ollama_tag(model))
+    trained = info.context_length if info is not None else 0
+    return min(wanted, trained) if trained else wanted
+
+
+def duct_window(model: ModelName | str) -> int:
+    """The window Duct budgets this model's threads in."""
+    if is_ollama_model(model):
+        return _ollama_context_length(model)
+    if is_compatible_model(model):
+        from service.compatible import window_for
+
+        return window_for(str(getattr(model, "value", model)))
+    return context_window_for(model)
+
+
+def _ollama_kwargs(model: ModelName | str, thinking: str) -> dict:
+    """What ChatOllama needs that no other provider's class takes.
+
+    ``num_ctx`` is the one that matters. Without it Ollama loads the model at
+    its own default, 4,096 tokens on a machine without a large GPU, and drops
+    what does not fit, Duct's system prompt and tool schemas included, without
+    an error: the run just goes wrong. ``reasoning`` keeps a thinking model's
+    reasoning out of its answer (it arrives as ``reasoning_content``, which the
+    stream already shows as thinking); sent only to a model the server says
+    thinks, because Ollama refuses it from one that cannot. A "quick" run asks
+    for none, the way the other providers' dials go to their lowest rung.
+    """
+    from service.ollama import model_or_none
+
+    kwargs: dict[str, Any] = {"num_ctx": _ollama_context_length(model)}
+    info = model_or_none(ollama_tag(model))
+    if info is not None and info.thinks:
+        kwargs["reasoning"] = thinking != "quick"
+    return kwargs
+
+
+def _thinking_kwargs_for(provider: Provider, model, thinking: str) -> dict:
+    """``thinking_kwargs`` translated into what this provider's class accepts.
+
+    ``agents/thinking.py`` is deliberately provider-blind: it answers "what does
+    this *model* call this rung" and emits LangChain's standard
+    ``reasoning_effort``. That kwarg is standard across ChatAnthropic, ChatOpenAI
+    and ChatGoogleGenerativeAI — but **not** ChatOpenRouter, which takes
+    OpenRouter's unified ``reasoning={"effort": …}`` object instead.
+
+    The failure mode this exists to prevent is silent: ChatOpenRouter accepts an
+    unknown kwarg, warns, and forwards it inside ``model_kwargs``, so a mistyped
+    dial reaches the API as a junk top-level field and the run appears to work
+    at whatever depth the model defaulted to. Translating at the transport
+    boundary — where the provider is known — keeps thinking.py from growing a
+    provider axis it has no reason to have.
+    """
+    kwargs = thinking_kwargs(model, thinking)
+    effort = kwargs.pop("reasoning_effort", None)
+    if effort and provider is Provider.OPENROUTER:
+        kwargs["reasoning"] = {"effort": effort}
+    elif effort:
+        kwargs["reasoning_effort"] = effort
+    if provider is Provider.ANTHROPIC and binds_thinking_to_conversation(model):
+        kwargs.update(_bound_thinking_kwargs(summarized=bool(effort)))
+    return kwargs
+
+
+# The Anthropic beta that lets a request say what to do with a thinking block
+# whose conversation has changed since it was produced.
+THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
+
+
+def _bound_thinking_kwargs(*, summarized: bool) -> dict:
+    """Drop a stale thinking block rather than refuse the request.
+
+    On a model that binds each thinking block to the conversation before it
+    (``agents/models.CLAUDE_BOUND_THINKING``), replaying one after an earlier
+    turn changed is a 400 on accounts created on or after 2026-08-31, and the
+    harness changes earlier turns on purpose — ``ClearToolUsesEdit`` prunes old
+    tool results, ``SeenImagePruneMiddleware`` swaps an image for a note, and
+    compaction rewrites the thread. ``drop_block`` makes the API drop the
+    first stale block and every one after it instead: the turn loses that
+    reasoning and the run carries on. Older accounts are opted into the same
+    check by it, which costs them the same reasoning after an edit and buys
+    one behaviour for every customer rather than a 400 that depends on when
+    their account was opened.
+
+    Setting ``thinking`` explicitly switches off langchain-anthropic's own
+    default of ``{"type": "adaptive", "display": "summarized"}`` when an effort
+    is set, so ``summarized`` restates that default: the reasoning pane shows
+    a summary exactly when it did before.
+    """
+    config: dict[str, Any] = {
+        "type": "adaptive",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+    }
+    if summarized:
+        config["display"] = "summarized"
+    return {"thinking": config, "betas": [THINKING_BINDING_BETA]}
+
+
+def resolve_chat_model(
+    provider: Provider,
+    model: ModelName | str,
+    api_key: str,
+    temperature: float | None = 1.0,
+    *,
+    base_url: str = "",
+    thinking: str = "",
+    cache_key: str = "",
+):
+    """Any LangChain-supported provider — this is the point of the migration.
+
+    ``model`` may be a plain string: OpenRouter slugs are passed through
+    un-enumerated (see ``agents/engines.resolve_engine_model``). ``base_url`` is
+    only consulted by gateway providers.
+
+    ``thinking`` is a *Duct* level ("quick" … "exhaustive"), not a provider
+    value. It resolves through agents/thinking.py to whatever this model calls
+    that rung, and contributes nothing when the model has no such dial — which
+    is why it is safe to pass unconditionally from every call site.
+
+    ``cache_key`` is the thread the calls belong to. OpenAI routes a request
+    carrying ``prompt_cache_key`` to the machine holding that prefix, so a
+    tool loop's ten calls on the same conversation hit the cache instead of
+    landing on ten machines and rebuilding it. It contributes nothing on the
+    other providers: Gemini caches implicitly, and Anthropic caches only a
+    request that asks for it, which is a middleware's job, not the
+    transport's (``prompt_caching_middleware``).
+
+    ``temperature`` is dropped for a model that refuses one while it reasons
+    (``agents/models.takes_temperature``), so a caller asking for 0 on a
+    verify call or a memory pass does not need to know which models those are.
+    """
+    cache = _cache_kwargs(provider, cache_key)
+    if not takes_temperature(model):
+        temperature = None
+    # A ChatGPT access token is not an API key and does not go to the public
+    # API: the credential's own shape sends it to the Codex backend. Decided
+    # here, at the one seam every run passes through, so no runner knows.
+    if provider is Provider.OPENAI and is_subscription_credential(api_key):
+        llm = build_codex_chat(
+            model,
+            api_key=api_key,
+            temperature=temperature,
+            **_thinking_kwargs_for(provider, model, thinking),
+            **cache,
+            **_retry_kwargs(provider),
+        )
+    elif provider is Provider.OPENAI_COMPATIBLE:
+        return _compatible_chat(model, api_key, temperature)
+    elif provider is Provider.OLLAMA:
+        # Ollama knows the model by its tag, not by Duct's namespaced id.
+        llm = init_chat_model(
+            model=ollama_tag(model),
+            model_provider=langchain_provider(provider),
+            temperature=temperature,
+            **_ollama_kwargs(model, thinking),
+            **get_api_key_kwargs(provider, api_key, base_url=base_url or default_base_url(provider)),
+        )
+    else:
+        llm = init_chat_model(
+            model=getattr(model, "value", model),
+            model_provider=langchain_provider(provider),
+            temperature=temperature,
+            **_thinking_kwargs_for(provider, model, thinking),
+            **cache,
+            **_retry_kwargs(provider),
+            **get_api_key_kwargs(provider, api_key, base_url=base_url or default_base_url(provider)),
+        )
+        llm = _bound_reply(llm, provider)
+    return _within_ducts_window(llm, model)
+
+
+# Marks a chat model as the user's own endpoint for readers that hold only the
+# model object (``structured_output``): it is a ChatOpenAI like OpenAI's own.
+DUCT_PROVIDER_METADATA = "duct_provider"
+
+
+def _compatible_chat(model: ModelName | str, credential: str, temperature: float | None) -> Any:
+    """ChatOpenAI at the user's own endpoint, on one of the models they chose.
+
+    The credential carries the address, the key and the chosen models with
+    their context lengths, so nothing here asks the server anything. A model
+    id that is not one of theirs (a run that resolved here with no tier
+    naming this provider) takes the first they chose. No thinking dial and no
+    cache key: neither is part of the shape every server accepts, and an
+    unknown field is a 400 on some of them. Off a private network every
+    request is held to a public address (``guarded_http_clients``).
+    """
+    from service import compatible
+
+    endpoint = compatible.unpack(credential)
+    if endpoint is None:
+        raise ValueError("That isn't an OpenAI-compatible endpoint Duct can read. Connect it again in Settings.")
+    served = compatible_served_id(model) if is_compatible_model(model) else endpoint.models[0].id
+    known = endpoint.model(served)
+    window = known.window if known else compatible.DEFAULT_CONTEXT_LENGTH
+    model_id = compatible_model_id(served)
+    compatible.remember_window(model_id, window)
+    llm = init_chat_model(
+        model=served,
+        model_provider=langchain_provider(Provider.OPENAI_COMPATIBLE),
+        temperature=temperature,
+        stream_usage=True,
+        metadata={DUCT_PROVIDER_METADATA: Provider.OPENAI_COMPATIBLE.value},
+        **_retry_kwargs(Provider.OPENAI_COMPATIBLE),
+        **get_api_key_kwargs(Provider.OPENAI_COMPATIBLE, endpoint.api_key, base_url=endpoint.base_url),
+        **compatible.guarded_http_clients(private_ok=compatible.private_allowed()),
+    )
+    return _within_ducts_window(llm, model_id)
+
+
+def _within_ducts_window(llm: Any, model: ModelName | str) -> Any:
+    """The model's profile says the window Duct budgets, not the one published.
+
+    deepagents sizes its summariser from `model.profile["max_input_tokens"]`:
+    the trigger is 0.85 of it. The integrations publish the vendor's figure —
+    a million tokens on Opus 5.5 and Sonnet 5.5 — while Duct budgets those
+    threads at 200k (CONTEXT_WINDOW, for the reason given there: every turn
+    re-sends the whole thread), so the summariser was set to fire at ~850k,
+    past the point where a run had already failed on cost or on the budget's
+    own overflow path. Writing Duct's window into the profile makes every
+    fraction deepagents derives — trigger, keep, argument truncation — a
+    fraction of the budget. Rulebook gap 3. The rest of the profile is kept;
+    the integrations read other keys from it (output limits, modalities).
+    """
+    window = duct_window(model)
+    profile = dict(getattr(llm, "profile", None) or {})
+    if profile.get("max_input_tokens") != window:
+        profile["max_input_tokens"] = window
+        try:
+            llm.profile = profile
+        except (AttributeError, TypeError, ValueError):  # a model class that refuses assignment
+            logger.debug("lc: could not set the window on %s's profile", model, exc_info=True)
+    return llm
+
+
+def structured_output(llm: Any, schema: type[BaseModel], **kwargs: Any) -> Any:
+    """``llm.with_structured_output(schema)`` on a method that constrains the
+    reply on this provider, for a one-shot structured call.
+
+    Each integration picks its own default, and Anthropic's is the weak one:
+    ``function_calling`` forces a tool call, which Fable 5.1, Opus 5.5 and
+    Sonnet 5.5 refuse outright (a 400 through langchain-anthropic 1.7.2; from
+    1.7.4 the call is simply not forced, a best effort —
+    langchain-ai/langchain#40766), as the API does beside extended thinking.
+    ``json_schema`` is Claude's own structured output, constrained decoding on
+    every Claude in the catalogue.
+
+    A user's own OpenAI-compatible endpoint asks for a JSON schema and falls
+    back to a tool call (below). Everyone else keeps their default. OpenAI (the ChatGPT plan included)
+    and Gemini already default to ``json_schema``. OpenRouter and xAI default
+    to tool calling, and OpenRouter fronts open-weight models whose hosts do
+    not all accept a JSON-schema response format — moving them is a change
+    to measure live, not to ride along with this one.
+    """
+    if isinstance(llm, ChatAnthropic):
+        kwargs.setdefault("method", "json_schema")
+    elif (getattr(llm, "metadata", None) or {}).get(DUCT_PROVIDER_METADATA) == Provider.OPENAI_COMPATIBLE.value:
+        # Constrained decoding first: vLLM, llama.cpp, LM Studio, Ollama and
+        # the open-weight hosts implement a JSON-schema response format, and a
+        # small model held to the schema answers where it would reply in words
+        # to a forced tool call (measured on qwen3 0.6B: 3/3 against 0/3). A
+        # server that refuses the format, or a reply that does not parse, falls
+        # back to a tool call, the one thing connecting the endpoint proved.
+        if "method" not in kwargs:
+            primary = llm.with_structured_output(schema, method="json_schema", **kwargs)
+            return primary.with_fallbacks([llm.with_structured_output(schema, method="function_calling", **kwargs)])
+    return llm.with_structured_output(schema, **kwargs)
+
+
+# The OpenAI request field that pins a conversation to one cache. Not a
+# declared ChatOpenAI field, so it rides in ``model_kwargs`` and lands as a
+# top-level request parameter on both the Responses and Completions shapes.
+PROMPT_CACHE_KEY_FIELD = "prompt_cache_key"
+
+# Retry in exactly one layer: `ReportedRetryMiddleware`, which reports each
+# attempt as MODEL_RETRYING, honours Retry-After and cools the credential
+# down when it gives up. Every provider SDK retries underneath by default
+# (Anthropic and OpenAI twice, Gemini six times), invisibly: four reported
+# attempts over two silent ones each was a minute of "retrying" the UI could
+# not explain, and a dead provider took that long to fall back. Gemini's
+# SDK reads 0 as "use the default", so 1 is its "once".
+SDK_RETRIES = 0
+SDK_RETRIES_GEMINI = 1
+
+
+def _retry_kwargs(provider: Provider) -> dict:
+    return {"max_retries": SDK_RETRIES_GEMINI if provider is Provider.GOOGLE_GENAI else SDK_RETRIES}
+
+
+#: The most a single OpenRouter reply may run to, reasoning included. A brief
+#: call writes about 4,000 tokens; this leaves room for deep reasoning and a
+#: long report. Claude Code's default reply limit is the same figure.
+OPENROUTER_REPLY_TOKENS = 32_000
+
+
+def _bound_reply(llm: Any, provider: Provider) -> Any:
+    """A reply limit for OpenRouter, which reserves credit against it.
+
+    ChatOpenRouter sends no ``max_tokens`` unless told, and OpenRouter then
+    holds the account's balance against the model's whole output limit before
+    the call starts: 131,072 tokens on DeepSeek V4 Flash. On 2026-11-10 every
+    eval trial died on that reservation (``PaymentRequiredResponseError``,
+    "can only afford 96603") while a trial actually writes about 4,100. A
+    customer on a small OpenRouter balance hits the same wall on every call,
+    and on an expensive model the reservation alone can exceed a few dollars.
+    A model whose profile lists a lower output limit gets that instead, since
+    asking for more than a model can write is a 400 on some hosts. Other
+    providers bill what was written and are left alone.
+    """
+    if provider is not Provider.OPENROUTER or getattr(llm, "max_tokens", None):
+        return llm
+    own = (getattr(llm, "profile", None) or {}).get("max_output_tokens")
+    limit = min(OPENROUTER_REPLY_TOKENS, own) if isinstance(own, int) and own > 0 else OPENROUTER_REPLY_TOKENS
+    try:
+        llm.max_tokens = limit
+    except (AttributeError, TypeError, ValueError):  # a model class that refuses assignment
+        logger.debug("lc: could not set a reply limit on %s", type(llm).__name__, exc_info=True)
+    return llm
+
+
+def _cache_kwargs(provider: Provider, cache_key: str) -> dict:
+    if provider is not Provider.OPENAI or not cache_key:
+        return {}
+    return {"model_kwargs": {PROMPT_CACHE_KEY_FIELD: cache_key}}
+
+
+def prompt_caching_middleware() -> list[AgentMiddleware]:
+    """What a ``create_agent`` graph mounts so Anthropic caches its prefix.
+
+    Anthropic bills a cached prefix at a tenth of the input price, but only
+    caches a request carrying ``cache_control``: nothing is cached by default.
+    ``create_deep_agent`` appends this middleware itself; a plain
+    ``create_agent`` gets nothing, so the audit re-bought its whole prompt at
+    full price on every call of its tool loop until this existed. Innermost
+    in the list, where deepagents puts it, so it marks the request a fallback
+    model actually sends. ``ignore`` makes it a no-op on every other model,
+    which is why it is safe to mount unconditionally.
+    """
+    return [AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore")]
+
+
+# ---------------------------------------------------------------------------
+# Stream translation
+# ---------------------------------------------------------------------------
+
+# What the model itself produced. A full AIMessage arrives when a node returns
+# one whole (a fake model, a non-streaming provider); chunks arrive from a
+# streaming call.
+MODEL_MESSAGE_TYPES = ("ai", "AIMessageChunk")
+
+
+def is_model_message(message: Any) -> bool:
+    """True for a message the model wrote, as opposed to one a node wrote into
+    the thread on the user's behalf (a steer) or a tool result."""
+    return getattr(message, "type", "") in MODEL_MESSAGE_TYPES
+
+
+def split_chunk(message: Any) -> tuple[str, str]:
+    """Separate visible text from reasoning in a stream chunk.
+
+    Providers differ: a plain string, or a list of typed blocks where reasoning
+    arrives as ``thinking`` / ``reasoning``. Unknown block types are ignored
+    rather than leaked into the artifact.
+    """
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content, ""
+    if not isinstance(content, list):
+        return "", ""
+
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == "text":
+            text_parts.append(block.get("text", ""))
+        elif kind in ("thinking", "reasoning"):
+            thinking_parts.append(block.get("thinking") or block.get("text", ""))
+    return "".join(text_parts), "".join(thinking_parts)
+
+
+# LangChain names a middleware's graph nodes ``<Middleware>.<hook>``. Those
+# nodes rewrite history — summarisation replaces it, context editing prunes
+# tool results — and their updates carry the *surviving* messages, old tool
+# calls included. Dispatching tool traffic from them replayed every earlier
+# fetch as a fresh STEP_STARTED after each compaction.
+MIDDLEWARE_NODE_SUFFIXES = (".before_model", ".after_model", ".before_agent", ".after_agent")
+SUMMARIZATION_NODE_MARK = "summarization"
+# What both summarisers stamp on their own model call (``metadata.lc_source``)
+# and on the summary message they write (``additional_kwargs.lc_source``).
+SUMMARIZATION_SOURCE = "summarization"
+# deepagents' summariser leaves the history in place and records the summary
+# and its cutoff under this state key instead.
+SUMMARIZATION_EVENT_KEY = "_summarization_event"
+
+
+def is_middleware_node(node: Any) -> bool:
+    return str(node).endswith(MIDDLEWARE_NODE_SUFFIXES)
+
+
+def is_summarization_node(node: Any) -> bool:
+    return SUMMARIZATION_NODE_MARK in str(node).lower()
+
+
+def is_summarization_call(meta: dict | None) -> bool:
+    """True for a streamed chunk of a summariser's own model call.
+
+    The node name is not enough. LangChain's `SummarizationMiddleware`
+    summarises in ``before_model`` and so has a node of its own, but
+    deepagents' summariser — the one every deep-rung session mounts — runs
+    inside ``wrap_model_call``, so its call streams from the ordinary
+    ``model`` node beside the reply it precedes. Matched on the node alone,
+    that summary streamed into the chat as the agent's prose, was billed as
+    ``thread`` and drew no compaction divider. Both summarisers tag the call
+    with ``lc_source``, and LangGraph carries it into the chunk's metadata.
+    """
+    meta = meta or {}
+    return meta.get("lc_source") == SUMMARIZATION_SOURCE or is_summarization_node(meta.get("langgraph_node"))
+
+
+# The framing each summariser wraps its summary in: LangChain's (and
+# deepagents' when offloading history failed) opens with this sentence;
+# deepagents' usual one names the offloaded file and puts the summary in
+# <summary> tags. The transcript shows the summary, not the framing. Greedy,
+# so a summary that quotes the tag keeps its tail.
+_SUMMARY_PREFIX = "Here is a summary of the conversation to date:"
+_SUMMARY_TAG = re.compile(r"<summary>(.*)</summary>", re.DOTALL)
+
+
+def compaction_summary(messages: Any) -> str:
+    """The summary a summariser just wrote, or "" when none is in the update.
+
+    The summariser tags its message (``additional_kwargs.lc_source ==
+    "summarization"``), which is the only stable handle on it: the message is
+    a HumanMessage like the user's own, so matching on type would be wrong the
+    moment a kept user turn sits beside it.
+    """
+    for message in messages or []:
+        kwargs = getattr(message, "additional_kwargs", None) or {}
+        if kwargs.get("lc_source") != SUMMARIZATION_SOURCE:
+            continue
+        text = getattr(message, "content", "")
+        if not isinstance(text, str):
+            continue
+        tagged = _SUMMARY_TAG.search(text)
+        if tagged:
+            return tagged.group(1).strip()
+        return text.removeprefix(_SUMMARY_PREFIX).strip()
+    return ""
+
+
+def _states(delta: Any) -> list[dict]:
+    return [d for d in (delta if isinstance(delta, list) else [delta]) if isinstance(d, dict)]
+
+
+def _served_model_id(name: Any, configured: Any) -> str:
+    """The id a call is priced and windowed by: the model that answered when
+    the response names one, else the thread's.
+
+    Ollama names its bare tag, which would read as a model Duct does not know
+    (no price, a 200k window it never had); it gets the namespace back.
+    """
+    if not name:
+        return str(getattr(configured, "value", configured) or "")
+    if is_ollama_model(configured) and not is_ollama_model(name):
+        return ollama_model_id(str(name))
+    if is_compatible_model(configured) and not is_compatible_model(name):
+        return compatible_model_id(str(name))
+    return str(name)
+
+
+class UsageTracker:
+    """Turn the per-chunk ``usage_metadata`` of a stream into one TOKEN_USAGE
+    per model call.
+
+    Providers attach usage to the last chunk of a call (Anthropic on
+    ``message_delta``, OpenAI on its final chunk), and LangChain defines chunk
+    usage as additive, so summing until the call's stop marker is right for
+    both shapes. A call with no stop marker — a non-streaming fake, a provider
+    that omits it — is flushed at the end of the turn.
+
+    ``scope`` says whose context the call filled: a subagent's calls run in a
+    nested namespace and count toward the bill, but the gauge follows the
+    thread the user is talking to.
+    """
+
+    def __init__(self, model: Any) -> None:
+        self.model = model
+        self._pending: dict | None = None
+
+    def feed(self, message: Any, meta: dict | None) -> dict | None:
+        usage = getattr(message, "usage_metadata", None)
+        response = getattr(message, "response_metadata", None) or {}
+        if usage:
+            if self._pending is None:
+                self._pending = {
+                    "input_tokens": 0, "output_tokens": 0,
+                    "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                    "model": "", "scope": _usage_scope(meta),
+                }
+            details = usage.get("input_token_details") or {}
+            self._pending["input_tokens"] += int(usage.get("input_tokens") or 0)
+            self._pending["output_tokens"] += int(usage.get("output_tokens") or 0)
+            self._pending["cache_read_tokens"] += int(details.get("cache_read") or 0)
+            self._pending["cache_creation_tokens"] += int(details.get("cache_creation") or 0)
+        if response.get("model_name") and self._pending is not None:
+            self._pending["model"] = _served_model_id(response["model_name"], self.model)
+        # Ollama names the end of a call `done_reason`.
+        if self._pending is not None and (
+            response.get("stop_reason") or response.get("finish_reason") or response.get("done_reason")
+        ):
+            return self.flush()
+        return None
+
+    def flush(self) -> dict | None:
+        if self._pending is None:
+            return None
+        usage, self._pending = self._pending, None
+        model = usage["model"] or getattr(self.model, "value", self.model) or ""
+        return {
+            "event": AgentEvent.TOKEN_USAGE,
+            **usage,
+            "model": str(model),
+            "total_tokens": usage["input_tokens"] + usage["output_tokens"],
+            "context_window": duct_window(model),
+            # None for a model the price table does not know: the tooltip then
+            # shows tokens without a dollar figure rather than a made-up one.
+            "cost_usd": cost_usd(
+                model,
+                input_tokens=usage["input_tokens"],
+                output_tokens=usage["output_tokens"],
+                cache_read_tokens=usage["cache_read_tokens"],
+                cache_creation_tokens=usage["cache_creation_tokens"],
+            ),
+        }
+
+
+def _usage_scope(meta: dict | None) -> str:
+    """``thread`` for the agent the user is talking to, ``subagent`` for a
+    model call nested inside one of its tool calls, ``compaction`` for the
+    summariser. All three count toward the bill; only the first drives the
+    context gauge — the summariser's prompt is the history being replaced,
+    not the context the next turn will run in.
+
+    Nesting is checked first: deepagents mounts a summariser on every
+    subagent too, and that one compacts the subagent's context, not the
+    thread's. Its state update never reaches this stream, so announcing it
+    as the thread's compaction would leave the chat "compacting" for good."""
+    meta = meta or {}
+    namespace = str(meta.get("langgraph_checkpoint_ns") or "")
+    if "tools:" in namespace or "|" in namespace:
+        return "subagent"
+    return "compaction" if is_summarization_call(meta) else "thread"
+
+
+def usage_from_messages(messages: list, model: Any) -> dict:
+    """The usage a stored thread shows on open: its last model call and the
+    running total, from the ``usage_metadata`` each AI message keeps.
+
+    Summarisation drops old messages, so the total is of what survives —
+    which is also what the next call will pay for again.
+    """
+    last: dict | None = None
+    total = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "calls": 0, "cost_usd": None}
+    for message in messages or []:
+        usage = getattr(message, "usage_metadata", None)
+        if not usage:
+            continue
+        details = usage.get("input_token_details") or {}
+        # The message may name the model that actually answered (a fallback);
+        # price by that when it does, else by the thread's configured model.
+        served = _served_model_id((getattr(message, "response_metadata", None) or {}).get("model_name"), model)
+        last = {
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "cache_read_tokens": int(details.get("cache_read") or 0),
+        }
+        last["cost_usd"] = cost_usd(
+            served,
+            input_tokens=last["input_tokens"],
+            output_tokens=last["output_tokens"],
+            cache_read_tokens=last["cache_read_tokens"],
+            cache_creation_tokens=int(details.get("cache_creation") or 0),
+        )
+        total["input_tokens"] += last["input_tokens"]
+        total["output_tokens"] += last["output_tokens"]
+        total["cache_read_tokens"] += last["cache_read_tokens"]
+        total["calls"] += 1
+        if last["cost_usd"] is not None:
+            total["cost_usd"] = round((total["cost_usd"] or 0.0) + last["cost_usd"], 6)
+    return {
+        "last": last,
+        "total": total,
+        "context_window": duct_window(model),
+        "model": str(getattr(model, "value", model) or ""),
+    }
+
+
+async def _dispatch_updates(
+    chunk: Any,
+    *,
+    on_todo: Callable[[list], Awaitable[None]] | None,
+    on_tool_use: Callable[[str, Any, str], Awaitable[None]] | None,
+    on_tool_result: Callable[[str, Any, str, bool], Awaitable[None]] | None,
+    on_compacted: Callable[[str], Awaitable[None]] | None = None,
+) -> None:
+    """Read one ``updates`` chunk for todos, tool traffic and compaction.
+
+    Defensive throughout: the shape is ``{node_name: state_delta}``, but
+    LangGraph also puts control keys (``__interrupt__``) alongside the nodes,
+    and middleware may deliver a list of deltas. Anything unrecognised is
+    skipped — a stream translator must never be the thing that ends a run.
+    """
+    if not isinstance(chunk, dict):
+        return
+    for node, delta in chunk.items():
+        if str(node).startswith("__"):
+            continue
+        if is_middleware_node(node):
+            # A summariser that returned messages replaced the history; the
+            # summary rides along so the transcript can show what it kept.
+            if (
+                on_compacted is not None
+                and is_summarization_node(node)
+                and any(state.get("messages") for state in _states(delta))
+            ):
+                await on_compacted(
+                    next((compaction_summary(s.get("messages")) for s in _states(delta) if s.get("messages")), "")
+                )
+            continue
+        for state in delta if isinstance(delta, list) else [delta]:
+            if not isinstance(state, dict):
+                continue
+            event = state.get(SUMMARIZATION_EVENT_KEY)
+            if on_compacted is not None and isinstance(event, dict):
+                # deepagents' summariser runs inside the model node, so its
+                # summary arrives here, on the model's own update, rather
+                # than from a middleware node of its own.
+                await on_compacted(compaction_summary([event.get("summary_message")]))
+            todos = state.get("todos")
+            if todos and on_todo is not None:
+                await on_todo(list(todos))
+            for msg in state.get("messages") or []:
+                for call in getattr(msg, "tool_calls", None) or []:
+                    if on_tool_use is not None and isinstance(call, dict):
+                        await on_tool_use(
+                            call.get("name", ""), call.get("args"), call.get("id", "") or ""
+                        )
+                if getattr(msg, "type", "") == "tool" and on_tool_result is not None:
+                    await on_tool_result(
+                        getattr(msg, "name", "") or "",
+                        getattr(msg, "content", ""),
+                        getattr(msg, "tool_call_id", "") or "",
+                        getattr(msg, "status", "") == "error",
+                    )
+
+
+def _turn_input(prompt: str | Command | None) -> Any:
+    """What ``astream`` is fed for one turn.
+
+    A string is a fresh user message. ``None`` continues whatever the thread was
+    doing — an unfinished run picks up from its last checkpoint, and a parked
+    one re-raises its live pauses (which is how a resumed session shows the
+    question it is still waiting on). A ``Command`` is a resume with answers.
+    """
+    if isinstance(prompt, str):
+        return {"messages": [{"role": "user", "content": prompt}]}
+    return prompt
+
+
+def pause_from_interrupt(item: Any) -> dict | None:
+    """The SSE payload for one LangGraph ``Interrupt``, or None if it is not ours.
+
+    Every Duct pause is raised through ``interrupt_pause`` and so carries its
+    ``event``. Anything else — a ``interrupt_on`` review from deepagents'
+    middleware, a subagent's ad-hoc interrupt — has no card in the UI and is
+    reported as a failed turn rather than guessed at.
+    """
+    value = getattr(item, "value", None)
+    if not isinstance(value, dict) or not value.get("event"):
+        return None
+    return {**value, "interrupt_id": getattr(item, "id", "") or ""}
+
+
+def live_pauses(snapshot: Any) -> list[dict]:
+    """The pauses a thread is still parked on, from ``aget_state``.
+
+    Read off the tasks, not ``snapshot.interrupts``. A pause is live only
+    while its task has no result — until langgraph 1.2.13 (#9103) the field
+    still listed an interrupt whose task had completed while the superstep's
+    other task was pending, and the UI re-showed the answered card. The
+    field agrees now; the task result is the ground truth either way, and
+    ``pause_from_interrupt`` still has to drop interrupts that are not ours.
+    """
+    out: list[dict] = []
+    for task in getattr(snapshot, "tasks", ()) or ():
+        if getattr(task, "result", None) is not None:
+            continue
+        for item in getattr(task, "interrupts", ()) or ():
+            pause = pause_from_interrupt(item)
+            if pause is not None:
+                out.append(pause)
+    return out
+
+
+class _InspectionModel(FakeListChatModel):
+    """A chat model that is never called.
+
+    ``aget_state`` needs a compiled graph to work out ``next``, and compiling a
+    deepagents graph needs a model object — but reading a thread makes no model
+    call, so a placeholder is the honest choice over resolving a real provider
+    (and a real key) for a lookup.
+    """
+
+    def bind_tools(self, tools, **kwargs):  # noqa: ARG002 - never invoked
+        return self
+
+
+def inspection_chat_model() -> Any:
+    """The placeholder model for building an agent only to read its thread."""
+    return _InspectionModel(responses=[""])
+
+
+# ---------------------------------------------------------------------------
+# Retries that say so
+# ---------------------------------------------------------------------------
+
+# Four attempts is ~7 s of waiting at the default backoff (1, 2, 4 s) — about
+# what a rate-limit window or an overloaded provider needs, and short enough
+# that a user watching the status row is not left wondering.
+MODEL_RETRY_ATTEMPTS = 4
+MODEL_RETRY_INITIAL_DELAY = 1.0
+MODEL_RETRY_MAX_DELAY = 8.0
+# A provider's own Retry-After wins over the schedule above, up to this long.
+# Past it the call is not retried at all (see ReportedRetryMiddleware): the
+# user is better served by a failure they can act on now than by a status row
+# counting down a minute and then failing anyway.
+MODEL_RETRY_HEADER_MAX_DELAY = 30.0
+_RETRY_JITTER = 0.25
+
+
+def retry_delay(attempt: int, exc: BaseException | None = None) -> float:
+    """Seconds to wait after the ``attempt``-th failure (1-based).
+
+    What the provider asked for if it said (``Retry-After``), otherwise the
+    jittered exponential schedule.
+    """
+    asked = retry_after_seconds(exc) if exc is not None else None
+    if asked is not None:
+        return min(asked, MODEL_RETRY_HEADER_MAX_DELAY)
+    delay = min(MODEL_RETRY_INITIAL_DELAY * 2 ** (attempt - 1), MODEL_RETRY_MAX_DELAY)
+    return max(0.0, delay + random.uniform(-delay * _RETRY_JITTER, delay * _RETRY_JITTER))
+
+
+async def _retry_sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+def emit_custom(payload: dict) -> None:
+    """Put a Duct event on the run's ``custom`` stream, if there is one.
+
+    ``stream_agent`` forwards custom chunks that carry an ``event``, so this is
+    how anything running inside the graph — a tool, a middleware — reaches the
+    SSE stream without holding the session's emit. Outside a run it is a no-op:
+    a unit test that calls the middleware directly must not need a graph.
+    """
+    try:
+        writer = get_stream_writer()
+    except Exception:  # noqa: BLE001 - no run context
+        return
+    if writer is not None:
+        writer(payload)
+
+
+def chat_message_text(chat_msg: Any) -> str:
+    """A queued chat message as plain text.
+
+    ``routes/agents.py`` queues ``{"role": "user", "content": ...}`` where the
+    content is a string or a content-block list (image uploads), so unwrap the
+    envelope and flatten the list form rather than handing either to a prompt
+    slot. Plain strings are accepted too — that is what a runner's internal
+    nudges put on the same queue.
+    """
+    if isinstance(chat_msg, dict):
+        chat_msg = chat_msg.get("content", "")
+    if isinstance(chat_msg, str):
+        return chat_msg
+    if isinstance(chat_msg, list):
+        return "\n".join(
+            block.get("text", "")
+            for block in chat_msg
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return str(chat_msg or "")
+
+
+def drain_steers(queue: Any) -> list[tuple[Any, str]]:
+    """Everything waiting on a steer queue, as (message, client id), without
+    blocking. Empty when there is no queue."""
+    out: list[tuple[Any, str]] = []
+    if queue is None:
+        return out
+    while True:
+        try:
+            item = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return out
+        out.append(take_client_id(item))
+
+
+def steer_messages(items: list[tuple[Any, str]]) -> list[HumanMessage]:
+    """User messages for steered items; each consumed one is reported."""
+    messages: list[HumanMessage] = []
+    for item, client_id in items:
+        content = item.get("content") if isinstance(item, dict) else item
+        if content is None or content == "":
+            continue
+        messages.append(HumanMessage(content=content))
+        if client_id:
+            emit_custom({"event": AgentEvent.USER_INPUT_CONSUMED, "client_message_id": client_id})
+    return messages
+
+
+# ---------------------------------------------------------------------------
+# Emergency compaction
+# ---------------------------------------------------------------------------
+
+# How much of the most recent history survives an emergency compaction, in
+# tokens. pi keeps the same 20k; enough for the turn in progress to keep its
+# footing, small enough that the retried request fits with room to answer.
+COMPACT_KEEP_TOKENS = 20_000
+# The node whose successor is the model call. Writing the rewritten history
+# "as" this node makes the graph's next step the request that just failed,
+# now with the smaller context — the same place the loop would have been had
+# a tool batch just finished.
+_RESUME_AS_NODE = "tools"
+
+
+async def compact_thread(agent: Any, config: dict, model: Any, *, keep_tokens: int | None = None) -> str | None:
+    """Summarise a thread's history in place so the next model call fits.
+
+    The automatic summariser works from an estimate, and the provider counts
+    for real; when the two disagree the request comes back as "too long" and,
+    before this, the conversation was over — "start fresh" was the only action
+    offered, an hour into an insights thread. OpenCode and pi both make one
+    bounded compact-and-retry attempt at that point; so does this.
+
+    LangChain's own `SummarizationMiddleware` does the cutting (never between
+    a tool call and its result) and the summary, forced by a trigger of one
+    message; the rewrite replaces the thread's messages with the summary plus
+    the most recent ``keep_tokens`` worth. deepagents' summariser keeps its own
+    event with a cutoff *index* into the message list, which the rewrite would
+    leave pointing past the end — and its fallback for that is to send the
+    model the summary alone — so the event is cleared in the same write.
+
+    Returns the summary it wrote (the transcript shows it under the
+    compaction divider), or None when there is nothing to cut, which the
+    caller treats as the ordinary failure.
+    """
+    snapshot = await agent.aget_state(config)
+    values = getattr(snapshot, "values", None) or {}
+    messages = list(values.get("messages") or [])
+    if not messages:
+        return None
+    summariser = SummarizationMiddleware(
+        model=model,
+        trigger=("messages", 1),
+        keep=("tokens", keep_tokens or COMPACT_KEEP_TOKENS),
+    )
+    update = await summariser.abefore_model({"messages": messages}, None)  # type: ignore[arg-type]
+    if not update:
+        return None
+    await agent.aupdate_state(
+        config, {**update, SUMMARIZATION_EVENT_KEY: None}, as_node=_RESUME_AS_NODE
+    )
+    return compaction_summary(update.get("messages"))
+
+
+class SeenImagePruneMiddleware(AgentMiddleware):
+    """Drop image bytes from a tool result once the model has looked at it.
+
+    A content run on Anthropic gets every generated or rendered image back
+    as a base64 block so the model can critique what it made — 50–400 KB a
+    time. The thread is durable: the Postgres saver writes the whole
+    ``messages`` channel on every superstep, so each image would be copied
+    into every later checkpoint of the conversation, and the context pruner
+    (ContextEditingMiddleware) trims only the model *request*, never state.
+
+    ``after_model`` runs after a model call, and a tool result always
+    precedes the call that reads it, so any image block present here has
+    been seen exactly once. The replacement keeps the message id (the
+    reducer swaps in place), the text block with the asset URL, and a note
+    saying where the picture went.
+    """
+
+    PLACEHOLDER = "[image shown once; the file is at the asset_url in this result]"
+
+    def _prune(self, state) -> dict | None:
+        replacements = []
+        for message in state.get("messages") or []:
+            if getattr(message, "type", "") != "tool" or not isinstance(message.content, list):
+                continue
+            if not any(_is_image_block(block) for block in message.content):
+                continue
+            content = [
+                {"type": "text", "text": self.PLACEHOLDER} if _is_image_block(block) else block
+                for block in message.content
+            ]
+            replacements.append(message.model_copy(update={"content": content}))
+        return {"messages": replacements} if replacements else None
+
+    def after_model(self, state, runtime):  # type: ignore[override]
+        del runtime
+        return self._prune(state)
+
+    async def aafter_model(self, state, runtime):  # type: ignore[override]
+        del runtime
+        return self._prune(state)
+
+
+def _is_image_block(block: Any) -> bool:
+    return isinstance(block, dict) and block.get("type") == "image" and bool(block.get("base64"))
+
+
+class SteerMiddleware(AgentMiddleware):
+    """Hand the model what the user typed while it was working.
+
+    Codex drains its pending input at the top of every model call; this is
+    that, as a ``before_model`` hook — a node in the graph, so the injected
+    message is checkpointed with the rest of the thread and survives a
+    restart. The message lands after whatever tool result the model was
+    waiting on, which is the earliest point it could honestly be read.
+
+    What arrives after the turn's last model call is not lost: the runner
+    checks the queue when a turn ends and starts a follow-up with it.
+    """
+
+    def __init__(self, session: Any) -> None:
+        super().__init__()
+        self.session = session
+
+    def _drain(self) -> dict | None:
+        messages = steer_messages(drain_steers(getattr(self.session, "steer_queue", None)))
+        return {"messages": messages} if messages else None
+
+    def before_model(self, state, runtime):  # type: ignore[override]
+        del state, runtime
+        return self._drain()
+
+    async def abefore_model(self, state, runtime):  # type: ignore[override]
+        del state, runtime
+        return self._drain()
+
+
+class ReportedRetryMiddleware(AgentMiddleware):
+    """Retry a model call on a transient failure, and tell the UI each time.
+
+    LangChain's ``ModelRetryMiddleware`` does the retrying but has no
+    per-attempt hook, so from the browser a 429 with three retries behind it
+    looked like a 10-second hang. Codex shows "Reconnecting… 2/5" in its status
+    row for exactly this; MODEL_RETRYING is that event.
+
+    What counts as transient is ``agents/core/errors.is_retryable`` — the same
+    classifier that stamps the code on the failure event once attempts run out,
+    so a rate limit retries and a rejected API key fails on the first try.
+    """
+
+    def __init__(
+        self,
+        *,
+        attempts: int = MODEL_RETRY_ATTEMPTS,
+        identity: str = "",
+        provider: Provider | None = None,
+    ) -> None:
+        super().__init__()
+        self.attempts = max(1, attempts)
+        # Who to cool down when the retries were not enough. Both empty for a
+        # caller that injected its own model — there is no credential of ours
+        # to attribute the limit to, and guessing one would bench a tier for
+        # somebody else.
+        self.identity = identity
+        self.provider = provider
+
+    def _report(self, exc: Exception, attempt: int, delay: float) -> None:
+        code = classify_error(exc)
+        logger.warning(
+            "model call failed (%s), retrying %d/%d in %.1fs", code, attempt, self.attempts, delay
+        )
+        # `retry_in` is a duration, not a timestamp: the client anchors it to
+        # its own clock on receipt, so a skewed server clock cannot show a
+        # countdown that is already over.
+        emit_custom({
+            "event": AgentEvent.MODEL_RETRYING,
+            "attempt": attempt,
+            "max_attempts": self.attempts,
+            "code": code,
+            "retry_in": round(delay, 1),
+        })
+
+    def _give_up(self, exc: Exception, attempt: int) -> bool:
+        if attempt >= self.attempts or not is_retryable(exc):
+            return self._done(exc)
+        # A provider asking for longer than the cap is not "having a moment";
+        # waiting the cap and retrying only fails again. pi fails immediately
+        # above its limit for the same reason, and the code on the failure
+        # ("rate limited") is the truth the user can act on.
+        asked = retry_after_seconds(exc)
+        if asked is not None and asked > MODEL_RETRY_HEADER_MAX_DELAY:
+            return self._done(exc)
+        return False
+
+    def _done(self, exc: Exception) -> bool:
+        """Always gives up. Records a rate limit on the way out.
+
+        This is the one place that knows the difference between a provider
+        having a moment and a provider genuinely out of quota — everything
+        above it is still retrying. Only RATE_LIMITED is recorded: a rejected
+        key must keep failing loudly rather than quietly demoting a tier for
+        five minutes.
+        """
+        if self.identity and self.provider is not None:
+            if classify_error(exc) is ErrorCode.RATE_LIMITED:
+                note_exhausted(self.identity, self.provider, seconds=retry_after_seconds(exc))
+        return True
+
+    def _span(self, request):
+        """One ``chat`` span per attempt. This middleware is the innermost
+        wrapper around the model call, so a span opened here measures the
+        provider and nothing else — the turn-level span in ``stream_agent``
+        measures everything, and the difference between them is the tool
+        time."""
+        chat = getattr(request, "model", None)
+        name = getattr(chat, "model_name", None) or getattr(chat, "model", None) or "unknown"
+        return model_span(
+            provider=self.provider.value if self.provider is not None else "unknown",
+            model=str(name),
+        )
+
+    async def awrap_model_call(self, request, handler):  # type: ignore[override]
+        for attempt in range(1, self.attempts + 1):
+            try:
+                with self._span(request):
+                    return await handler(request)
+            except Exception as exc:
+                if self._give_up(exc, attempt):
+                    raise
+                delay = retry_delay(attempt, exc)
+                self._report(exc, attempt, delay)
+                await _retry_sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def wrap_model_call(self, request, handler):  # type: ignore[override]
+        for attempt in range(1, self.attempts + 1):
+            try:
+                with self._span(request):
+                    return handler(request)
+            except Exception as exc:
+                if self._give_up(exc, attempt):
+                    raise
+                delay = retry_delay(attempt, exc)
+                self._report(exc, attempt, delay)
+                time.sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+class TurnClock:
+    """Where one turn's wall-clock went, for the line logged at its end.
+
+    The transcript already holds every timestamp; this prints the answer
+    instead of leaving it to an evening with a SQL script. Tool calls are
+    timed from the ``tool_use`` in the model's message to the matching
+    ``tool`` message, so a sub-agent dispatch counts as one long tool call,
+    which is what it costs the person waiting. Parallel calls overlap, so
+    the tool total can exceed the turn — read it as "time the model was
+    waiting on something", not as a partition of the turn.
+    """
+
+    SLOWEST_SHOWN = 3
+
+    def __init__(self) -> None:
+        self.started = time.perf_counter()
+        self._open: dict[str, tuple[str, float]] = {}
+        self._done: list[tuple[str, float]] = []
+
+    def tool_started(self, name: str, tool_use_id: str) -> None:
+        self._open[tool_use_id] = (name, time.perf_counter())
+
+    def tool_finished(self, name: str, tool_use_id: str) -> None:
+        opened = self._open.pop(tool_use_id, None)
+        started = opened[1] if opened else time.perf_counter()
+        self._done.append((opened[0] if opened else name, time.perf_counter() - started))
+
+    def summary(self) -> str:
+        elapsed = time.perf_counter() - self.started
+        if not self._done:
+            return f"turn {elapsed:.1f}s, no tool calls"
+        tools = sum(seconds for _, seconds in self._done)
+        slowest = ", ".join(
+            f"{name} {seconds:.1f}s"
+            for name, seconds in sorted(self._done, key=lambda item: -item[1])[: self.SLOWEST_SHOWN]
+        )
+        return (
+            f"turn {elapsed:.1f}s: {len(self._done)} tool calls {tools:.1f}s "
+            f"(slowest {slowest}), model+overhead ~{max(elapsed - tools, 0):.1f}s"
+        )
+
+
+async def stream_agent(
+    agent: Any,
+    prompt: str | Command | None,
+    emit: Callable,
+    *,
+    on_artifact_chunk_event: str = AgentEvent.ARTIFACT_CHUNK,
+    on_artifact_close: Callable,
+    log_prefix: str = "agent-v1",
+    config: dict | None = None,
+    provider: Provider | None = None,
+    model: ModelName | str = "",
+    conversation_id: str = "",
+    user_id: str = "",
+    on_todo: Callable[[list], Awaitable[None]] | None = None,
+    on_tool_use: Callable[[str, Any, str], Awaitable[None]] | None = None,
+    on_tool_result: Callable[[str, Any, str, bool], Awaitable[None]] | None = None,
+    on_pause: Callable[[list[dict]], Awaitable[None]] | None = None,
+) -> list[dict]:
+    """Drive one agent turn and translate its stream into Duct's SSE vocabulary.
+
+    Emits the same ``AgentEvent`` values as the V3 (Claude Agent SDK) runners so
+    the frontend is unchanged: AGENT_MESSAGE_CHUNK for prose, ARTIFACT_CHUNK for
+    tokens inside ``<duct_artifact>``, THINKING_CHUNK for reasoning deltas,
+    MESSAGE_STOP at the end of the turn.
+
+    ``prompt`` is a user message, ``None`` to continue the thread, or a
+    ``Command`` to resume it with answers — see ``_turn_input``.
+
+    Returns the pauses the turn ended on: the run is parked on every one of
+    them and continues only when each is resumed by id. They are emitted as
+    their SSE events *before* MESSAGE_STOP, so the transcript closes the
+    streaming bubble with the card already in place. An empty list means the
+    turn ran to completion. ``on_pause`` receives the same list *before* the
+    events go out — the answer route has to know what the run is parked on by
+    the time a client could possibly reply, and a client replies fast.
+
+    Custom stream chunks — anything a tool writes through LangGraph's stream
+    writer — are forwarded when they carry an ``event``, so progress emitted
+    from inside a tool (or a subagent's tool) reaches the UI on the same wire.
+
+    The optional ``on_todo`` / ``on_tool_*`` hooks read the ``updates`` stream.
+    They default to ``None``, so a caller that wants only prose gets exactly the
+    behaviour this had before they existed.
+    """
+    parser = DuctArtifactStreamParser(
+        on_text=lambda text: emit({"event": AgentEvent.AGENT_MESSAGE_CHUNK, "text": text}),
+        on_artifact_chunk=lambda text: emit({"event": on_artifact_chunk_event, "text": text}),
+        on_artifact_close=on_artifact_close,
+        log_prefix=log_prefix,
+    )
+
+    # The turn is an `invoke_agent` span; each model call inside it is a
+    # `chat` span from ReportedRetryMiddleware and each tool call a span from
+    # its binder. See core/telemetry.py for where they go.
+    usage = UsageTracker(model)
+    # The summariser's text while its call streams; None when none is running.
+    summary_parts: list[str] | None = None
+    # Summaries already announced from the message stream whose state update
+    # has yet to arrive — see where it is incremented.
+    announced = 0
+    clock = TurnClock()
+
+    async def _compacted(summary: str) -> None:
+        nonlocal summary_parts
+        summary_parts = None
+        await emit({"event": AgentEvent.CONTEXT_COMPACTED, "summary": summary})
+
+    async def _on_compacted(summary: str) -> None:
+        nonlocal announced
+        if announced:
+            announced -= 1
+            return
+        await _compacted(summary)
+
+    async def _timed_tool_use(name: str, tool_input: Any, tool_use_id: str) -> None:
+        clock.tool_started(name, tool_use_id)
+        if on_tool_use is not None:
+            await on_tool_use(name, tool_input, tool_use_id)
+
+    async def _timed_tool_result(name: str, result: Any, tool_use_id: str, is_error: bool) -> None:
+        clock.tool_finished(name, tool_use_id)
+        if on_tool_result is not None:
+            await on_tool_result(name, result, tool_use_id, is_error)
+
+    turn_config = dict(config or {})
+    if conversation_id:
+        from service.analytics import langchain_callback
+
+        callback = langchain_callback(
+            session_id=conversation_id,
+            distinct_id=user_id,
+        )
+        if callback is not None:
+            turn_config["callbacks"] = [*(turn_config.get("callbacks") or []), callback]
+
+    with model_span(
+        provider=(provider or Provider.ANTHROPIC).value,
+        model=getattr(model, "value", model) or "unknown",
+        operation=OP_INVOKE_AGENT,
+        conversation_id=conversation_id,
+        agent_name=log_prefix,
+    ):
+        pauses: list[dict] = []
+        foreign_interrupts = 0
+        async for mode, chunk in agent.astream(
+            _turn_input(prompt),
+            turn_config,
+            stream_mode=["messages", "updates", "custom"],
+        ):
+            if mode == "custom":
+                if isinstance(chunk, dict) and chunk.get("event"):
+                    await emit(dict(chunk))
+                continue
+            if mode == "updates":
+                if isinstance(chunk, dict):
+                    for item in chunk.get("__interrupt__") or ():
+                        pause = pause_from_interrupt(item)
+                        if pause is None:
+                            foreign_interrupts += 1
+                        else:
+                            pauses.append(pause)
+                await _dispatch_updates(
+                    chunk,
+                    on_todo=on_todo,
+                    on_tool_use=_timed_tool_use,
+                    on_tool_result=_timed_tool_result,
+                    on_compacted=_on_compacted,
+                )
+                continue
+            if mode != "messages":
+                continue
+            message, meta = chunk
+            if not is_model_message(message):
+                # LangGraph's messages stream also carries any message a node
+                # *writes* — and SteerMiddleware writes the user's own words.
+                # Streamed on, a message typed mid-turn came back as a grey
+                # bubble, as if the agent had said it.
+                continue
+            meta = meta if isinstance(meta, dict) else {}
+            scope = _usage_scope(meta)
+            if scope == "compaction" and summary_parts is None:
+                summary_parts = []
+                await emit({"event": AgentEvent.CONTEXT_COMPACTING})
+            elif scope == "thread" and summary_parts is not None:
+                # deepagents summarises inside the model call it is about to
+                # make, so its state update lands only after the reply that
+                # already runs on the summary. Announced from the update, the
+                # divider would sit below that reply and the gauge would mark
+                # the new, smaller context stale. The reply's first chunk is
+                # when the summary took effect; the update is then skipped as
+                # a repeat. (LangChain's summariser has a node of its own,
+                # whose update arrives before any reply and announces it.)
+                announced += 1
+                await _compacted("".join(summary_parts).strip())
+            billed = usage.feed(message, meta)
+            if billed is not None:
+                await emit(billed)
+            if scope == "compaction":
+                # The summariser's output is history, not a reply. It used to
+                # stream into the transcript as if the agent had said it.
+                summary_parts.append(split_chunk(message)[0])
+                continue
+            if scope == "subagent":
+                # A subagent's tokens are its report to the *agent*, which
+                # relays what matters; they are billed above and nothing
+                # else. Streamed as prose they read as the agent talking —
+                # and a draft_post subagent's report is a whole PostDraft
+                # in JSON, which is how a raw payload landed in the chat.
+                continue
+            text, thinking = split_chunk(message)
+            if thinking:
+                await emit({"event": AgentEvent.THINKING_CHUNK, "text": thinking})
+            if text:
+                await parser.feed(text)
+
+    # The parser holds back the last few characters of every chunk in case they
+    # are a split `<duct_artifact>` open tag, so a turn's tail only reaches the
+    # stream on flush. Both V3 runners do this at their message_stop; V1 did
+    # not, which silently truncated every turn by up to 14 characters — visible
+    # as a short chat reply vanishing entirely.
+    await parser.flush()
+    billed = usage.flush()
+    if billed is not None:
+        await emit(billed)
+    if on_pause is not None:
+        await on_pause(list(pauses))
+    for pause in pauses:
+        await emit(dict(pause))
+    if foreign_interrupts:
+        # The thread is parked on something no card can answer. Say so rather
+        # than leave the UI in "working" forever; the next user message starts
+        # a fresh turn on the same thread.
+        logger.warning("%s: %d interrupt(s) without a Duct event", log_prefix, foreign_interrupts)
+        await emit({
+            "event": AgentEvent.STEP_FAILED,
+            "status": StepStatus.ERROR,
+            "error": "The agent paused on something this app cannot answer. Try rephrasing.",
+        })
+    await emit({"event": AgentEvent.MESSAGE_STOP})
+    logger.info("%s: %s", log_prefix, clock.summary())
+    return pauses

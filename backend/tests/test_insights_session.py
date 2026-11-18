@@ -1,0 +1,1218 @@
+"""Autonomous insights session — assembly, event contract, and the chat loop.
+
+Phase 1 of `docs/engineering/2026-08-31-autonomous-insights-agent-plan.md`: insights stops
+being a request-shaped pipeline and becomes a session like audit and content.
+What matters, and what these pin:
+
+  * the frontend cannot tell which agent or harness served a run — only the
+    shared `AgentEvent` vocabulary reaches the stream;
+  * `deepagents` mounts a VIRTUAL filesystem, not the real one, so an
+    autonomous loop cannot reach Duct's source or the host;
+  * an unremembered session gets no memory tools at all — the agent cannot
+    write what it cannot reach;
+  * the session stays open after the opening turn and each follow-up continues
+    the SAME thread rather than restarting one.
+
+Fake chat model throughout — no API key, no network.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+
+import pytest
+from langchain_core.messages import AIMessage
+
+from agents.core import lc
+from agents.core.errors import ErrorCode
+from agents.core.events import AgentEvent
+from agents.core.lc import _dispatch_updates
+from routes.agents import AgentMessage, send_message
+from agents.insights.prompts.autonomous import (
+    build_insights_system_prompt,
+    build_insights_user_prompt,
+)
+from agents.insights.schema import InsightsRequest, InsightsSession, create_insights_session
+from agents.insights.v1.runner import AutonomousInsightsRunner
+
+
+from tests.fakes import (
+    AuthenticationError,
+    FlakyFake,
+    OverflowFake,
+    RaisingFake,
+    RateLimitError,
+    ToolCallingFake,
+    fake_llm as _fake,
+    tool_names as _tool_names,
+)
+
+
+@pytest.fixture
+def session() -> InsightsSession:
+    return create_insights_session(str(uuid.uuid4()))
+
+
+QUESTION = {"question": "Which goal matters most?", "header": "Goal"}
+
+
+def _asks_then_answers(*replies: str):
+    """A model that asks one clarifying question, then answers with `replies`."""
+    return ToolCallingFake(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "AskUserQuestion",
+                    "args": {"questions": [QUESTION]},
+                    "id": "ask_1",
+                }],
+            ),
+            *[AIMessage(content=r) for r in replies],
+        ]
+    )
+
+
+def _kinds(emitted) -> list[str]:
+    return [e["event"] for e in emitted.events]
+
+
+RUNNER = AutonomousInsightsRunner(api_key="unused-no-network")
+
+
+# ---------------------------------------------------------------------------
+# Request shape
+# ---------------------------------------------------------------------------
+
+def test_a_project_and_a_sentence_is_a_complete_request():
+    """The whole point of the rewrite: no connectors, accounts, goal or dates.
+
+    If this ever needs more fields to validate, the wizard is growing back.
+    """
+    req = InsightsRequest.model_validate({"project_id": "p1", "prompt": "why did CPA jump?"})
+
+    assert req.prompt == "why did CPA jump?"
+    assert req.remember is True
+    assert req.focus == ""  # an optional steer, never a required mode
+
+
+def test_request_rejects_unknown_fields():
+    with pytest.raises(Exception):
+        InsightsRequest.model_validate({"project_id": "p1", "customer_id": "123-456"})
+
+
+# ---------------------------------------------------------------------------
+# Prompt assembly
+# ---------------------------------------------------------------------------
+
+def test_system_prompt_is_byte_identical_across_sessions():
+    """The cached prefix must not vary per customer — per-project data belongs
+    in the user turn (service/memory.py, and the same rule audit and content
+    follow)."""
+    assert build_insights_system_prompt() == build_insights_system_prompt()
+
+
+def test_system_prompt_describes_the_tools_actually_mounted():
+    """The capability stanza tracks what is really mounted, phase by phase. An
+    agent that believes it can fetch data it cannot produces a confident, wrong
+    brief — the exact failure this agent exists to eliminate."""
+    prompt = build_insights_system_prompt()
+
+    for tool in ("FetchData", "ReadConnectorNotes", "ListDataSources", "SelectAccount"):
+        assert tool in prompt
+
+
+def test_system_prompt_carries_the_catalog_and_the_notes_index():
+    """Both are identical for every customer, so they belong in the cached
+    prefix — and the agent cannot name an entity it has never been shown."""
+    prompt = build_insights_system_prompt()
+
+    assert "<entity_catalogs>" in prompt
+    assert "search_terms" in prompt          # a catalog entity
+    assert "ReadConnectorNotes" in prompt
+    assert "`stripe`" in prompt              # a notes index entry
+
+
+def test_user_turn_carries_the_per_project_blocks():
+    out = build_insights_user_prompt(
+        prompt="how is paid search doing?",
+        business_context="<business_context>\nBusiness: Acme\n</business_context>",
+        memory="<project_memory>\nTarget CPA is $45\n</project_memory>",
+    )
+
+    assert "Acme" in out
+    assert "Target CPA is $45" in out
+    assert "<request>" in out and "how is paid search doing?" in out
+
+
+def test_user_turn_carries_what_the_project_can_reach():
+    """ListDataSources, answered before the first model call: the block rides
+    in the user turn (per-project, never the cached prefix) and the prompt
+    tells the agent to read it rather than call the tool first."""
+    from agents.insights.setup import render_data_sources
+
+    block = render_data_sources([
+        {"connector_id": "google_ads", "status": "bound", "account_id": "123-456", "account_name": "Acme"},
+        {"connector_id": "gsc", "status": "available"},
+        {"connector_id": "ga4", "status": "not_connected", "auth_kind": "oauth"},
+        {"connector_id": "mixpanel", "status": "not_connected", "auth_kind": "manual"},
+    ])
+    out = build_insights_user_prompt(prompt="how is the site doing?", data_sources=block)
+
+    assert "<data_sources>" in out
+    assert 'google_ads: bound → 123-456 "Acme"' in out
+    assert "gsc: available" in out and "SelectAccount" in out
+    assert "ga4: not_connected" in out and "RequestConnection" in out
+    assert "mixpanel: not_connected" in out and "Toolbox" in out
+    # The prefix names the block so the agent reads it; the block itself is
+    # per-project and never enters the cached system prompt.
+    assert "<data_sources>" in build_insights_system_prompt()
+    assert "123-456" not in build_insights_system_prompt()
+    assert render_data_sources([]) == ""
+
+
+def test_empty_prompt_becomes_an_opening_instruction():
+    """Opening a session without typing anything is a normal entry point."""
+    out = build_insights_user_prompt(prompt="")
+
+    assert out.strip()
+    assert out != build_insights_user_prompt(prompt="status?")
+
+
+# ---------------------------------------------------------------------------
+# Agent assembly
+# ---------------------------------------------------------------------------
+
+def test_filesystem_tools_are_virtual_not_the_real_disk():
+    """deepagents' default backend is graph state, so `read_file` cannot reach
+    Duct's source or the host. No Bash tool exists at all — the guarantee the
+    product makes about agent isolation."""
+    names = _tool_names(RUNNER.build_agent(llm=_fake("ok")))
+
+    assert {"read_file", "write_file", "ls"} <= names
+    assert "Bash" not in names and "bash" not in names
+
+
+def test_planning_is_off_and_the_verifier_is_on():
+    """No ``write_todos`` for insights: measured, two of five model turns in a
+    brief did nothing but rewrite the checklist. Progress comes from the tool
+    traffic instead (fetch steps, the verifier's dispatch chip), so the
+    sub-agent tool is the one that must be there."""
+    names = _tool_names(RUNNER.build_agent(llm=_fake("ok")))
+    assert "write_todos" not in names
+    assert "task" in names
+
+
+def test_memory_tools_need_a_project(session, emitted):
+    unscoped = RUNNER.build_agent(llm=_fake("ok"), project_id=None)
+    scoped = RUNNER.build_agent(llm=_fake("ok"), project_id=uuid.uuid4())
+
+    assert "RememberFact" not in _tool_names(unscoped)
+    assert {"RememberFact", "SearchMemory", "GetMemory"} <= _tool_names(scoped)
+
+
+def test_unremembered_session_gets_no_memory_tools():
+    """"Don't remember this" is enforced by absence, not by instruction: the
+    agent cannot write what it cannot reach."""
+    agent = RUNNER.build_agent(llm=_fake("ok"), project_id=uuid.uuid4(), remember=False)
+
+    assert "RememberFact" not in _tool_names(agent)
+
+
+def test_connector_discovery_is_mounted(session, emitted):
+    """The tools that replace the wizard's first four steps."""
+    agent = RUNNER.build_agent(
+        llm=_fake("ok"), project_id=uuid.uuid4(), user_id=uuid.uuid4(),
+        session=session, session_id=session.session_id, emit=emitted,
+    )
+
+    assert {"ListDataSources", "SelectAccount", "RequestConnection"} <= _tool_names(agent)
+
+
+def test_tools_that_pause_need_a_session_and_a_project(session, emitted):
+    """A tool that cannot serve its purpose should not be offered at all — a
+    model calling SelectAccount with nowhere to persist the choice is worse than
+    one that never sees it."""
+    anonymous = RUNNER.build_agent(llm=_fake("ok"), user_id=uuid.uuid4())
+
+    names = _tool_names(anonymous)
+    assert "ListDataSources" in names          # read-only, still useful
+    assert "SelectAccount" not in names
+    assert "RequestConnection" not in names
+
+
+def test_signed_out_sessions_get_no_connector_tools():
+    """No user, no connectors: there is nothing to enumerate and no owner to
+    attribute a binding to."""
+    assert not {"ListDataSources", "SelectAccount", "RequestConnection"} & _tool_names(
+        RUNNER.build_agent(llm=_fake("ok"), project_id=uuid.uuid4(), user_id=None)
+    )
+
+
+def test_ask_user_tool_only_present_with_a_session(session, emitted):
+    without = RUNNER.build_agent(llm=_fake("ok"))
+    with_session = RUNNER.build_agent(llm=_fake("ok"), 
+        session=session, session_id=session.session_id, emit=emitted
+    )
+
+    assert "AskUserQuestion" not in _tool_names(without)
+    assert "AskUserQuestion" in _tool_names(with_session)
+
+
+# ---------------------------------------------------------------------------
+# Streaming contract
+# ---------------------------------------------------------------------------
+
+async def test_only_the_shared_event_vocabulary_reaches_the_stream(session, emitted):
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_fake("Your CPA rose because of one campaign."),
+        session=session, prompt="why did CPA jump?",
+        chat_idle_timeout=0.01,
+    )
+
+    kinds = [e["event"] for e in emitted.events]
+    assert set(kinds) <= set(AgentEvent), "an insights-only event would break the shared UI"
+    assert AgentEvent.AGENT_MESSAGE_CHUNK in kinds
+    assert AgentEvent.MESSAGE_STOP in kinds
+
+
+async def test_opening_turn_finishes_before_the_chat_loop(session, emitted):
+    """PIPELINE_FINISHED is what moves the UI out of "working" and into chat, so
+    it must land after the first turn — not when the session eventually ends."""
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_fake("Here is the read."),
+        session=session, prompt="status?",
+        chat_idle_timeout=0.01,
+    )
+
+    kinds = [e["event"] for e in emitted.events]
+    assert AgentEvent.PIPELINE_FINISHED in kinds
+    assert kinds.index(AgentEvent.MESSAGE_STOP) < kinds.index(AgentEvent.PIPELINE_FINISHED)
+
+
+async def test_follow_up_continues_the_same_session(session, emitted):
+    """The session stays open: a queued message drives a second turn, and the
+    sentinel from close_session ends the loop."""
+    await session.chat_queue.put("and what about mobile?")
+    await session.chat_queue.put(None)  # sentinel — close_session's stop signal
+
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_fake("First answer.", "Second answer."),
+        session=session, prompt="status?",
+        chat_idle_timeout=2.0,
+    )
+
+    prose = "".join(
+        e["text"] for e in emitted.events if e["event"] == AgentEvent.AGENT_MESSAGE_CHUNK
+    )
+    assert "First answer." in prose and "Second answer." in prose
+    # Two turns, so two turn boundaries.
+    assert sum(1 for e in emitted.events if e["event"] == AgentEvent.MESSAGE_STOP) == 2
+
+
+async def test_a_failed_turn_does_not_end_the_session(session, emitted):
+    """One bad turn must leave the user able to rephrase."""
+    await session.chat_queue.put("follow up")
+    await session.chat_queue.put(None)
+
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_fake("First answer.", cls=RaisingFake),
+        session=session, prompt="status?",
+        chat_idle_timeout=2.0,
+    )
+
+    kinds = [e["event"] for e in emitted.events]
+    assert AgentEvent.STEP_FAILED in kinds
+    assert AgentEvent.PIPELINE_FAILED not in kinds  # the session survived
+    failed = next(e for e in emitted.events if e["event"] == AgentEvent.STEP_FAILED)
+    # Typed, and never the raw exception text.
+    assert failed["code"] == ErrorCode.UNKNOWN
+    assert "provider blew up" not in failed["error"]
+
+
+@pytest.fixture
+def no_retry_sleep(monkeypatch):
+    waited: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        waited.append(seconds)
+
+    monkeypatch.setattr(lc, "_retry_sleep", _sleep)
+    return waited
+
+
+async def test_a_transient_failure_is_retried_and_reported(session, emitted, no_retry_sleep):
+    """A 429 twice, then an answer: the user sees two "reconnecting" events and
+    then the reply — not a failed turn, and not a silent ten-second hang."""
+    await session.chat_queue.put(None)
+
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_fake("Recovered.", cls=FlakyFake),
+        session=session, prompt="status?", chat_idle_timeout=2.0,
+    )
+
+    retries = [e for e in emitted.events if e["event"] == AgentEvent.MODEL_RETRYING]
+    assert [r["attempt"] for r in retries] == [1, 2]
+    assert all(r["code"] == ErrorCode.RATE_LIMITED for r in retries)
+    assert retries[0]["max_attempts"] == lc.MODEL_RETRY_ATTEMPTS
+    assert len(no_retry_sleep) == 2 and no_retry_sleep[1] > no_retry_sleep[0] * 1.2  # backing off
+    # The wait the UI counts down is the wait actually taken.
+    assert [r["retry_in"] for r in retries] == [round(s, 1) for s in no_retry_sleep]
+    kinds = _kinds(emitted)
+    assert AgentEvent.STEP_FAILED not in kinds
+    assert AgentEvent.PIPELINE_FAILED not in kinds
+    assert AgentEvent.PIPELINE_FINISHED in kinds
+
+
+class TellsWhenToRetry(RateLimitError):
+    """A 429 that says how long to wait, the way Anthropic's and OpenAI's do."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.response = type("Response", (), {"headers": {"retry-after": "7"}})()
+
+
+async def test_the_providers_retry_after_sets_the_wait_and_the_countdown(session, emitted, no_retry_sleep):
+    await session.chat_queue.put(None)
+
+    class Told(FlakyFake):
+        failures: int = 1
+        exc: type[Exception] = TellsWhenToRetry
+
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_fake("Recovered.", cls=Told),
+        session=session, prompt="status?", chat_idle_timeout=2.0,
+    )
+
+    assert no_retry_sleep == [7.0]
+    retry = next(e for e in emitted.events if e["event"] == AgentEvent.MODEL_RETRYING)
+    assert retry["retry_in"] == 7.0
+    assert AgentEvent.PIPELINE_FINISHED in _kinds(emitted)
+
+
+async def test_a_request_too_long_is_compacted_once_and_retried(session, emitted, monkeypatch):
+    """An hour into a thread the provider says the request is too long. The
+    history is summarised, the same request is retried with room, and the
+    user sees a compaction, not a dead conversation."""
+    monkeypatch.setattr(lc, "COMPACT_KEEP_TOKENS", 12)  # a test transcript is tiny
+    await session.chat_queue.put("and what about mobile?")
+    await session.chat_queue.put(None)
+
+    # The opening turn answers; the follow-up overflows once, then answers.
+    fake = _fake("Answered.", cls=OverflowFake)
+    fake._overflowed = -1
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=fake,
+        session=session, prompt="status?", chat_idle_timeout=2.0,
+    )
+
+    kinds = _kinds(emitted)
+    assert AgentEvent.CONTEXT_COMPACTING in kinds
+    assert AgentEvent.CONTEXT_COMPACTED in kinds
+    # The divider in the transcript shows what the summariser kept.
+    compacted = next(e for e in emitted.events if e.get("event") == AgentEvent.CONTEXT_COMPACTED)
+    assert isinstance(compacted.get("summary"), str)
+    assert AgentEvent.STEP_FAILED not in kinds
+    assert AgentEvent.PIPELINE_FAILED not in kinds
+    assert kinds.count(AgentEvent.MESSAGE_STOP) == 2  # both turns finished
+    # The thread now opens with the summary, and the follow-up survived it.
+    snapshot = await RUNNER.build_agent(llm=fake, remember=False, execute=False, interactive=False).aget_state(
+        {"configurable": {"thread_id": session.session_id}}
+    )
+    texts = [str(m.content) for m in snapshot.values["messages"]]
+    assert any("summary of the conversation" in t for t in texts)
+    assert any("mobile" in t for t in texts)
+
+
+async def test_a_second_overflow_is_the_ordinary_failure(session, emitted, monkeypatch):
+    monkeypatch.setattr(lc, "COMPACT_KEEP_TOKENS", 12)
+    await session.chat_queue.put("and what about mobile?")
+    await session.chat_queue.put(None)
+
+    class Overflows(OverflowFake):
+        overflows: int = 2
+
+    fake = _fake("Answered.", cls=Overflows)
+    fake._overflowed = -1
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=fake,
+        session=session, prompt="status?", chat_idle_timeout=2.0,
+    )
+
+    kinds = _kinds(emitted)
+    assert kinds.count(AgentEvent.CONTEXT_COMPACTING) == 1
+    failed = [e for e in emitted.events if e["event"] == AgentEvent.STEP_FAILED]
+    assert len(failed) == 1 and failed[0]["code"] == ErrorCode.CONTEXT_WINDOW
+
+
+async def test_a_retry_after_beyond_the_cap_is_not_waited_for(session, emitted, no_retry_sleep):
+    """A provider asking for five minutes gets a rate-limited failure now, not
+    a thirty-second countdown and then the same failure."""
+    await session.chat_queue.put(None)
+
+    class Patient(RateLimitError):
+        def __init__(self, message):
+            super().__init__(message)
+            self.response = type("Response", (), {"headers": {"retry-after": "300"}})()
+
+    class Told(FlakyFake):
+        failures: int = 1
+        exc: type[Exception] = Patient
+
+    with pytest.raises(Patient):
+        await RUNNER.run_session(
+            session.session_id, emitted, llm=_fake("Recovered.", cls=Told),
+            session=session, prompt="status?", chat_idle_timeout=2.0,
+        )
+
+    assert AgentEvent.MODEL_RETRYING not in _kinds(emitted)
+    assert no_retry_sleep == []
+
+
+async def test_a_rejected_key_fails_on_the_first_attempt(session, emitted, no_retry_sleep):
+    """Retrying a bad API key only delays the answer the user needs."""
+    await session.chat_queue.put("follow up")
+    await session.chat_queue.put(None)
+
+    class AuthFlaky(FlakyFake):
+        failures: int = 1
+        exc: type[Exception] = AuthenticationError
+
+    # The opening turn fails (the route reports it); the follow-up answers.
+    with pytest.raises(AuthenticationError):
+        await RUNNER.run_session(
+            session.session_id, emitted, llm=_fake("Recovered.", cls=AuthFlaky),
+            session=session, prompt="status?", chat_idle_timeout=2.0,
+        )
+
+    assert AgentEvent.MODEL_RETRYING not in _kinds(emitted)
+    assert no_retry_sleep == []
+
+
+async def test_short_replies_are_not_truncated(session, emitted):
+    """Regression: the parser holds back the tail of every chunk in case it is a
+    split `<duct_artifact>` open tag, so a turn only completes on flush. V1 never
+    flushed, which swallowed any reply shorter than the tag — the common case for
+    a chat agent. Both V3 runners already flushed; V1 does now too.
+    """
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_fake("Up 12%."),
+        session=session, prompt="cpa?", chat_idle_timeout=0.01,
+    )
+
+    prose = "".join(
+        e["text"] for e in emitted.events if e["event"] == AgentEvent.AGENT_MESSAGE_CHUNK
+    )
+    assert prose == "Up 12%."
+
+
+async def test_todos_reach_the_frontend_shape(session, emitted):
+    """The deepagents/LangChain Todo is {content, status} — exactly what
+    AuditTodos.jsx renders, so no mapping layer should creep in."""
+    captured: list[list] = []
+
+    async def on_todo(todos):
+        captured.append(todos)
+
+    await _dispatch_updates(
+        {"tools": {"todos": [{"content": "Pull search terms", "status": "in_progress"}]}},
+        on_todo=on_todo, on_tool_use=None, on_tool_result=None,
+    )
+
+    assert captured == [[{"content": "Pull search terms", "status": "in_progress"}]]
+
+
+async def test_update_dispatch_survives_unexpected_shapes():
+    """LangGraph puts control keys beside the nodes and middleware may deliver a
+    list of deltas. A stream translator must never be what ends a run."""
+    calls: list = []
+
+    async def on_todo(todos):
+        calls.append(todos)
+
+    for chunk in (None, "junk", {"__interrupt__": ("x",)}, {"n": None}, {"n": [{"todos": []}]}):
+        await _dispatch_updates(chunk, on_todo=on_todo, on_tool_use=None, on_tool_result=None)
+
+    assert calls == []  # nothing raised, nothing spurious emitted
+
+
+# ---------------------------------------------------------------------------
+# Pauses — checkpointed, answered by id, shown again on resume
+# ---------------------------------------------------------------------------
+
+async def test_a_question_parks_the_session_and_an_answer_resumes_it(session, emitted):
+    """The whole round trip: the tool interrupts, the pause reaches the stream
+    with its id, PIPELINE_FINISHED is held back, the answer arrives as the
+    route would queue it, and the model gets to finish."""
+    conversation_id = uuid.uuid4()
+
+    async def answer_when_parked():
+        while not session.pending_pauses:
+            await asyncio.sleep(0.01)
+        (interrupt_id,) = session.pending_pauses
+        assert AgentEvent.PIPELINE_FINISHED not in _kinds(emitted), "parked, not finished"
+        await session.chat_queue.put({"resume": {interrupt_id: {QUESTION["question"]: "Signups"}}})
+        await session.chat_queue.put(None)
+
+    answerer = asyncio.create_task(answer_when_parked())
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_asks_then_answers("Signups it is."),
+        session=session, prompt="what should I fix?", conversation_id=conversation_id,
+        chat_idle_timeout=2.0,
+    )
+    await answerer
+
+    kinds = _kinds(emitted)
+    pause = next(e for e in emitted.events if e["event"] == AgentEvent.QUESTIONS_REQUIRED)
+    assert pause["questions"] == [QUESTION]
+    assert pause["interrupt_id"]
+    # The card lands before the bubble closes, and the run only counts as
+    # opened once a turn ends with nothing parked.
+    assert kinds.index(AgentEvent.QUESTIONS_REQUIRED) < kinds.index(AgentEvent.MESSAGE_STOP)
+    assert kinds.index(AgentEvent.PIPELINE_FINISHED) > kinds.index(AgentEvent.QUESTIONS_REQUIRED)
+    prose = "".join(e["text"] for e in emitted.events if e["event"] == AgentEvent.AGENT_MESSAGE_CHUNK)
+    assert "Signups it is." in prose
+    assert session.pending_pauses == {}
+
+
+async def test_resuming_a_parked_conversation_shows_the_pause_again(emitted):
+    """Yesterday's question is still the question. A new session on the same
+    conversation re-emits it — flagged as a replay so it is not recorded twice —
+    without calling the model, and parks on it."""
+    conversation_id = uuid.uuid4()
+    first = create_insights_session(str(uuid.uuid4()))
+    await RUNNER.run_session(
+        first.session_id, emitted, llm=_asks_then_answers("never reached"),
+        session=first, prompt="what should I fix?", conversation_id=conversation_id,
+        chat_idle_timeout=0.01,
+    )
+    parked_on = next(iter(first.pending_pauses))
+    emitted.events.clear()
+
+    second = create_insights_session(str(uuid.uuid4()))
+    await RUNNER.run_session(
+        second.session_id, emitted, llm=_fake("must not be called", cls=RaisingFake),
+        session=second, prompt="", conversation_id=conversation_id,
+        chat_idle_timeout=0.01, resume=True,
+    )
+
+    kinds = _kinds(emitted)
+    assert AgentEvent.QUESTIONS_REQUIRED in kinds
+    assert AgentEvent.AGENT_MESSAGE_CHUNK not in kinds and AgentEvent.PIPELINE_FINISHED not in kinds
+    replayed = next(e for e in emitted.events if e["event"] == AgentEvent.QUESTIONS_REQUIRED)
+    assert replayed["replay"] is True
+    assert replayed["interrupt_id"] == parked_on
+    assert list(second.pending_pauses) == [parked_on]
+
+
+async def test_the_thread_is_the_conversation_not_the_session(emitted):
+    """Two sessions, one conversation: the second is a continuation, so it
+    opens ready without a greeting and the thread carries both turns."""
+    conversation_id = uuid.uuid4()
+    first = create_insights_session(str(uuid.uuid4()))
+    await RUNNER.run_session(
+        first.session_id, emitted, llm=_fake("CPA is up."),
+        session=first, prompt="cpa?", conversation_id=conversation_id, chat_idle_timeout=0.01,
+    )
+    emitted.events.clear()
+
+    second = create_insights_session(str(uuid.uuid4()))
+    await RUNNER.run_session(
+        second.session_id, emitted, llm=_fake("must not be called", cls=RaisingFake),
+        session=second, prompt="", conversation_id=conversation_id,
+        chat_idle_timeout=0.01, resume=True,
+    )
+    assert _kinds(emitted) == [AgentEvent.PIPELINE_FINISHED]
+
+    state = await RUNNER.thread_state(conversation_id)
+    assert state["status"] == "idle"
+    assert state["message_count"] == 2  # the question and its answer, on one thread
+
+
+async def test_thread_state_reports_a_parked_thread(emitted):
+    conversation_id = uuid.uuid4()
+    session = create_insights_session(str(uuid.uuid4()))
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_asks_then_answers("never reached"),
+        session=session, prompt="fix?", conversation_id=conversation_id, chat_idle_timeout=0.01,
+    )
+
+    state = await RUNNER.thread_state(conversation_id)
+
+    assert state["status"] == "paused"
+    assert state["pauses"][0]["event"] == AgentEvent.QUESTIONS_REQUIRED
+    assert state["pauses"][0]["questions"] == [QUESTION]
+
+
+async def test_token_usage_reaches_the_stream_and_the_thread_state(emitted):
+    """Every model call is billed on the stream, and a thread opened later
+    shows the same figures from its checkpoint — the ring before the run."""
+    conversation_id = uuid.uuid4()
+    usage = {"input_tokens": 1200, "output_tokens": 30, "total_tokens": 1230}
+    llm = ToolCallingFake(responses=[AIMessage(content="Done.", usage_metadata=usage)])
+
+    await RUNNER.run_session(
+        "s-usage", emitted, llm=llm, session=None, prompt="go",
+        conversation_id=conversation_id,
+    )
+
+    billed = [e for e in emitted.events if e["event"] == AgentEvent.TOKEN_USAGE]
+    assert len(billed) == 1
+    assert billed[0]["input_tokens"] == 1200 and billed[0]["output_tokens"] == 30
+    assert billed[0]["context_window"] > 0
+    kinds = _kinds(emitted)
+    assert kinds.index(AgentEvent.TOKEN_USAGE) < kinds.index(AgentEvent.MESSAGE_STOP)
+
+    state = await RUNNER.thread_state(conversation_id)
+    assert state["usage"]["last"]["input_tokens"] == 1200
+    assert state["usage"]["total"]["calls"] == 1
+
+
+async def test_a_message_sent_mid_turn_reaches_the_model_at_its_next_call(session, emitted):
+    """The user types while the agent works. The steer middleware hands the
+    message to the model at its next call, the client is told the row is
+    consumed, and the thread has one more human message than the prompt."""
+    conversation_id = uuid.uuid4()
+    await session.steer_queue.put({"role": "user", "content": "also mobile", "client_message_id": "m1"})
+    await session.chat_queue.put(None)
+
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_fake("Both, then."),
+        session=session, prompt="why did CPA jump?", conversation_id=conversation_id,
+        chat_idle_timeout=2.0,
+    )
+
+    consumed = [e for e in emitted.events if e["event"] == AgentEvent.USER_INPUT_CONSUMED]
+    assert [c["client_message_id"] for c in consumed] == ["m1"]
+    assert session.steer_queue.empty()
+    assert session.turn_active is False
+    state = await RUNNER.thread_state(conversation_id)
+    assert state["message_count"] == 3  # prompt, the steer, the answer
+
+
+async def test_the_chat_route_steers_while_a_turn_runs_and_queues_otherwise(session):
+    """Never a 409: busy means steer (this harness can), idle means a turn."""
+    session.turn_active = True
+    out = await send_message(
+        "insights", session.session_id,
+        AgentMessage(type="chat", content="also mobile", client_message_id="m1"), user=None,
+    )
+    assert out["delivery"] == "steer"
+    assert session.steer_queue.get_nowait() == {"role": "user", "content": "also mobile", "client_message_id": "m1"}
+
+    session.turn_active = False
+    out = await send_message("insights", session.session_id, AgentMessage(type="chat", content="next"), user=None)
+    assert out["delivery"] == "turn"
+    assert session.chat_queue.get_nowait() == {"role": "user", "content": "next"}
+
+
+async def test_an_unknown_conversation_is_idle_not_an_error():
+    state = await RUNNER.thread_state(uuid.uuid4())
+    assert state["status"] == "idle"
+    assert (state["pauses"], state["todos"], state["message_count"]) == ([], [], 0)
+    assert state["usage"]["last"] is None  # nothing billed yet, but the gauge has a window
+    assert state["usage"]["context_window"] > 0
+
+
+async def test_the_answer_route_resumes_a_checkpointed_pause(session):
+    """The route cannot tell a Future from an interrupt and must not need to:
+    with pauses pending it queues a resume for the runner, by id."""
+    session.pending_pauses = {"int_1": {"event": AgentEvent.QUESTIONS_REQUIRED, "interrupt_id": "int_1"}}
+
+    out = await send_message(
+        "insights", session.session_id,
+        AgentMessage(type="answer", answers={"Goal": "Signups"}, interrupt_id="int_1"),
+        user=None,
+    )
+
+    assert out == {"status": "queued", "type": "answer"}
+    assert session.chat_queue.get_nowait() == {"resume": {"int_1": {"Goal": "Signups"}}}
+    assert session.pending_pauses == {}
+
+
+async def test_an_answer_without_an_id_takes_the_only_pending_pause(session):
+    session.pending_pauses = {"int_9": {"event": AgentEvent.CONNECTION_REQUIRED, "interrupt_id": "int_9"}}
+
+    await send_message(
+        "insights", session.session_id, AgentMessage(type="answer", answers={"skipped": True}), user=None
+    )
+
+    assert session.chat_queue.get_nowait() == {"resume": {"int_9": {"skipped": True}}}
+
+
+async def test_session_state_reports_a_future_bridged_pause_too(session):
+    """A reattaching client asks the session what it is parked on. The
+    Future bridge has no interrupt id, but it does have the event it emitted,
+    and that is enough to put the card back."""
+    from agents.core.session import bridge_user_input
+    from routes.agents import get_session_state
+
+    async def emit(_e):
+        pass
+
+    parked = asyncio.create_task(bridge_user_input(
+        session, session.session_id, event=AgentEvent.QUESTIONS_REQUIRED,
+        payload={"questions": [QUESTION]}, emit=emit, timeout=2.0,
+    ))
+    while session.answer_future is None:
+        await asyncio.sleep(0.01)
+
+    state = await get_session_state("insights", session.session_id, user=None)
+    assert state["has_pending_question"] is True
+    assert state["pending"] == [{"event": AgentEvent.QUESTIONS_REQUIRED, "questions": [QUESTION]}]
+
+    session.answer_future.set_result({})
+    await parked
+    state = await get_session_state("insights", session.session_id, user=None)
+    assert state["pending"] == []
+
+
+async def test_chat_while_parked_is_steered_not_refused(session):
+    """A tool call is waiting for its result, so a fresh human turn on top of
+    it would be a transcript the provider rejects. It used to be a 409; now
+    the message waits on the steer queue and the model reads it right after
+    the answer, at its next call."""
+    session.pending_pauses = {"int_1": {"event": AgentEvent.QUESTIONS_REQUIRED, "interrupt_id": "int_1"}}
+
+    out = await send_message(
+        "insights", session.session_id, AgentMessage(type="chat", content="also mobile"), user=None
+    )
+    assert out["delivery"] == "steer"
+    assert session.steer_queue.get_nowait() == {"role": "user", "content": "also mobile"}
+    assert session.chat_queue.empty()
+
+
+# ---------------------------------------------------------------------------
+# Route wiring
+# ---------------------------------------------------------------------------
+
+async def test_route_creates_an_insights_session_not_an_audit_one():
+    """Insights used to borrow AuditSession because it had no session of its own.
+    It has one now, and the route must hand back that type — the runner reads
+    fields (artifact_project_id, memory_off) that only it declares."""
+    from routes.agents import _create_session_for
+
+    created = _create_session_for("insights", str(uuid.uuid4()), {"prompt": "hi"})
+
+    assert isinstance(created, InsightsSession)
+    assert created.agent_type == "insights"
+
+
+async def test_route_rejects_a_wizard_shaped_body():
+    """The old pipeline's fields must not quietly work — a caller still sending
+    connectors and a customer_id should hear that the contract changed."""
+    from fastapi import HTTPException
+    from routes.agents import _create_session_for, _dispatch_start
+
+    session_id = str(uuid.uuid4())
+    _create_session_for("insights", session_id, {})
+
+    async def emit(_e):
+        pass
+
+    with pytest.raises(HTTPException) as exc:
+        await _dispatch_start(
+            "insights", session_id,
+            {"connections": ["google_ads"], "customer_id": "123", "goal": "maximize_roas"},
+            emit,
+        )
+    assert exc.value.status_code == 422
+
+
+def test_agent_spec_advertises_the_session_capabilities():
+    """Discovery drives what the frontend offers, so the spec has to say the
+    agent asks questions and holds a chat — it claimed neither before."""
+    from agents.registry import AgentCapability, AgentType, get_spec
+
+    spec = get_spec(AgentType.INSIGHTS)
+
+    assert spec.active
+    assert AgentCapability.INTERACTIVE_QUESTIONS in spec.capabilities
+    assert AgentCapability.CHAT in spec.capabilities
+    # The config schema is what a client validates against — it must be the
+    # session request, not an empty dict.
+    assert "prompt" in spec.config_schema.get("properties", {})
+
+
+# ---------------------------------------------------------------------------
+# Unattended runs — the scheduled brief, which can never block on a human
+# ---------------------------------------------------------------------------
+
+UNATTENDED_BRIEF = """<duct_artifact>
+---
+title: Weekly paid search
+---
+# Weekly paid search
+
+Spend held. GSC was never connected, so organic overlap is unverified.
+</duct_artifact>"""
+
+
+def test_an_unattended_run_cannot_ask_a_question():
+    """`backend/CLAUDE.md` is explicit that the scheduled brief is the product
+    and can never block on a person. Blocking is made impossible rather than
+    discouraged: the tools that pause are simply not mounted."""
+    interactive = RUNNER.build_agent(
+        llm=_fake("x"), session=create_insights_session("s"), session_id="s",
+        emit=lambda body: None, project_id=uuid.uuid4(), user_id=uuid.uuid4(),
+    )
+    unattended = RUNNER.build_agent(
+        llm=_fake("x"), session=create_insights_session("s"), session_id="s",
+        emit=lambda body: None, project_id=uuid.uuid4(), user_id=uuid.uuid4(),
+        interactive=False,
+    )
+
+    assert "AskUserQuestion" in _tool_names(interactive)
+    assert "AskUserQuestion" not in _tool_names(unattended)
+    # The connector tools that pause go too — but the read-only one stays, or
+    # the agent cannot even tell the reader what it could not reach.
+    for pausing in ("RequestConnection", "SelectAccount"):
+        assert pausing in _tool_names(interactive)
+        assert pausing not in _tool_names(unattended)
+    assert "ListDataSources" in _tool_names(unattended)
+    assert "FetchData" in _tool_names(unattended)
+    # And the prompt agrees: the unattended stanza names no tool that pauses,
+    # or the agent plans around a question it will never get to ask.
+    from agents.insights.prompts.autonomous import CAPABILITIES_UNATTENDED
+
+    assert "AskUserQuestion" not in CAPABILITIES_UNATTENDED
+
+
+async def test_run_once_returns_the_brief_it_wrote(emitted):
+    brief = await RUNNER.run_once(emitted, llm=_fake(UNATTENDED_BRIEF), prompt="weekly brief")
+
+    assert brief["title"] == "Weekly paid search"
+    assert brief["format"] == "markdown"
+    assert "Spend held" in brief["content"]
+
+    kinds = [e["event"] for e in emitted.events]
+    assert AgentEvent.ARTIFACT_VERSION in kinds
+    assert AgentEvent.PIPELINE_FINISHED in kinds
+    # No chat loop: one turn, one boundary, and the call returns.
+    assert kinds.count(AgentEvent.MESSAGE_STOP) == 1
+
+
+async def test_a_run_that_wrote_nothing_says_so(emitted):
+    """An unattended run that reached no conclusion worth keeping must be
+    distinguishable from one that produced a brief — a caller logging "ok" for
+    an empty result is how a broken schedule stays invisible for a month."""
+    brief = await RUNNER.run_once(emitted, llm=_fake("I could not reach any data."), prompt="?")
+
+    assert brief == {}
+    assert AgentEvent.ARTIFACT_VERSION not in [e["event"] for e in emitted.events]
+
+
+# ---------------------------------------------------------------------------
+# Stream translation: only the model's words are the agent's words
+# ---------------------------------------------------------------------------
+
+
+async def test_a_steered_user_message_is_not_streamed_back_as_the_agent(emitted):
+    """SteerMiddleware writes the user's mid-turn message into the thread as
+    a HumanMessage from a graph node, and LangGraph's messages stream carries
+    every message a node writes. Streamed on, "I have connected GA4 now" came
+    back as a grey bubble under the user's own blue one."""
+    from langchain_core.messages import AIMessageChunk, HumanMessage, ToolMessage
+
+    class _Agent:
+        async def astream(self, _input, _config, stream_mode):
+            yield "messages", (HumanMessage(content="I have connected GA4 now"), {"langgraph_node": "SteerMiddleware.before_model"})
+            yield "messages", (ToolMessage(content='{"status": "ok"}', tool_call_id="t1"), {"langgraph_node": "tools"})
+            yield "messages", (AIMessageChunk(content="Pulling GA4 now."), {"langgraph_node": "model"})
+
+    async def _no_artifact(_raw, _text):
+        return None
+
+    await lc.stream_agent(_Agent(), "hi", emitted, on_artifact_close=_no_artifact)
+
+    texts = [e["text"] for e in emitted.events if e.get("event") == AgentEvent.AGENT_MESSAGE_CHUNK]
+    assert "".join(texts) == "Pulling GA4 now."
+
+
+# ---------------------------------------------------------------------------
+# The verifier runs on its own rung
+# ---------------------------------------------------------------------------
+
+
+def test_the_verifier_resolves_through_its_own_job(monkeypatch):
+    """Job.VERIFICATION is a tier below Job.ANALYSIS in the map, and the
+    subagent used to inherit the analyst's model regardless. The run carries
+    both, and the runner builds the verifier on the second."""
+    from agents.engines import JobRun
+    from agents.insights import setup
+    from agents.models import ModelName, Provider
+    from agents.tiers import Job
+
+    class _Settings:
+        engine = ""
+        tiers = {}
+        auto_fallback = True
+
+    seen: list[Job] = []
+
+    def _job_run(job, **_kwargs):
+        seen.append(job)
+        model = ModelName.GPT_6_1_SOL if job is Job.ANALYSIS else ModelName.GPT_6_LUNA
+        return JobRun(provider=Provider.OPENAI, model=model, api_key="sk-proj-x", source="header")
+
+    monkeypatch.setattr(setup, "resolve_job_run", _job_run)
+    monkeypatch.setattr(setup, "stored_keys_for", lambda _uid: {})
+    monkeypatch.setattr(setup, "get_model_settings", lambda _uid: _Settings())
+
+    run = setup.resolve_run(user_id=None, project_id=None, user_keys={Provider.OPENAI: "sk-proj-x"})
+
+    assert seen == [Job.ANALYSIS, Job.VERIFICATION]
+    assert run.model is ModelName.GPT_6_1_SOL
+    assert run.verify_model is ModelName.GPT_6_LUNA and run.verify_provider is Provider.OPENAI
+
+    runner = AutonomousInsightsRunner(
+        api_key=run.api_key, provider=run.provider, model=run.model,
+        verify_provider=run.verify_provider, verify_model=run.verify_model, verify_api_key=run.verify_api_key,
+    )
+    built: list = []
+    monkeypatch.setattr(
+        "agents.insights.v1.runner.build_verify_subagent",
+        lambda tools, model=None, **_kw: built.append(model) or {"name": "verify", "description": "", "system_prompt": "", "tools": tools},
+    )
+    runner.build_agent(remember=False, execute=False, interactive=False)
+    assert built and getattr(built[0], "model_name", "") == ModelName.GPT_6_LUNA.value
+
+
+def test_a_hand_built_run_keeps_the_verifier_on_the_analysis_model():
+    """No verify fields → no second model: the tests' fake-model seam and any
+    caller that resolved nothing must not fire a real provider call."""
+    runner = AutonomousInsightsRunner(api_key="sk-x")
+    assert runner._verify is None
+
+
+# ---------------------------------------------------------------------------
+# The composer's dials reach the run
+# ---------------------------------------------------------------------------
+
+
+def test_the_tier_lift_reaches_the_analysis_and_not_the_verifier(monkeypatch):
+    """"Run this on Heavy" means the answer, not the checks: the composer's
+    tier rides on the analysis job only."""
+    from agents.engines import JobRun
+    from agents.insights import setup
+    from agents.models import ModelName, Provider
+    from agents.tiers import Job
+
+    class _Settings:
+        engine = ""
+        tiers = {}
+        auto_fallback = True
+
+    seen: dict[Job, str] = {}
+
+    def _job_run(job, **kwargs):
+        seen[job] = kwargs.get("tier_override", "")
+        return JobRun(provider=Provider.OPENAI, model=ModelName.GPT_5_MINI, api_key="sk-proj-x", source="header")
+
+    monkeypatch.setattr(setup, "resolve_job_run", _job_run)
+    monkeypatch.setattr(setup, "stored_keys_for", lambda _uid: {})
+    monkeypatch.setattr(setup, "get_model_settings", lambda _uid: _Settings())
+
+    setup.resolve_run(user_id=None, project_id=None, user_keys={Provider.OPENAI: "sk-proj-x"}, tier_override="heavy")
+    assert seen == {Job.ANALYSIS: "heavy", Job.VERIFICATION: ""}
+
+
+def test_a_stale_tier_preference_never_stops_a_run():
+    """An unknown tier word is ignored, not refused — see resolve_job_run."""
+    from agents.preferences import UserPreferences
+
+    assert UserPreferences(tier="light").tier == "light"
+    assert UserPreferences().tier == ""
+
+
+async def test_an_autonomy_change_is_restated_at_the_next_turn(session, monkeypatch):
+    """The posture lives in the opening user turn, so a session used to keep
+    the level it opened with until the next session. The chat route now
+    re-reads the project per message and prepends the new posture once."""
+    import routes.agents as routes_agents
+
+    session.artifact_project_id = uuid.uuid4()
+    session.autonomy = "ask"
+    session.autonomy_model = "claude-opus-5"
+    levels = iter(["ask", "assisted", "assisted"])
+    monkeypatch.setattr(routes_agents, "_configured_autonomy", lambda _pid: next(levels))
+
+    await send_message("insights", session.session_id, AgentMessage(type="chat", content="first"), user=None)
+    assert session.chat_queue.get_nowait()["content"] == "first"          # unchanged: same level
+
+    await send_message("insights", session.session_id, AgentMessage(type="chat", content="second"), user=None)
+    queued = session.chat_queue.get_nowait()["content"]
+    assert queued.startswith("<autonomy>") and "ASSISTED" in queued and queued.endswith("second")
+    assert session.autonomy == "assisted"
+
+    await send_message("insights", session.session_id, AgentMessage(type="chat", content="third"), user=None)
+    assert session.chat_queue.get_nowait()["content"] == "third"          # stated once, not every turn
+
+
+async def test_a_session_without_a_project_keeps_its_message_untouched(session):
+    session.artifact_project_id = None
+    session.autonomy = "ask"
+    await send_message("insights", session.session_id, AgentMessage(type="chat", content="hi"), user=None)
+    assert session.chat_queue.get_nowait()["content"] == "hi"
+
+
+async def test_a_format_change_is_restated_at_the_next_turn(session):
+    """The brief format rides in the opening turn like the posture, so the
+    composer's dial used to wait for the next session. Stated once per change."""
+    session.artifact_format = "html"
+    session.artifact_format_stated = "html"
+
+    await send_message("insights", session.session_id, AgentMessage(type="chat", content="first", artifact_format="html"), user=None)
+    assert session.chat_queue.get_nowait()["content"] == "first"
+
+    await send_message("insights", session.session_id, AgentMessage(type="chat", content="second", artifact_format="markdown"), user=None)
+    queued = session.chat_queue.get_nowait()["content"]
+    assert queued.startswith("<deliverable_format>") and "markdown" in queued and queued.endswith("second")
+    assert session.artifact_format_stated == "markdown"
+
+    await send_message("insights", session.session_id, AgentMessage(type="chat", content="third", artifact_format="markdown"), user=None)
+    assert session.chat_queue.get_nowait()["content"] == "third"
+
+
+async def test_a_thread_resumed_without_a_prompt_is_told_the_format_at_its_first_message(session):
+    """Its history carries the preference it opened with — days old, and on
+    2026-09-21 the wrong one: a thread opened under markdown refused HTML
+    twice after the default had moved. The first message says the current one,
+    even from a client that sends no dial value."""
+    session.artifact_format = "html"
+    session.artifact_format_stated = ""
+
+    await send_message("insights", session.session_id, AgentMessage(type="chat", content="in html please"), user=None)
+    queued = session.chat_queue.get_nowait()["content"]
+    assert queued.startswith("<deliverable_format>") and "HTML document" in queued
+    assert queued.endswith("in html please")
+    assert session.artifact_format_stated == "html"
+
+
+def test_a_resumed_follow_up_opens_with_the_current_format():
+    from agents.insights.v1.runner import _resumed_opening
+
+    opening = _resumed_opening("and in html?", "html")
+    assert opening.startswith("<deliverable_format>") and opening.endswith("and in html?")
+    assert _resumed_opening("", "html") == ""  # opened from the desk: nothing to say yet
+
+
+async def test_the_chat_loop_stays_open_while_someone_is_attached(session, emitted):
+    """Idle means nobody is there, not nobody has typed. A consumer's
+    keep-alive frames touch the session; a question asked 31 minutes into
+    reading a brief used to find the loop gone and go nowhere."""
+    from agents.core.session import touch_session
+
+    async def reader() -> None:
+        for _ in range(12):  # attached for longer than the idle timeout below
+            touch_session(session)
+            await asyncio.sleep(0.01)
+        await session.chat_queue.put("and what about mobile?")
+        await session.chat_queue.put(None)
+
+    reading = asyncio.create_task(reader())
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_fake("First answer.", "Second answer."),
+        session=session, prompt="status?",
+        chat_idle_timeout=0.05,
+    )
+    await reading
+
+    assert sum(1 for e in emitted.events if e["event"] == AgentEvent.MESSAGE_STOP) == 2
+
+
+# ---------------------------------------------------------------------------
+# What the model saw is written down
+# ---------------------------------------------------------------------------
+
+class _ContextRecorder:
+    """Only the recorder surface run_session touches."""
+
+    def __init__(self) -> None:
+        self.contexts: list[dict] = []
+
+    async def record_context(self, data: dict) -> None:
+        self.contexts.append(data)
+
+    async def record_tool_use(self, *a, **k) -> None:  # noqa: D401 - tool traffic, not under test
+        pass
+
+    async def record_tool_result(self, *a, **k) -> None:
+        pass
+
+
+async def test_the_run_records_the_turn_the_model_actually_read(session, emitted):
+    """The USER row is the sentence typed; the model read a composed turn under
+    a system prompt that changes with the code. A session that stores only the
+    former cannot be reviewed against what its answer was a function of."""
+    session.recorder = _ContextRecorder()
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_fake("One campaign."),
+        session=session, prompt="why did CPA jump?",
+        business_context="<business_context>Acme sells anvils.</business_context>",
+        memory="<project_memory>CPA target is $40.</project_memory>",
+        chat_idle_timeout=0.01,
+    )
+
+    [ctx] = session.recorder.contexts
+    assert ctx["agent_type"] == "insights"
+    assert ctx["resume"] is False
+    assert len(ctx["system_prompt_sha256"]) == 64 and ctx["system_prompt_chars"] > 1000
+    assert ctx["blocks"]["prompt"] == "why did CPA jump?"
+    assert ctx["blocks"]["memory"].startswith("<project_memory>")
+    # The stored turn is the composed one, with every block in it.
+    assert "Acme sells anvils." in ctx["turn"] and "CPA target" in ctx["turn"]
+    assert ctx["turn"].rstrip().endswith("why did CPA jump?") or "why did CPA jump?" in ctx["turn"]
+
+
+async def test_a_resumed_thread_records_its_own_context(session, emitted):
+    """Resume takes the follow-up with no priming — only the current brief
+    format ahead of it, since the thread's own history may carry an old one —
+    and says so in the row, so a reviewer does not go looking for a digest
+    that was never read."""
+    session.recorder = _ContextRecorder()
+    await RUNNER.run_session(
+        session.session_id, emitted, llm=_fake("Still one campaign."),
+        session=session, prompt="and last week?", conversation_id=uuid.uuid4(), resume=True,
+        chat_idle_timeout=0.01,
+    )
+
+    [ctx] = session.recorder.contexts
+    assert ctx["resume"] is True
+    assert ctx["turn"].startswith("<deliverable_format>") and ctx["turn"].endswith("and last week?")
+    assert ctx["blocks"]["memory"] == "" and ctx["blocks"]["data_sources"] == ""
+
+
+def test_the_general_purpose_helper_is_supplied_and_read_only(monkeypatch):
+    """Rulebook gap 1. deepagents adds a `general-purpose` sub-agent with
+    EVERY parent tool unless one by that name is supplied — for insights that
+    was ProposeChanges, RollbackChangeSet, RememberFact, the artifact writers
+    and the pause tools, with no limits or retry of their own."""
+    import agents.insights.v1.runner as runner_module
+    from agents.insights.subagents import GENERAL_PURPOSE_SUBAGENT, GENERAL_PURPOSE_TOOLS
+
+    built: dict = {}
+    original = runner_module.build_deep_session_agent
+
+    def _capture(**kwargs):
+        built.update(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(runner_module, "build_deep_session_agent", _capture)
+    RUNNER.build_agent(llm=_fake("ok"))
+
+    by_name = {sub["name"]: sub for sub in built["subagents"]}
+    assert GENERAL_PURPOSE_SUBAGENT in by_name
+    helper_tools = {t.name for t in by_name[GENERAL_PURPOSE_SUBAGENT]["tools"]}
+    # Exactly the parent's read tools: whatever this session shape mounted of
+    # the list, and nothing off it (an unscoped build mounts few of them).
+    assert helper_tools == {t.name for t in built["tools"]} & set(GENERAL_PURPOSE_TOOLS)
+    assert helper_tools
+    assert not helper_tools & {
+        "ProposeChanges", "RollbackChangeSet", "RememberFact", "CreateArtifact",
+        "UpdateArtifact", "RewriteArtifact", "AskUserQuestion", "RequestConnection", "SelectAccount",
+    }
+    # Same objects as the parent's, so the helper shares its scoping closure.
+    parent = {id(t) for t in built["tools"]}
+    assert all(id(t) in parent for t in by_name[GENERAL_PURPOSE_SUBAGENT]["tools"])

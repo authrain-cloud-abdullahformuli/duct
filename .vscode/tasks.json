@@ -1,0 +1,152 @@
+{
+  "version": "2.0.0",
+  "//": "The stop tasks are one line each because the kill list lives in scripts/dev_stop.sh. It was inline here until Zed joined VS Code as an editor of this repo: Zed merges this file into its own task list but implements neither dependsOn nor dependsOrder, so a stop task written as a fan-out over five others silently stopped nothing there. One script, two editors, no second list to forget.",
+  "tasks": [
+    {
+      "label": "Serve site on :8090",
+      "type": "shell",
+      "command": "python3 dev_server.py --port 8090",
+      "options": { "cwd": "${workspaceFolder}/site" },
+      "isBackground": true,
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": {
+        "owner": "site",
+        "pattern": { "regexp": "^$" },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".",
+          "endsPattern": "Serving Cloudflare-style site routes on"
+        }
+      }
+    },
+    {
+      "//": "Freezes the backend into backend/dist/duct-sidecar for the self-host desktop launch. Only the first freeze needs this task: after it, the desktop scripts' pre* hooks refreeze whenever the backend has moved ahead. NOT bare `pyinstaller`: that deletes its output directory before rebuilding, out from under a sidecar a running app is executing; the script stages the freeze and swaps it in. ~3 min. Zed lists this one from here, so .zed/tasks.json has no copy.",
+      "label": "Desktop: Build sidecar",
+      "type": "shell",
+      "command": "npm run sidecar",
+      "options": { "cwd": "${workspaceFolder}/desktop" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "App: stop dev server (3003)",
+      "type": "shell",
+      "command": "./scripts/dev_stop.sh app",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Jaeger: stop (16686)",
+      "type": "shell",
+      "command": "./scripts/dev_stop.sh jaeger",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "//": "Manual: the dev bundle is launched detached, so no debug session owns it. Quit first, kill second — the reasoning is in the script.",
+      "label": "Desktop: stop Duct Dev app",
+      "type": "shell",
+      "command": "./scripts/dev_stop.sh desktop",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Backend: stop uvicorn (8002)",
+      "type": "shell",
+      "command": "./scripts/dev_stop.sh backend",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Duct: stop Site + API (8002, 8090)",
+      "type": "shell",
+      "command": "./scripts/dev_stop.sh backend site",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "//": "One command for the end of a session. The desktop app is launched detached via `open`, so no debug session owns it and Stop cannot close it — without this, every desktop launch leaves an app and its sidecar running until someone notices. Touches only Duct's own ports; other projects on this machine are not its business.",
+      "label": "Duct: stop everything",
+      "type": "shell",
+      "command": "./scripts/dev_stop.sh all",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Site: stop dev server (8090)",
+      "type": "shell",
+      "command": "./scripts/dev_stop.sh site",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "//": "Catches every mail a local flow sends, so an invite or a report can be read as it would arrive rather than as a log line. Point the API at it with EMAIL_PROVIDER=smtp, SMTP_HOST=localhost, SMTP_PORT=1025, SMTP_SECURITY=none (backend/.env.example). Bound to localhost: the inbox holds whatever the flows sent. Needs `brew install mailpit`.",
+      "label": "Mailpit: catch local mail (:8025)",
+      "type": "shell",
+      "command": "mailpit --smtp 127.0.0.1:1025 --listen 127.0.0.1:8025",
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Mailpit: stop (8025)",
+      "type": "shell",
+      "command": "./scripts/dev_stop.sh mailpit",
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    }
+  ]
+}

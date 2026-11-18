@@ -1,0 +1,175 @@
+"use client";
+
+import Link from "next/link";
+import {
+  Bookmark,
+  Calendar,
+  Eye,
+  Heart,
+  ImageOff,
+  MessageCircle,
+  Share2,
+} from "lucide-react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { cdnImage, mediaUrl } from "@/lib/contentApi";
+import { SCHEDULED_META, statusMeta } from "@/lib/contentStatus";
+import { PostStatus, PostType } from "@/lib/contentEnums";
+import { metricsOf } from "@/lib/contentMetrics";
+import { PlatformGlyph, platformMeta } from "@/components/content/platformGlyphs";
+import { ClipStill } from "@/components/content/PostVideo";
+import { compactNumber, formatDate, titleCase } from "@/lib/format";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// `scheduled` is not a stored post status — it is a plan slot — so it comes
+// from its own entry rather than widening the enum's map.
+const chipFor = (status) => (status === "scheduled" ? SCHEDULED_META : statusMeta(status));
+
+// ---------------------------------------------------------------------------
+// Post card
+// ---------------------------------------------------------------------------
+
+export default function PostCard({ post }) {
+  const { t, i18n } = useLingui();
+  // Board view only needs a small image — request a width-capped CDN render
+  // when Image Resizing is enabled (full-res stays for the editor).
+  const thumb = cdnImage(mediaUrl(post.thumbnail_url), { width: 480 });
+  const platforms = Array.isArray(post.platforms) ? post.platforms : [];
+  const m = metricsOf(post.perf);
+  const hasMetrics = [m.views, m.likes, m.comments, m.shares, m.saves].some((v) => v != null);
+  const status = post.status || "pending";
+  const failureReason = post.publish_error || "";
+  const chip = chipFor(status);
+  const formatLabel = post.format_name || post.format_slug || "";
+  const published = post.posted_at;
+  const publishedOn = published ? formatDate(published, { locale: i18n.locale }) : "";
+  const dayNumber = post.day_index;
+
+  return (
+    <Link
+      href={`/content/posts/${post.id}`}
+      className="group flex flex-col overflow-hidden rounded-xl border border-border/70 bg-card transition-all hover:-translate-y-0.5 hover:border-primary/40 hover:shadow-md"
+    >
+      {/* Thumbnail */}
+      <div className="relative aspect-[4/5] w-full overflow-hidden bg-gradient-to-br from-muted/60 to-muted/20">
+        {thumb ? (
+          <img
+            src={thumb}
+            alt={post.topic || t`post preview`}
+            className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
+            loading="lazy"
+          />
+        ) : post.video?.url ? (
+          <ClipStill url={post.video.url} className="h-full w-full object-cover" />
+        ) : post.post_type === PostType.TEXT && post.caption ? (
+          // A text post's preview is its opening words, set like a post, and
+          // faded out above the platform badges rather than under them.
+          <div className="absolute inset-x-4 bottom-11 top-10 overflow-hidden [mask-image:linear-gradient(to_bottom,black_65%,transparent)]">
+            <p className="whitespace-pre-line text-sm leading-relaxed">{post.caption}</p>
+          </div>
+        ) : (
+          <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-muted-foreground">
+            <ImageOff className="h-7 w-7" />
+            <span className="text-2xs"><Trans>No preview yet</Trans></span>
+          </div>
+        )}
+
+        {/* top gradient for legibility — over a picture, not over words */}
+        {thumb && <div className="pointer-events-none absolute inset-x-0 top-0 h-16 bg-gradient-to-b from-black/40 to-transparent" />}
+
+        {/* status pill */}
+        <span className={`absolute left-2.5 top-2.5 rounded-full px-2 py-0.5 text-2xs font-semibold capitalize shadow-sm ${chip.solidClass}`}>
+          {i18n._(chip.label)}
+        </span>
+
+        {/* day badge */}
+        {post.day_index != null && (
+          <span className="absolute right-2.5 top-2.5 rounded-full bg-foreground/70 px-2 py-0.5 text-2xs font-medium text-background backdrop-blur-sm">
+            <Trans>Day {dayNumber}</Trans>
+          </span>
+        )}
+
+        {/* platform glyphs */}
+        {platforms.length > 0 && (
+          <div className="absolute bottom-2.5 left-2.5 flex items-center gap-1.5">
+            {platforms.slice(0, 5).map((p) => (
+              <span
+                key={p}
+                className="flex size-6 items-center justify-center rounded-full bg-background/95 text-foreground shadow-sm"
+              >
+                <PlatformGlyph platform={p} className="size-3.5" title={platformMeta(p).label} />
+              </span>
+            ))}
+          </div>
+        )}
+
+        {post.published_via === "duct" && (
+          <span className="absolute bottom-2.5 right-2.5 rounded-full bg-primary/90 px-2 py-0.5 text-2xs font-semibold text-primary-foreground shadow-sm">
+            <Trans>via Duct</Trans>
+          </span>
+        )}
+      </div>
+
+      {/* Body */}
+      <div className="flex flex-1 flex-col gap-2.5 p-3.5">
+        <h3 className="line-clamp-2 text-sm font-semibold leading-snug group-hover:text-brand">
+          {post.topic || post.post_dir_slug || t`Untitled post`}
+        </h3>
+
+        {/* The chip says Failed; this says why, in the scheduler's own words
+            (vendor text, so it is shown as sent, not translated). */}
+        {status === PostStatus.FAILED && (
+          <p className="line-clamp-3 text-xs text-destructive">
+            {failureReason
+              ? <Trans>Your scheduler didn't publish it: {failureReason}</Trans>
+              : <Trans>Your scheduler didn't publish it at its scheduled time.</Trans>}
+          </p>
+        )}
+
+        <div className="flex flex-wrap items-center gap-1.5">
+          {post.pillar && (
+            <span className="rounded-full bg-primary/10 px-2 py-0.5 text-2xs font-medium text-brand">
+              {titleCase(post.pillar)}
+            </span>
+          )}
+          {formatLabel && (
+            <span className="rounded-full border border-border/70 px-2 py-0.5 text-2xs text-muted-foreground">
+              {formatLabel}
+            </span>
+          )}
+        </div>
+
+        {/* Metrics */}
+        {hasMetrics ? (
+          <div className="mt-auto flex flex-wrap items-center gap-x-3 gap-y-1 pt-1 text-2xs text-muted-foreground">
+            <Metric icon={Eye}           value={m.views} />
+            <Metric icon={Heart}         value={m.likes} />
+            <Metric icon={MessageCircle} value={m.comments} />
+            <Metric icon={Share2}        value={m.shares} />
+            <Metric icon={Bookmark}      value={m.saves} />
+          </div>
+        ) : (
+          <p className="mt-auto pt-1 text-2xs text-muted-foreground"><Trans>No metrics yet</Trans></p>
+        )}
+
+        {/* Footer */}
+        <div className="flex items-center gap-1.5 border-t border-border/40 pt-2 text-2xs text-muted-foreground">
+          <Calendar className="h-3 w-3" />
+          {published ? <span><Trans>Published {publishedOn}</Trans></span> : <span className="italic"><Trans>Not published</Trans></span>}
+        </div>
+      </div>
+    </Link>
+  );
+}
+
+function Metric({ icon: Icon, value }) {
+  if (value == null) return null;
+  return (
+    <span className="inline-flex items-center gap-1 tabular-nums">
+      <Icon className="h-3.5 w-3.5" />
+      {compactNumber(value)}
+    </span>
+  );
+}

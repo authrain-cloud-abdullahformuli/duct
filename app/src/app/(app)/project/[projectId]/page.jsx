@@ -1,0 +1,915 @@
+"use client";
+
+// Project context — the editor for one project.
+//
+// This was the onboarding wizard. Onboarding is `/start` now (the audit is
+// the onboarding), and what the wizard was actually good at — five short
+// screens that edit the durable facts every agent reads — stays, minus the
+// job of creating a project from nothing. A project arrives here already
+// drafted from its site: every drafted field carries a chip saying where the
+// value came from and a one-click confirm, so reviewing a draft is faster
+// than filling a form ever was (lib/projectDraft.js holds the rules).
+
+import Link from "next/link";
+import { useEffect, useMemo, useState } from "react";
+import { useParams } from "next/navigation";
+import { Brain, Check, FileText, Globe, Sparkles, Users, X } from "lucide-react";
+import { Plural, Trans, useLingui } from "@lingui/react/macro";
+import { msg } from "@lingui/core/macro";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { cn } from "@/lib/utils";
+import {
+  getProjectById,
+  hydrateProjectsFromBackend,
+  pushProjectToBackend,
+  saveProject,
+  setActiveProjectId,
+} from "../../../../lib/projects";
+import {
+  PROVENANCE_CRAWL,
+  PROVENANCE_DOCUMENT,
+  PROVENANCE_INFERRED,
+  PROVENANCE_USER,
+  markConfirmed,
+} from "../../../../lib/projectDraft";
+import { fetchProjectConfig, getFallbackProjectConfig } from "../../../../lib/projectConfig";
+import { Textarea } from "@/components/ui/textarea";
+import { Page, PageHeader } from "@/components/ui/page";
+
+// `value` is what the profile stores and the prompts read, so it stays
+// English; `label` is what the person picking it sees.
+const PRIMARY_SEGMENTS = [
+  { value: "Consumer", label: msg`Consumer` },
+  { value: "SMB", label: msg`SMB` },
+  { value: "Mid-market", label: msg`Mid-market` },
+  { value: "Enterprise", label: msg`Enterprise` },
+  { value: "Public sector", label: msg`Public sector` },
+  { value: "Non-profit", label: msg`Non-profit` },
+  { value: "Other", label: msg`Other` },
+];
+const BRAND_VOICES = [
+  { value: "Professional", label: msg`Professional` },
+  { value: "Friendly", label: msg`Friendly` },
+  { value: "Bold", label: msg`Bold` },
+  { value: "Technical", label: msg`Technical` },
+  { value: "Playful", label: msg`Playful` },
+];
+const GROWTH_MOTIONS = [
+  { value: "Organic", label: msg`Organic` },
+  { value: "Paid", label: msg`Paid` },
+  { value: "Product-led", label: msg`Product-led` },
+  { value: "Sales-led", label: msg`Sales-led` },
+  { value: "Partnerships", label: msg`Partnerships` },
+  { value: "Community", label: msg`Community` },
+  { value: "Lifecycle/CRM", label: msg`Lifecycle/CRM` },
+];
+const TOTAL_STEPS = 5;
+
+// `#brand` from the Content Studio's brand form lands on the step that owns
+// the field, rather than on step one with the right answer three clicks away.
+const STEP_BY_ANCHOR = { about: 1, targets: 2, audience: 3, competition: 4, brand: 5 };
+
+function parseComparisonItems(rawValue) {
+  return Array.from(
+    new Set(
+      String(rawValue || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function hasText(value) {
+  return String(value ?? "").trim().length > 0;
+}
+
+const STEP_DEFINITIONS = [
+  {
+    label: msg`About your business`,
+    shortLabel: msg`About`,
+    fields: [
+      { weight: 3, check: (profile) => hasText(profile.company?.name) },
+      { weight: 2, check: (profile) => hasText(profile.company?.pitch) },
+      { weight: 3, check: (profile) => hasText(profile.company?.industry) },
+      { weight: 2, check: (profile) => hasText(profile.company?.business_model) },
+      { weight: 1, check: (profile) => hasText(profile.company?.website_url) },
+    ],
+  },
+  {
+    label: msg`Targets`,
+    shortLabel: msg`Targets`,
+    fields: [
+      { weight: 2, check: (profile) => hasText(profile.targets?.north_star_metric) },
+      { weight: 2, check: (profile) => hasText(profile.targets?.north_star_goal_window) },
+      { weight: 2, check: (profile) => hasText(profile.targets?.growth_stage_milestone) },
+    ],
+  },
+  {
+    label: msg`Audience`,
+    shortLabel: msg`Audience`,
+    fields: [
+      { weight: 2, check: (profile) => hasText(profile.audience?.primary_segment) },
+      { weight: 3, check: (profile) => (profile.audience.personas[0]?.name || "").trim().length > 0 },
+      { weight: 2, check: (profile) => (profile.audience.personas[0]?.description || "").trim().length > 0 },
+    ],
+  },
+  {
+    label: msg`Competition`,
+    shortLabel: msg`Competition`,
+    fields: [
+      { weight: 1, check: (profile) => hasText(profile.competition?.compare_against) },
+    ],
+  },
+  {
+    label: msg`Business context`,
+    shortLabel: msg`Context`,
+    fields: [
+      { weight: 2, check: (profile) => hasText(profile.brand_channels?.brand_voice) },
+      { weight: 2, check: (profile) => (profile.brand_channels?.growth_motions || []).length > 0 },
+      { weight: 1, check: (profile) => hasText(profile.brand_channels?.context_notes) },
+    ],
+  },
+];
+
+
+// Where a drafted value came from, beside its label. Confirming marks the
+// field as the user's, so a later draft leaves it alone.
+const PROVENANCE_COPY = {
+  [PROVENANCE_CRAWL]: { label: msg`From your site`, Icon: Globe },
+  [PROVENANCE_DOCUMENT]: { label: msg`From your files`, Icon: FileText },
+  [PROVENANCE_INFERRED]: { label: msg`Duct's guess`, Icon: Sparkles },
+};
+
+function ProvenanceChip({ source, onConfirm }) {
+  const { i18n } = useLingui();
+  const copy = PROVENANCE_COPY[source];
+  if (!copy) return null;
+  const { label, Icon } = copy;
+  return (
+    <span className="ml-1 inline-flex items-center gap-1 align-middle">
+      <Badge variant="outline" className="gap-1 font-normal text-muted-foreground">
+        <Icon aria-hidden />
+        {i18n._(label)}
+      </Badge>
+      <button
+        type="button"
+        onClick={onConfirm}
+        className="inline-flex items-center gap-0.5 rounded-3xl px-1.5 text-xs font-medium text-brand hover:bg-primary/10"
+      >
+        <Check className="size-3" aria-hidden />
+        <Trans>Looks right</Trans>
+      </button>
+    </span>
+  );
+}
+
+export default function ProjectContextPage() {
+  const { t, i18n } = useLingui();
+  const { projectId } = useParams();
+  const [ready, setReady] = useState(false);
+  const [step, setStep] = useState(1);
+  const [projectMeta, setProjectMeta] = useState(null);
+  const [projectLoadError, setProjectLoadError] = useState("");
+  const [projectConfig, setProjectConfig] = useState(getFallbackProjectConfig);
+  const [projectConfigLoading, setProjectConfigLoading] = useState(false);
+  const [projectConfigError, setProjectConfigError] = useState("");
+  const [provenance, setProvenance] = useState({});
+  const [profile, setProfile] = useState({
+    company: { name: "", pitch: "", industry: "", business_model: "", website_url: "" },
+    targets: {
+      monthly_budget: "",
+      target_cpa: "",
+      target_roas: "",
+      primary_kpi: "",
+      north_star_metric: "",
+      north_star_goal_window: "",
+      north_star_constraints: "",
+      growth_stage_milestone: "",
+      growth_stage_context: "",
+    },
+    audience: { primary_segment: "", personas: [{ name: "", description: "", priority: "primary" }] },
+    competition: { compare_against: "", competitors: [{ name: "", differentiator: "" }], positioning_statement: "" },
+    brand_channels: {
+      brand_voice: "",
+      growth_motions: [],
+      context_notes: "",
+      active_channels: [],
+      seasonality_notes: "",
+    },
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      let project = getProjectById(projectId);
+      if (!project) {
+        // Opened on a device that has never seen this project — an invite, a
+        // second laptop. The server is the durable store; ask it once.
+        try {
+          await hydrateProjectsFromBackend();
+        } catch {
+          /* offline: fall through to the not-found state */
+        }
+        project = getProjectById(projectId);
+      }
+      if (cancelled) return;
+      if (!project) {
+        setProjectMeta(null);
+        setProjectLoadError(t`Project not found. It may have been deleted, or you may not be a member.`);
+        setReady(true);
+        return;
+      }
+      setActiveProjectId(project.id);
+      setProjectMeta(project);
+      setProvenance(project.provenance || {});
+      const draft = project;
+      setProfile((prev) => ({
+        ...prev,
+        ...draft,
+        company: { ...prev.company, ...(draft.company || {}) },
+        targets: { ...prev.targets, ...(draft.targets || {}) },
+        audience: {
+          ...prev.audience,
+          ...(draft.audience || {}),
+          personas:
+            Array.isArray(draft.audience?.personas) && draft.audience.personas.length
+              ? draft.audience.personas
+              : prev.audience.personas,
+        },
+        competition: {
+          ...prev.competition,
+          ...(draft.competition || {}),
+          competitors:
+            Array.isArray(draft.competition?.competitors) && draft.competition.competitors.length
+              ? draft.competition.competitors
+              : prev.competition.competitors,
+          positioning_statement: draft.competition?.positioning_statement ?? prev.competition.positioning_statement,
+        },
+        brand_channels: { ...prev.brand_channels, ...(draft.brand_channels || {}) },
+      }));
+      const anchor = typeof window !== "undefined" ? window.location.hash.replace("#", "") : "";
+      if (STEP_BY_ANCHOR[anchor]) setStep(STEP_BY_ANCHOR[anchor]);
+      setReady(true);
+    }
+    load();
+    return () => {
+      cancelled = true;
+    };
+    // `t` only words the not-found message; a locale switch must not reload
+    // the project and discard what is being typed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!ready) return;
+    let cancelled = false;
+    async function loadProjectConfig() {
+      setProjectConfigLoading(true);
+      try {
+        const config = await fetchProjectConfig({
+          industry: profile.company.industry,
+          businessModel: profile.company.business_model,
+        });
+        if (cancelled) return;
+        setProjectConfig(config);
+        setProjectConfigError("");
+      } catch {
+        if (cancelled) return;
+        setProjectConfig(getFallbackProjectConfig());
+        setProjectConfigError(t`Using fallback options while config service is unavailable.`);
+      } finally {
+        if (!cancelled) {
+          setProjectConfigLoading(false);
+        }
+      }
+    }
+    loadProjectConfig();
+    return () => {
+      cancelled = true;
+    };
+    // Same reason as above: `t` is not a reason to refetch the config.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, profile.company.industry, profile.company.business_model]);
+
+  // Every keystroke lands in the local store; the backend is written at the
+  // save buttons below.
+  useEffect(() => {
+    if (!ready || !projectMeta?.id) return;
+    saveProject({
+      ...projectMeta,
+      ...profile,
+      provenance,
+      name: projectMeta.name || profile.company.name || "Untitled project",
+    });
+  }, [profile, provenance, projectMeta, ready]);
+
+  const stepProgress = useMemo(
+    () =>
+      STEP_DEFINITIONS.map((stepDef) => {
+        const totalWeight = stepDef.fields.reduce((sum, field) => sum + field.weight, 0);
+        const completedWeight = stepDef.fields.reduce(
+          (sum, field) => sum + (field.check(profile) ? field.weight : 0),
+          0
+        );
+        const percent = Math.round((completedWeight / totalWeight) * 100);
+        return { ...stepDef, totalWeight, completedWeight, percent };
+      }),
+    [profile]
+  );
+  const inputProgressPercent = useMemo(() => {
+    const completedWeight = stepProgress.reduce((sum, item) => sum + item.completedWeight, 0);
+    const totalWeight = stepProgress.reduce((sum, item) => sum + item.totalWeight, 0);
+    return Math.round((completedWeight / totalWeight) * 100);
+  }, [stepProgress]);
+  const comparisonItems = useMemo(
+    () => parseComparisonItems(profile.competition.compare_against),
+    [profile.competition.compare_against]
+  );
+  const [comparisonInput, setComparisonInput] = useState("");
+  const industryOptions = projectConfig?.industry_options ?? [];
+  const businessModelOptions = projectConfig?.business_model_options ?? [];
+  const northStarOptions = projectConfig?.north_star_metric_options ?? [];
+  const growthStageOptions = projectConfig?.growth_stage_milestone_options ?? [];
+  const hasCompanyContext = Boolean(profile.company.industry && profile.company.business_model);
+  const drafted = Object.values(provenance).filter((v) => v !== PROVENANCE_USER).length;
+
+  // Typing into a field is as good as confirming it, drafted or not. The
+  // server settles a save by these labels: a field marked as the person's wins,
+  // even when it was cleared, where an unmarked empty one is taken for a copy
+  // that never had the value and is left alone.
+  function own(key) {
+    setProvenance((prev) => (prev[key] === PROVENANCE_USER ? prev : { ...prev, [key]: PROVENANCE_USER }));
+  }
+
+  function Prov({ k }) {
+    const source = provenance[k];
+    if (!source || source === PROVENANCE_USER) return null;
+    return <ProvenanceChip source={source} onConfirm={() => own(k)} />;
+  }
+
+  function handleIndustryChange(value) {
+    own("industry");
+    setProfile((prev) => ({
+      ...prev,
+      company: { ...prev.company, industry: value },
+      targets: { ...prev.targets, north_star_metric: "", growth_stage_milestone: "" },
+    }));
+  }
+
+  function handleBusinessModelChange(value) {
+    own("business_model");
+    setProfile((prev) => ({
+      ...prev,
+      company: { ...prev.company, business_model: value },
+      targets: { ...prev.targets, north_star_metric: "", growth_stage_milestone: "" },
+    }));
+  }
+
+  function goNext() {
+    setStep((current) => Math.min(current + 1, TOTAL_STEPS));
+  }
+
+  function persist() {
+    const merged = {
+      ...(projectMeta || {}),
+      ...profile,
+      provenance,
+      name: projectMeta?.name || profile.company.name || "Untitled project",
+    };
+    const saved = saveProject(merged);
+    window.dispatchEvent(new Event("duct:project-changed"));
+    pushProjectToBackend(saved);
+    return saved;
+  }
+
+  // "Save & Next": the deliberate persistence point. Saves locally, upserts to
+  // the backend (fire-and-forget), then advances.
+  function saveAndNext() {
+    persist();
+    goNext();
+  }
+
+  function saveProjectFinal() {
+    persist();
+  }
+
+  function goBack() {
+    setStep((current) => Math.max(current - 1, 1));
+  }
+
+  function skipStep() {
+    goNext();
+  }
+
+  function goToStep(targetStep) {
+    if (targetStep < 1 || targetStep > TOTAL_STEPS) return;
+    setStep(targetStep);
+  }
+
+  function addCompetitionItems(rawValue) {
+    const incoming = parseComparisonItems(rawValue);
+    if (!incoming.length) return;
+    own("compare_against");
+    setProfile((prev) => {
+      const existing = parseComparisonItems(prev.competition.compare_against);
+      const merged = Array.from(new Set([...existing, ...incoming]));
+      return { ...prev, competition: { ...prev.competition, compare_against: merged.join(", ") } };
+    });
+    setComparisonInput("");
+  }
+
+  function removeCompetitionItem(itemToRemove) {
+    own("compare_against");
+    setProfile((prev) => {
+      const next = parseComparisonItems(prev.competition.compare_against).filter((item) => item !== itemToRemove);
+      return { ...prev, competition: { ...prev.competition, compare_against: next.join(", ") } };
+    });
+  }
+
+  if (!ready) {
+    return (
+      <Page width="narrow">
+        <PageHeader title={<Trans>Project context</Trans>} />
+        <div className="flex flex-col gap-5" role="status" aria-label={t`Loading the project`}>
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="flex flex-col gap-2">
+              <Skeleton className="h-3.5 w-28 rounded" />
+              <Skeleton className="h-9" />
+            </div>
+          ))}
+        </div>
+      </Page>
+    );
+  }
+
+  if (projectLoadError) {
+    return (
+      <Page width="narrow">
+        <PageHeader title={<Trans>Project context</Trans>} status={projectLoadError} />
+        <Button asChild className="self-start">
+          <Link href="/projects"><Trans>Back to projects</Trans></Link>
+        </Button>
+      </Page>
+    );
+  }
+
+  return (
+    <Page width="narrow">
+      <PageHeader
+        title={<Trans>Project context</Trans>}
+        status={
+          drafted > 0 ? (
+            <Plural value={drafted} one="# drafted field to confirm" other="# drafted fields to confirm" />
+          ) : (
+            <Trans>{inputProgressPercent}% complete</Trans>
+          )
+        }
+        // Members live with the project they grant access to; the targets set
+        // here become project memory, so its timeline sits beside the form.
+        actions={
+          <>
+            <Button asChild variant="outline" size="sm">
+              <Link href={`/project/${projectMeta.id}/memory`}>
+                <Brain className="size-4" />
+                <Trans>Memory</Trans>
+              </Link>
+            </Button>
+            <Button asChild variant="outline" size="sm">
+              <Link href={`/project/${projectMeta.id}/members`}>
+                <Users className="size-4" />
+                <Trans>Members</Trans>
+              </Link>
+            </Button>
+          </>
+        }
+      />
+
+      {/* Sticky progress shell */}
+      <div className="project-progress-shell">
+        <div className="mb-3">
+          <Progress value={inputProgressPercent} className="h-1.5" />
+        </div>
+
+        <div className="flex items-center gap-3 overflow-x-auto pb-1" role="list" aria-label={t`Project context sections`}>
+          {stepProgress.map((stepItem, index) => {
+            const stepNumber = index + 1;
+            const isActive = step === stepNumber;
+            const isDone = stepItem.percent === 100;
+            return (
+              <div
+                key={stepNumber}
+                role="listitem"
+                className="inline-flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <button
+                  type="button"
+                  onClick={() => goToStep(stepNumber)}
+                  className={cn(
+                    "rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors",
+                    isActive
+                      ? "border-primary/30 bg-primary/8 text-foreground font-semibold"
+                      : "border-transparent bg-muted/70 text-muted-foreground hover:border-border hover:bg-muted"
+                  )}
+                >
+                  {i18n._(stepItem.shortLabel)}
+                </button>
+                {isDone && <Check className="size-3.5 text-brand" aria-hidden="true" />}
+                {index < TOTAL_STEPS - 1 && (
+                  <span className="inline-block h-px w-3 bg-border" aria-hidden="true" />
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Step 1: About your business */}
+      {step === 1 && (
+        <div id="about" className="grid gap-4">
+          <p className="text-sm text-muted-foreground">
+            <Trans>Tell us who you are and what you do. This anchors every audit and report we generate.</Trans>
+          </p>
+          <div className="grid gap-1.5">
+            <Label htmlFor="company-name"><Trans>Company name</Trans> <Prov k="company_name" /></Label>
+            <Input
+              id="company-name"
+              value={profile.company.name}
+              onChange={(e) => {
+                own("company_name");
+                setProfile((prev) => ({ ...prev, company: { ...prev.company, name: e.target.value } }));
+              }}
+              placeholder={t`Your company`}
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="company-pitch"><Trans>Your one-line pitch</Trans> <Prov k="pitch" /></Label>
+            <Input
+              id="company-pitch"
+              value={profile.company.pitch}
+              onChange={(e) => {
+                own("pitch");
+                setProfile((prev) => ({ ...prev, company: { ...prev.company, pitch: e.target.value } }));
+              }}
+              placeholder={t`e.g. A meal-planning app for busy families.`}
+            />
+            <p className="text-xs text-muted-foreground">
+              <Trans>If a stranger asked what you do, what would you say?</Trans>
+            </p>
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="company-industry"><Trans>Industry</Trans> <Prov k="industry" /></Label>
+            <Select value={profile.company.industry} onValueChange={handleIndustryChange}>
+              <SelectTrigger id="company-industry">
+                <SelectValue placeholder={t`Select industry...`} />
+              </SelectTrigger>
+              <SelectContent>
+                {industryOptions.map((industry) => (
+                  <SelectItem key={industry.value} value={industry.value}>{industry.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="company-business-model"><Trans>Business model</Trans> <Prov k="business_model" /></Label>
+            <Select value={profile.company.business_model} onValueChange={handleBusinessModelChange}>
+              <SelectTrigger id="company-business-model">
+                <SelectValue placeholder={t`Select business model...`} />
+              </SelectTrigger>
+              <SelectContent>
+                {businessModelOptions.map((model) => (
+                  <SelectItem key={model.value} value={model.value}>{model.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="company-website"><Trans>Website <span className="text-muted-foreground">(optional)</span></Trans> <Prov k="website_url" /></Label>
+            <Input
+              id="company-website"
+              value={profile.company.website_url}
+              onChange={(e) => {
+                own("website_url");
+                setProfile((prev) => ({ ...prev, company: { ...prev.company, website_url: e.target.value } }));
+              }}
+              placeholder={t`https://example.com`}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Step 2: Targets */}
+      {step === 2 && (
+        <div id="targets" className="grid gap-4">
+          <p className="text-sm text-muted-foreground">
+            <Trans>Define your North Star metric and current growth stage. Channel-specific KPIs stay in report generation.</Trans>
+          </p>
+          <div className="grid gap-1.5">
+            <Label htmlFor="north-star-metric"><Trans>North Star metric</Trans></Label>
+            <Select
+              value={profile.targets.north_star_metric}
+              disabled={!hasCompanyContext || projectConfigLoading}
+              onValueChange={(val) =>
+                setProfile((prev) => ({ ...prev, targets: { ...prev.targets, north_star_metric: val } }))
+              }
+            >
+              <SelectTrigger id="north-star-metric">
+                <SelectValue placeholder={t`Select North Star metric...`} />
+              </SelectTrigger>
+              <SelectContent>
+                {northStarOptions.map((metric) => (
+                  <SelectItem key={metric.value} value={metric.value}>{metric.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {!hasCompanyContext ? (
+              <p className="text-xs text-muted-foreground">
+                <Trans>Select Industry and Business model first to load relevant North Star options.</Trans>
+              </p>
+            ) : null}
+            {projectConfigError ? <p className="text-xs text-muted-foreground">{projectConfigError}</p> : null}
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="north-star-goal-window"><Trans>What does success look like in the next 90 days?</Trans></Label>
+            <Textarea
+              id="north-star-goal-window"
+              rows={3}
+              value={profile.targets.north_star_goal_window}
+              onChange={(e) =>
+                setProfile((prev) => ({ ...prev, targets: { ...prev.targets, north_star_goal_window: e.target.value } }))
+              }
+              placeholder={t`e.g. Reach 500 weekly active users with at least 40% week-4 retention.`}
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="growth-stage-milestone"><Trans>Current growth stage (milestone-based)</Trans></Label>
+            <Select
+              value={profile.targets.growth_stage_milestone}
+              disabled={!hasCompanyContext || projectConfigLoading}
+              onValueChange={(val) =>
+                setProfile((prev) => ({ ...prev, targets: { ...prev.targets, growth_stage_milestone: val } }))
+              }
+            >
+              <SelectTrigger id="growth-stage-milestone">
+                <SelectValue placeholder={t`Select your current milestone...`} />
+              </SelectTrigger>
+              <SelectContent>
+                {growthStageOptions.map((stage) => (
+                  <SelectItem key={stage.value} value={stage.value}>{stage.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="north-star-constraints"><Trans>What currently limits this metric most? <span className="text-muted-foreground">(optional)</span></Trans></Label>
+            <Textarea
+              id="north-star-constraints"
+              rows={3}
+              value={profile.targets.north_star_constraints}
+              onChange={(e) =>
+                setProfile((prev) => ({ ...prev, targets: { ...prev.targets, north_star_constraints: e.target.value } }))
+              }
+              placeholder={t`e.g. Limited sales capacity, high onboarding drop-off, or long implementation cycles.`}
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="growth-stage-context"><Trans>Growth stage context or constraints <span className="text-muted-foreground">(optional)</span></Trans></Label>
+            <Textarea
+              id="growth-stage-context"
+              rows={2}
+              value={profile.targets.growth_stage_context}
+              onChange={(e) =>
+                setProfile((prev) => ({ ...prev, targets: { ...prev.targets, growth_stage_context: e.target.value } }))
+              }
+              placeholder={t`e.g. Team of 3, founder-led sales, runway for 8 months.`}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Step 3: Audience */}
+      {step === 3 && (
+        <div id="audience" className="grid gap-4">
+          <div className="grid gap-1.5">
+            <Label htmlFor="primary-segment"><Trans>Primary segment</Trans></Label>
+            <Select
+              value={profile.audience.primary_segment}
+              onValueChange={(val) =>
+                setProfile((prev) => ({ ...prev, audience: { ...prev.audience, primary_segment: val } }))
+              }
+            >
+              <SelectTrigger id="primary-segment">
+                <SelectValue placeholder={t`Select primary segment...`} />
+              </SelectTrigger>
+              <SelectContent>
+                {PRIMARY_SEGMENTS.map((segment) => (
+                  <SelectItem key={segment.value} value={segment.value}>{i18n._(segment.label)}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="persona-name"><Trans>Primary persona name</Trans> <Prov k="personas" /></Label>
+            <Input
+              id="persona-name"
+              value={profile.audience.personas[0]?.name || ""}
+              onChange={(e) => {
+                own("personas");
+                setProfile((prev) => ({
+                  ...prev,
+                  audience: {
+                    ...prev.audience,
+                    personas: [{
+                      ...(prev.audience.personas[0] || {}),
+                      name: e.target.value,
+                      description: prev.audience.personas[0]?.description || "",
+                      priority: prev.audience.personas[0]?.priority || "primary",
+                    }, ...prev.audience.personas.slice(1)],
+                  },
+                }));
+              }}
+              placeholder={t`Marketing managers at SaaS startups`}
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="persona-desc"><Trans>Persona description</Trans></Label>
+            <Textarea
+              id="persona-desc"
+              rows={3}
+              value={profile.audience.personas[0]?.description || ""}
+              onChange={(e) => {
+                own("personas");
+                setProfile((prev) => ({
+                  ...prev,
+                  audience: {
+                    ...prev.audience,
+                    personas: [{
+                      ...(prev.audience.personas[0] || {}),
+                      description: e.target.value,
+                      name: prev.audience.personas[0]?.name || "",
+                      priority: prev.audience.personas[0]?.priority || "primary",
+                    }, ...prev.audience.personas.slice(1)],
+                  },
+                }));
+              }}
+              placeholder={t`Pain points, goals, motivations...`}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Step 4: Competition */}
+      {step === 4 && (
+        <div id="competition" className="grid gap-4">
+          <div className="grid gap-1.5">
+            <Label htmlFor="compare-against"><Trans>Who do customers compare you against most often?</Trans> <Prov k="compare_against" /></Label>
+            <Input
+              id="compare-against"
+              value={comparisonInput}
+              onChange={(e) => setComparisonInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === ",") {
+                  e.preventDefault();
+                  addCompetitionItems(comparisonInput);
+                }
+              }}
+              onBlur={() => addCompetitionItems(comparisonInput)}
+              placeholder={t`e.g. Notion, HubSpot, in-house spreadsheets`}
+            />
+            <p className="text-xs text-muted-foreground">
+              <Trans>Add one or more names, separated by commas.</Trans>
+            </p>
+            {comparisonItems.length > 0 && (
+              <div className="flex flex-wrap gap-2 pt-1">
+                {comparisonItems.map((item) => (
+                  <Badge key={item} variant="secondary" className="inline-flex items-center gap-1 pr-1">
+                    <span>{item}</span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="size-4 rounded-full"
+                      onClick={() => removeCompetitionItem(item)}
+                      aria-label={t`Remove ${item}`}
+                    >
+                      <X className="size-3" />
+                    </Button>
+                  </Badge>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Step 5: Business context */}
+      {step === 5 && (
+        <div id="brand" className="grid gap-4">
+          <p className="text-sm text-muted-foreground">
+            <Trans>Capture durable business context that applies across paid, organic, and product intelligence use cases.</Trans>
+          </p>
+          <div className="grid gap-1.5">
+            <Label htmlFor="brand-voice"><Trans>Brand voice</Trans> <Prov k="brand_voice" /></Label>
+            <Select
+              value={profile.brand_channels.brand_voice}
+              onValueChange={(val) => {
+                own("brand_voice");
+                setProfile((prev) => ({ ...prev, brand_channels: { ...prev.brand_channels, brand_voice: val } }));
+              }}
+            >
+              <SelectTrigger id="brand-voice">
+                <SelectValue placeholder={t`Select voice...`} />
+              </SelectTrigger>
+              <SelectContent>
+                {BRAND_VOICES.map((voice) => (
+                  <SelectItem key={voice.value} value={voice.value}>{i18n._(voice.label)}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="grid gap-1.5">
+            <Label><Trans>Primary growth motions</Trans></Label>
+            <div className="flex flex-wrap gap-2">
+              {GROWTH_MOTIONS.map((motion) => {
+                const active = profile.brand_channels.growth_motions.includes(motion.value);
+                return (
+                  <Button
+                    key={motion.value}
+                    type="button"
+                    variant={active ? "default" : "outline"}
+                    size="sm"
+                    onClick={() =>
+                      setProfile((prev) => ({
+                        ...prev,
+                        brand_channels: {
+                          ...prev.brand_channels,
+                          growth_motions: active
+                            ? prev.brand_channels.growth_motions.filter((item) => item !== motion.value)
+                            : [...prev.brand_channels.growth_motions, motion.value],
+                        },
+                      }))
+                    }
+                  >
+                    {i18n._(motion.label)}
+                  </Button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="grid gap-1.5">
+            <Label htmlFor="context-notes"><Trans>Additional business context</Trans></Label>
+            <Textarea
+              id="context-notes"
+              rows={2}
+              value={profile.brand_channels.context_notes}
+              onChange={(e) =>
+                setProfile((prev) => ({
+                  ...prev,
+                  brand_channels: { ...prev.brand_channels, context_notes: e.target.value },
+                }))
+              }
+              placeholder={t`e.g. Strong Q4 seasonality, long enterprise sales cycle, or limited engineering bandwidth.`}
+            />
+          </div>
+
+        </div>
+      )}
+
+      <div className="project-actions">
+        {step > 1 && (
+          <Button type="button" variant="outline" onClick={goBack}>
+            <Trans>Back</Trans>
+          </Button>
+        )}
+        {step < TOTAL_STEPS ? (
+          <Button type="button" onClick={saveAndNext}>
+            <Trans>Save & Next</Trans>
+          </Button>
+        ) : (
+          <Button type="button" onClick={saveProjectFinal}>
+            <Trans>Save project</Trans>
+          </Button>
+        )}
+        {step > 1 && step < TOTAL_STEPS && (
+          <Button type="button" variant="ghost" onClick={skipStep}>
+            <Trans>I&apos;ll do this later</Trans>
+          </Button>
+        )}
+      </div>
+    </Page>
+  );
+}

@@ -1,0 +1,204 @@
+"use client";
+
+// Invitation landing page. Lives outside the (app) route group on purpose: the
+// recipient is usually signed out, so it must render without AuthGuard and show
+// who invited them before asking them to sign in.
+
+import { use, useCallback, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
+import GoogleSignInButton from "@/components/GoogleSignInButton";
+import { acceptInvitation, fetchInvitation } from "@/lib/membersApi";
+import { hydrateProjectsFromBackend, setActiveProjectId } from "@/lib/projects";
+import {
+  POST_SIGNIN_REDIRECT_KEY,
+  authToken,
+  clearAuthToken,
+  decodeJwtPayload,
+} from "@/lib/authFetch";
+
+// Read by the sign-in page after the OAuth round trip, so the invite survives
+// the redirect through Google without ever putting the token in an OAuth param.
+
+// The wordmark is a name, not copy: the literal-string check lets "Duct"
+// through by name and this is the same word set in the logo's lowercase.
+const WORDMARK = "duct";
+
+function signedInEmail() {
+  if (typeof window === "undefined") return "";
+  const payload = decodeJwtPayload(authToken());
+  if (!payload?.exp || payload.exp * 1000 <= Date.now()) return "";
+  return (payload.sub || "").toLowerCase();
+}
+
+function Shell({ children }) {
+  return (
+    <main
+      id="main-content"
+      className="flex min-h-dvh items-center justify-center bg-background px-4 py-10"
+      tabIndex={-1}
+    >
+      <div className="w-full max-w-md rounded-3xl border border-border bg-card p-7 shadow-sm ring-1 ring-foreground/5">
+        <div className="mb-6 flex items-center gap-1.5">
+          <span className="font-serif text-lg tracking-tight text-foreground">{WORDMARK}</span>
+          <span className="size-2 rounded-full bg-[var(--orange)]" aria-hidden />
+        </div>
+        {children}
+      </div>
+    </main>
+  );
+}
+
+export default function InvitePage({ params }) {
+  const { token } = use(params);
+  const router = useRouter();
+  const { t } = useLingui();
+
+  const [invitation, setInvitation] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [accepting, setAccepting] = useState(false);
+  const [viewerEmail, setViewerEmail] = useState("");
+
+  useEffect(() => {
+    setViewerEmail(signedInEmail());
+    fetchInvitation(token)
+      .then(setInvitation)
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false));
+  }, [token]);
+
+  const accept = useCallback(async () => {
+    setAccepting(true);
+    setError("");
+    try {
+      const result = await acceptInvitation(token);
+      // Pull the newly shared project into the local cache and make it active,
+      // so the app opens on the project they were invited to.
+      await hydrateProjectsFromBackend();
+      setActiveProjectId(result.project_id);
+      window.dispatchEvent(new Event("duct:project-changed"));
+      router.replace(`/project/${result.project_id}/members`);
+    } catch (err) {
+      setError(err.message);
+      setAccepting(false);
+    }
+  }, [token, router]);
+
+  function goSignIn() {
+    try {
+      sessionStorage.setItem(POST_SIGNIN_REDIRECT_KEY, `/invite/${token}`);
+    } catch {
+      // Private mode with storage disabled — they'll land on the app home and
+      // can reopen the emailed link.
+    }
+    router.push("/");
+  }
+
+  if (loading) {
+    return (
+      <Shell>
+        <p className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Spinner className="size-4" />
+          <Trans>Checking your invitation…</Trans>
+        </p>
+      </Shell>
+    );
+  }
+
+  if (!invitation) {
+    return (
+      <Shell>
+        <h1 className="mb-2 font-serif text-xl text-foreground"><Trans>Invitation unavailable</Trans></h1>
+        <p className="mb-6 text-sm text-muted-foreground">
+          {error || t`This invitation link is invalid, expired, or has already been used.`}
+        </p>
+        <p className="text-sm text-muted-foreground">
+          <Trans>
+            Ask whoever invited you to send a new one, or{" "}
+            <a className="underline underline-offset-2" href="/">
+              sign in
+            </a>{" "}
+            if you already have access.
+          </Trans>
+        </p>
+      </Shell>
+    );
+  }
+
+  const inviter = invitation.inviter_name || invitation.inviter_email;
+  const projectName = invitation.project_name || t`a project`;
+  const invitedEmail = invitation.invited_email;
+  const signedIn = Boolean(viewerEmail);
+  const wrongAccount = signedIn && viewerEmail !== invitation.invited_email;
+
+  return (
+    <Shell>
+      <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-brand">
+        <Trans>Project invitation</Trans>
+      </p>
+      <h1 className="mb-3 font-serif text-2xl leading-snug text-foreground">
+        {inviter ? (
+          <Trans>
+            {inviter} invited you to <em className="text-brand">{projectName}</em>
+          </Trans>
+        ) : (
+          <Trans>
+            You've been invited to <em className="text-brand">{projectName}</em>
+          </Trans>
+        )}
+      </h1>
+      <p className="mb-6 text-sm text-muted-foreground">
+        <Trans>
+          You&rsquo;ll join as a collaborator — you can open the project, run audits and insights, and
+          work on content with the rest of the team.
+        </Trans>
+      </p>
+
+      {error && <p className="mb-4 text-sm text-destructive">{error}</p>}
+
+      {!signedIn && (
+        <>
+          <GoogleSignInButton onClick={goSignIn} />
+          <p className="mt-3 text-center text-xs text-muted-foreground">
+            <Trans>
+              Sign in as <strong>{invitedEmail}</strong> to accept. We&rsquo;ll create your account if
+              you don&rsquo;t have one.
+            </Trans>
+          </p>
+        </>
+      )}
+
+      {signedIn && wrongAccount && (
+        <>
+          <p className="mb-4 rounded-2xl border border-warning/30 bg-warning/5 p-3 text-sm text-warning">
+            <Trans>
+              This invitation was sent to <strong>{invitedEmail}</strong>, but you&rsquo;re signed in
+              as <strong>{viewerEmail}</strong>.
+            </Trans>
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full"
+            onClick={() => {
+              clearAuthToken();
+              goSignIn();
+            }}
+          >
+            <Trans>Switch account</Trans>
+          </Button>
+        </>
+      )}
+
+      {signedIn && !wrongAccount && (
+        <Button type="button" className="w-full" onClick={accept} disabled={accepting}>
+          {accepting && <Spinner className="size-4" />}
+          <Trans>Accept invitation</Trans>
+        </Button>
+      )}
+    </Shell>
+  );
+}

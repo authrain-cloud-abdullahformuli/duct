@@ -1,0 +1,215 @@
+// Shared date / number / string formatters.
+//
+// Every list, card and badge in the app was growing its own `fmtDate`,
+// `fmtNum`, `prettify` and `relativeTime`; those copies drifted (some floored
+// at "1m ago", some said "just now"; some collapsed `--` runs, some didn't).
+// This is the one place they live now. Pure functions, no React, no DOM —
+// safe to import from server components and `lib/` modules alike.
+
+// ---------------------------------------------------------------------------
+// Dates
+// ---------------------------------------------------------------------------
+
+/** Date from an ISO string / Date / epoch ms, or null when it isn't a real date. */
+export function toDate(value) {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** Stable YYYY-MM-DD key in *local* time (calendar bucketing, not serialisation). */
+export function dayKey(value) {
+  const d = toDate(value);
+  if (!d) return "";
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/**
+ * "Mar 15, 2026" — or "Mar 15" with `withYear: false`.
+ *
+ * `locale` defaults to the viewer's; pass "en" where the copy around it is
+ * pinned to English so the date doesn't read half-translated.
+ */
+export function formatDate(value, { withYear = true, locale, fallback = "" } = {}) {
+  const d = toDate(value);
+  if (!d) return fallback;
+  return d.toLocaleDateString(locale, {
+    month: "short",
+    day: "numeric",
+    ...(withYear ? { year: "numeric" } : {}),
+  });
+}
+
+// Spaces ICU versions disagree on. Node's ICU writes a range's dash between
+// thin spaces (U+2009) where Chromium and WebKit write plain ones, so the
+// server's HTML and the first client render differed by a character nobody
+// can see, and React threw the tree away as a hydration mismatch (the plan
+// board header, 2026-11-08). Plain spaces are what both browsers print.
+const ICU_SPACES = /[\u2009\u202f]/g;
+
+/** "Oct 7 – 31", "Oct 28 – Nov 3": a span of days, the way the locale writes
+ * one, so the month is not repeated when it does not change. */
+export function formatDateRange(start, end, { locale } = {}) {
+  const a = toDate(start);
+  const b = toDate(end);
+  if (!a || !b) return "";
+  return new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" })
+    .formatRange(a, b)
+    .replace(ICU_SPACES, " ");
+}
+
+/** "3:04 PM". */
+export function formatTime(value, { locale, fallback = "" } = {}) {
+  const d = toDate(value);
+  if (!d) return fallback;
+  return d.toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" });
+}
+
+/**
+ * "just now" / "5m ago" / "3h ago" / "2d ago" for past timestamps.
+ *
+ * `fallbackAfterDays` switches to an absolute date once the age passes that
+ * many days — past a week "9d ago" stops meaning anything.
+ */
+export function relativeTime(value, { fallbackAfterDays = 0, locale } = {}) {
+  const d = toDate(value);
+  if (!d) return "";
+  const seconds = Math.max(0, (Date.now() - d.getTime()) / 1000);
+  const days = seconds / 86400;
+  if (fallbackAfterDays > 0 && days >= fallbackAfterDays) {
+    return formatDate(d, { locale });
+  }
+  // `Intl.RelativeTimeFormat` rather than a hand-built "5m ago": the word
+  // order and the abbreviation are the locale's ("hace 5 min", "vor 5 Min."),
+  // and `numeric: "auto"` gives "now" for zero instead of "0 seconds ago".
+  const rtf = relativeFormatter(locale);
+  if (seconds < 60) return rtf.format(0, "second");
+  if (seconds < 3600) return rtf.format(-Math.floor(seconds / 60), "minute");
+  if (seconds < 86400) return rtf.format(-Math.floor(seconds / 3600), "hour");
+  return rtf.format(-Math.floor(days), "day");
+}
+
+/** "today" / "in 6 days" / "3 days ago" — day granularity, and it handles the future. */
+export function relativeDays(value, { locale } = {}) {
+  const d = toDate(value);
+  if (!d) return "";
+  const days = Math.round((d.getTime() - Date.now()) / 86_400_000);
+  // `numeric: "always"` keeps "in 1 day" rather than "tomorrow": the callers
+  // put this after "expires", where "expires tomorrow" reads as a warning the
+  // copy never meant.
+  return new Intl.RelativeTimeFormat(locale || undefined, { numeric: days === 0 ? "auto" : "always" }).format(days, "day");
+}
+
+function relativeFormatter(locale) {
+  try {
+    return new Intl.RelativeTimeFormat(locale || undefined, { numeric: "auto", style: "narrow" });
+  } catch {
+    return new Intl.RelativeTimeFormat(undefined, { numeric: "auto", style: "narrow" });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Numbers
+// ---------------------------------------------------------------------------
+
+/** Thousands-separated, with a dash for anything that isn't a number. */
+export function formatNumber(value, { fallback = "—", locale } = {}) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toLocaleString(locale)
+    : fallback;
+}
+
+/** A ratio as a percentage in the reader's locale: 0.062 → "6.2%" / "6,2 %". */
+export function formatPercent(ratio, { locale, digits = 1 } = {}) {
+  const v = Number(ratio);
+  return new Intl.NumberFormat(locale, { style: "percent", maximumFractionDigits: digits })
+    .format(Number.isFinite(v) ? v : 0);
+}
+
+/**
+ * A number an agent stored with its unit, for a chip: "€2.1K", "11.2%",
+ * "1.8K clicks". The unit is model-written, so every shape is handled: an ISO
+ * currency code, "%" with the value either as a ratio (0.112) or as points
+ * (11.2), any other word as a suffix, or none.
+ */
+export function formatMeasure(value, unit = "", { locale } = {}) {
+  const v = Number(value);
+  if (!Number.isFinite(v)) return "";
+  if (unit === "%") {
+    return Math.abs(v) <= 1
+      ? formatPercent(v, { locale })
+      : `${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(v)}%`;
+  }
+  if (/^[A-Z]{3}$/.test(unit)) {
+    try {
+      return new Intl.NumberFormat(locale, {
+        style: "currency", currency: unit, notation: "compact", maximumFractionDigits: 1,
+      }).format(v);
+    } catch {
+      // Not a currency Intl knows: fall through to the plain suffix.
+    }
+  }
+  const n = new Intl.NumberFormat(locale, { notation: "compact", maximumFractionDigits: 1 }).format(v);
+  return unit ? `${n} ${unit}` : n;
+}
+
+/** A change as a signed percentage: 0.14 → "+14%", -0.091 → "-9.1%", 0 → "0%". */
+export function formatDelta(ratio, { locale } = {}) {
+  const v = Number(ratio);
+  return new Intl.NumberFormat(locale, {
+    style: "percent", signDisplay: "exceptZero", maximumFractionDigits: 1,
+  }).format(Number.isFinite(v) ? v : 0);
+}
+
+/** "938" / "1.2k" / "3M" — for metric chips where width is tight. */
+export function compactNumber(value) {
+  const v = Number(value) || 0;
+  if (Math.abs(v) >= 1_000_000) return `${(v / 1_000_000).toFixed(v % 1_000_000 ? 1 : 0)}M`;
+  if (Math.abs(v) >= 1_000) return `${(v / 1_000).toFixed(v % 1_000 ? 1 : 0)}k`;
+  return String(v);
+}
+
+/** A duration in seconds as a clock reads it: "42s", "1m 05s", "1h 02m". */
+export function formatElapsed(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (total < 60) return `${total}s`;
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  if (m < 60) return `${m}m ${String(s).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+// ---------------------------------------------------------------------------
+// Strings
+// ---------------------------------------------------------------------------
+
+/** `face_shape` / `google-ads` -> "Face Shape" / "Google Ads". */
+export function titleCase(value) {
+  return String(value || "")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .trim();
+}
+
+/**
+ * Display title for an insight slug: drops the `local-` prefix and the trailing
+ * `-1712...` disambiguator the generator appends, then title-cases the rest.
+ */
+export function formatTitle(slug) {
+  return titleCase(String(slug || "").replace(/^local-/, "").replace(/[-_]\d+$/, ""));
+}
+
+/** Sentence case for a single lowercase token: `high` -> "High". */
+export function capitalize(value) {
+  const s = String(value || "");
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** "SK" from a name, "sh" -> "SH" from an email — avatar fallbacks. */
+export function initials(nameOrEmail) {
+  const source = String(nameOrEmail || "?").trim();
+  const parts = source.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return source.slice(0, 2).toUpperCase();
+}

@@ -1,0 +1,82 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Duct",
+  "version": "0.7.3",
+  "identifier": "ai.getduct.desktop",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["ai.getduct.desktop"]
+      }
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkwRDE4MUREOEJCMUQ3MTEKUldRUjE3R0wzWUhSa0VUejE3OHFJTVhOMmJna25BdUtsbi9TOTF2R0VraU54dkJLS2RzbXAwMDkK",
+      "endpoints": [
+        "https://github.com/authrain-cloud-abdullahformuli/duct/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "Duct",
+        "url": "https://app.getduct.ai",
+        "visible": false,
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true,
+        "preventOverflow": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "publisher": "Duct",
+    "homepage": "https://getduct.ai",
+    "license": "MIT",
+    "copyright": "Copyright © 2026 Duct",
+    "category": "Productivity",
+    "shortDescription": "Cross-tool insights for your product and marketing stack.",
+    "longDescription": "Duct connects your product and marketing stack and turns what it finds into briefs, alerts and answers you can act on.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "hardenedRuntime": true,
+      "entitlements": "Entitlements.developerid.plist"
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "./windows/installer-hooks.nsh"
+      }
+    }
+  }
+}

@@ -1,0 +1,1628 @@
+//! Duct desktop shell — a thin Tauri wrapper that loads the hosted Duct web app
+//! and stores bring-your-own provider API keys in the OS keychain.
+//!
+//! The frontend (`app/src/lib/providerKeys.js`) calls these commands via the
+//! global `window.__TAURI__.core.invoke(...)`. Keys live in the platform
+//! keychain (macOS Keychain / Windows Credential Manager / Linux Secret
+//! Service) — this shell never writes them to disk. No agent code, prompts, or
+//! API keys ship in this bundle; everything proprietary stays on the backend.
+//!
+//! Every OAuth flow runs in the system browser (Google disallows OAuth in
+//! embedded webviews, and a user in one has none of their browser's sessions,
+//! passwords or passkeys): the web app calls `open_external` to launch the
+//! authorize URL, and the backend redirects the browser back to a
+//! `ai.getduct.desktop://` deep link, which lands below and is forwarded into
+//! the webview. Two routes, one shape — `auth` for signing in to Duct,
+//! `connector` for connecting a data source. Neither carries the credential
+//! itself, only a single-use code the webview redeems against the backend.
+
+mod chatgpt;
+mod sidecar;
+mod telemetry;
+
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use keyring::{Entry, Error as KeyringError};
+use tauri::{webview::PageLoadEvent, AppHandle, Manager, Url, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_deep_link::DeepLinkExt;
+use tauri_plugin_opener::OpenerExt;
+
+use sidecar::{get_sidecar_info, SidecarState};
+
+/// Keychain service namespace. The `provider` id (e.g. "anthropic") is the account.
+const KEYCHAIN_SERVICE: &str = "ai.getduct.desktop.provider-keys";
+
+fn entry(provider: &str) -> Result<Entry, String> {
+    Entry::new(KEYCHAIN_SERVICE, provider).map_err(describe_keyring_error)
+}
+
+/// Turn a keyring failure into something a user can act on.
+///
+/// macOS and Windows always have a credential store. Linux does not: the
+/// `secret-service` backend talks to a D-Bus daemon (gnome-keyring, KWallet,
+/// KeePassXC) that a minimal, headless, or tiling-WM install may simply not run.
+/// The raw error for that is a D-Bus transport message with no hint about the
+/// cause, and the web app used to swallow it entirely — a saved key just
+/// silently didn't persist. Name the actual problem instead.
+pub(crate) fn describe_keyring_error(err: KeyringError) -> String {
+    let generic = err.to_string();
+    if cfg!(target_os = "macos") {
+        // macOS ties an item's ACL to the code signature of the app that wrote
+        // it. A rebuilt development build is ad-hoc signed, and its identity
+        // changes with every build, so yesterday's item is unreadable today and
+        // the raw error is a bare OSStatus that explains none of that.
+        return match err {
+            KeyringError::NoStorageAccess(_) | KeyringError::PlatformFailure(_) => format!(
+                "the keychain would not release this item ({generic}). macOS grants \
+                 access per application signature, so a rebuilt or re-signed app \
+                 cannot read what an earlier build stored. Saving it again fixes it."
+            ),
+            other => other.to_string(),
+        };
+    }
+    if !cfg!(target_os = "linux") {
+        return generic;
+    }
+    match err {
+        KeyringError::NoStorageAccess(_) | KeyringError::PlatformFailure(_) => format!(
+            "no OS keyring available ({generic}). Duct stores provider keys in the \
+             freedesktop Secret Service; install and start a keyring daemon such as \
+             gnome-keyring or KeePassXC, then try again."
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// Keychain service for the shell's *own* secrets, kept apart from
+/// `KEYCHAIN_SERVICE` so a secret can never collide with a provider named the
+/// same thing.
+const KEYCHAIN_SIDECAR_SERVICE: &str = "ai.getduct.desktop.sidecar";
+const CREDENTIALS_KEY_ACCOUNT: &str = "credentials-encryption-key";
+/// Gates the loopback API the webview talks to.
+const LOCAL_API_KEY_ACCOUNT: &str = "local-api-key";
+/// Signs this install's session tokens.
+const LOCAL_JWT_SECRET_ACCOUNT: &str = "local-jwt-secret";
+
+/// Read a sidecar secret from the keychain, minting it on first run.
+///
+/// **The shell owns these, not the sidecar.** Only one signed binary should
+/// ever touch the keychain: macOS grants access per application signature, so a
+/// second executable reading it doubles both the number of identities that can
+/// drift and the number of ways a user can be shown a keychain prompt. The
+/// sidecar is a separate binary, so the shell reads and passes the value down
+/// the environment instead (`sidecar.rs`). See
+/// `docs/engineering/credential-storage.md`, "A signed release never prompts".
+///
+/// `mint` encodes the 32 fresh bytes, because the callers disagree about the
+/// alphabet: Fernet wants padded url-safe base64, the rest want unpadded.
+fn sidecar_secret(account: &str, mint: impl Fn(&[u8; 32]) -> String) -> Result<String, String> {
+    let entry = Entry::new(KEYCHAIN_SIDECAR_SERVICE, account).map_err(describe_keyring_error)?;
+
+    match entry.get_password() {
+        Ok(existing) if !existing.trim().is_empty() => return Ok(existing),
+        // An empty stored value is treated as absent and re-minted: it can only
+        // come from a half-finished write, and handing it on would fail later,
+        // somewhere that does not mention the keychain.
+        Ok(_) | Err(KeyringError::NoEntry) => {}
+        Err(e) => return Err(describe_keyring_error(e)),
+    }
+
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| format!("could not gather randomness: {e}"))?;
+    let value = mint(&bytes);
+    entry.set_password(&value).map_err(describe_keyring_error)?;
+    Ok(value)
+}
+
+/// The `X-API-Key` the webview sends to the loopback sidecar.
+///
+/// It used to be a `0600` file beside the database, which protects it from
+/// other *accounts* on the machine and from nothing running as this user — the
+/// realistic attacker for a desktop app. The keychain gates it on the asking
+/// app's signature instead.
+pub(crate) fn local_api_key() -> Result<String, String> {
+    sidecar_secret(LOCAL_API_KEY_ACCOUNT, |b| {
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b)
+    })
+}
+
+/// The key this install signs its session tokens with.
+///
+/// The sharpest of the local secrets: whoever holds it can mint a valid token
+/// for any user id and drive the whole local API, so a `0600` file was the
+/// weakest link in an otherwise keychain-backed design.
+pub(crate) fn local_jwt_secret() -> Result<String, String> {
+    sidecar_secret(LOCAL_JWT_SECRET_ACCOUNT, |b| {
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b)
+    })
+}
+
+/// The Fernet key the sidecar encrypts stored connector credentials with,
+/// minted on first run and kept in the OS keychain.
+///
+/// Desktop had no way to get one at all: `CREDENTIALS_ENCRYPTION_KEY` is a
+/// server setting, and the frozen bundle deliberately ships no `.env`, so
+/// `service/credentials.py` raised on every encrypt — connecting Google Ads
+/// could complete its OAuth and then fail to persist the refresh token.
+///
+/// The keychain rather than a file beside the database: a key sitting next to
+/// its own ciphertext stops someone reading the file and nobody holding the
+/// disk, and this machine already has a credential store the provider keys use.
+///
+/// **Losing this key makes existing stored credentials undecryptable.** That is
+/// survivable by design — `connector_access` and `service/provider_keys.py`
+/// both treat a failed decrypt as "absent" and degrade to reconnecting — but it
+/// does mean a user who wipes their keychain reconnects their sources.
+pub(crate) fn credentials_encryption_key() -> Result<String, String> {
+    // Fernet keys are url-safe base64 of exactly 32 bytes, padding included.
+    sidecar_secret(CREDENTIALS_KEY_ACCOUNT, |b| {
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE, b)
+    })
+}
+
+/// Read a stored provider key. Returns "" when none is set.
+///
+/// `async` on this and on every other command that touches the keychain or
+/// the disk. A plain command runs on the main thread, which is the UI thread,
+/// and the keyring crate blocks — on macOS for as long as a keychain prompt
+/// stays on screen after the app's signature changed. The window stopped
+/// painting for exactly that long. The marker runs the function on a worker
+/// thread instead; nothing else about it changes.
+#[tauri::command(async)]
+fn get_provider_key(provider: String) -> Result<String, String> {
+    match entry(&provider)?.get_password() {
+        Ok(secret) => Ok(secret),
+        Err(KeyringError::NoEntry) => Ok(String::new()),
+        Err(e) => Err(describe_keyring_error(e)),
+    }
+}
+
+/// Store a provider key in the OS keychain.
+#[tauri::command(async)]
+fn set_provider_key(provider: String, key: String) -> Result<(), String> {
+    entry(&provider)?
+        .set_password(&key)
+        .map_err(describe_keyring_error)
+}
+
+/// Remove a stored provider key (no-op if absent).
+#[tauri::command(async)]
+fn delete_provider_key(provider: String) -> Result<(), String> {
+    match entry(&provider)?.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+        Err(e) => Err(describe_keyring_error(e)),
+    }
+}
+
+/// `get_shell_info`'s answer, computed once. Nothing in it can change while
+/// the process runs — the sidecar probe is a `stat` of the bundle — and the
+/// web app asks on every page load.
+static SHELL_INFO: OnceLock<serde_json::Value> = OnceLock::new();
+
+/// Shell version and feature flags. The hosted web app probes this so it can
+/// gate shell-dependent flows on capability, not on shell version — older
+/// shells where this command doesn't exist simply keep the legacy behaviour.
+#[tauri::command(async)]
+fn get_shell_info(app: AppHandle) -> serde_json::Value {
+    SHELL_INFO
+        .get_or_init(|| {
+            serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "capabilities": {
+                    "browserAuth": true,
+                    // The `connector` deep-link route exists, so connector OAuth can go
+                    // to the system browser too. Older shells lack the route entirely
+                    // and the web app keeps navigating them in-window.
+                    "browserConnectors": true,
+                    // Whether this build ships a local backend. True means the web app
+                    // should resolve its API base from `get_sidecar_info` instead of the
+                    // build-time NEXT_PUBLIC_API_BASE; false means keep talking to the
+                    // hosted API, which is also what older shells without the flag do.
+                    //
+                    // Probed rather than hardcoded, so the answer cannot disagree with
+                    // what `bundle.resources` actually put in the bundle. The official
+                    // build ships no sidecar; the self-host build adds it back.
+                    "localSidecar": sidecar::is_available(&app),
+                    // `tauri-plugin-updater` is wired and permitted in this build, so
+                    // the web app may check for updates and offer to install one. Kept
+                    // as a probe rather than a literal `true` so a build that compiles
+                    // the plugin out cannot advertise an update path it does not have —
+                    // no shipping build does that today (see the `updater` feature in
+                    // Cargo.toml), which is why the flag is worth a second look.
+                    "autoUpdate": cfg!(feature = "updater"),
+                    // The `notify` command exists, so the web app may hand "done" and
+                    // "needs you" notices to the OS instead of the webview's missing
+                    // Notification API. Older shells lack it and stay silent.
+                    "notifications": true,
+                    // `open_notification_settings` exists *and* this OS has a page for
+                    // it to open. False on Linux, where it does not — the web app then
+                    // offers no "open settings" affordance rather than one that errors.
+                    "notificationSettings": NOTIFICATION_SETTINGS_URL.is_some(),
+                    // The `chatgpt_*` commands exist: the web app may offer "Continue
+                    // with ChatGPT" and send the access token they mint as the OpenAI
+                    // credential. Older shells lack them and show the API-key path
+                    // alone. Whether the path is *allowed* is the backend's
+                    // CHATGPT_AUTH_ENABLED, read from /api/providers/status.
+                    "chatgptAuth": true
+                }
+            })
+        })
+        .clone()
+}
+
+/// Where the OS keeps this app's notification switch, or `None` where the
+/// desktop has no single such place.
+///
+/// macOS moved the pane to ExtensionKit with the System Settings rewrite in
+/// Ventura; `com.apple.preference.notifications` was the pre-13 spelling. An id
+/// the running OS does not know opens System Settings at its front page rather
+/// than failing, so an older macOS degrades to "you are in the right app".
+///
+/// Linux is `None` on purpose rather than a guess: GNOME, KDE and the rest each
+/// own their own page and there is no scheme that covers them.
+const NOTIFICATION_SETTINGS_URL: Option<&str> = if cfg!(target_os = "macos") {
+    Some("x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+} else if cfg!(windows) {
+    Some("ms-settings:notifications")
+} else {
+    None
+};
+
+/// Show a system notification. The web app decides *when* (only while the
+/// window is not focused — `app/src/lib/notify.js`); this only decides *how*,
+/// which on a remote origin cannot be the plugin's JS bindings for the same
+/// reason as the updater. Title and body are plain text from our own page.
+///
+/// Registering the plugin is not free of the webview, though: it injects a
+/// `window.Notification` polyfill that invokes `plugin:notification|notify` and
+/// friends. Those three commands are permitted in `capabilities/*.json` because
+/// the polyfill calls `is_permission_granted` on load and an ACL denial there
+/// reaches the page as an unhandled rejection — a runtime error on every load,
+/// for an API we do not use. They grant no reach this command did not already.
+#[tauri::command]
+fn notify(app: AppHandle, title: String, body: Option<String>) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    let mut builder = app.notification().builder().title(title);
+    if let Some(body) = body.filter(|b| !b.trim().is_empty()) {
+        builder = builder.body(body);
+    }
+    builder.show().map_err(|e| e.to_string())
+}
+
+/// Open the OS page where notifications for this app are turned on or off.
+///
+/// The sidebar's notification row needs this because the shell cannot answer
+/// "are they on?": the notification plugin's desktop `permission_state` returns
+/// `Granted` unconditionally, whatever the user actually chose in System
+/// Settings. So the row does not assert a state it cannot know — it hands the
+/// user to where the real switch is.
+///
+/// Unlike `open_external` this takes no URL. A page that could name the
+/// settings URL could name any URL-scheme handler on the machine, and the one
+/// destination worth reaching here is a constant.
+#[tauri::command]
+fn open_notification_settings(app: AppHandle) -> Result<(), String> {
+    let url = NOTIFICATION_SETTINGS_URL
+        .ok_or("this desktop has no single notification settings page")?;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// Open a URL in the system's default browser. Restricted to `https`, plus
+/// `http` on the loopback names, so the remote page can never use the shell to
+/// launch other URL-scheme handlers.
+#[tauri::command]
+fn open_external(app: AppHandle, url: String) -> Result<(), String> {
+    if !is_openable_externally(&url) {
+        return Err("only http(s) URLs may be opened externally".into());
+    }
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// The hosts `open_external` accepts over plain `http`: the local sidecar and
+/// the ChatGPT callback both live on loopback, and nothing else should.
+const LOOPBACK_HOSTS: &[&str] = &["localhost", "127.0.0.1"];
+
+/// The `open_external` rule, on a parsed URL rather than a prefix.
+///
+/// `starts_with("http://localhost")` also accepted `http://localhost.evil.tld`
+/// and `http://localhost@evil.tld`. Only the parsed host can be compared
+/// exactly, and the parser normalises the scheme too.
+fn is_openable_externally(raw: &str) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    match url.scheme() {
+        "https" => url.host_str().is_some_and(|host| !host.is_empty()),
+        "http" => url.host_str().is_some_and(|host| LOOPBACK_HOSTS.contains(&host)),
+        _ => false,
+    }
+}
+
+/// Whether a newer release is available, and what it is.
+///
+/// Returns `null` when the app is current. Exposed as a command rather than
+/// letting the page use `@tauri-apps/plugin-updater` directly: the window loads
+/// a *remote* origin, which cannot import the plugin's JS guest bindings the way
+/// a bundled frontend would. Same reason `providerKeys.js` goes through invoke.
+#[cfg(feature = "updater")]
+#[tauri::command]
+async fn check_for_update(app: AppHandle) -> Result<Option<serde_json::Value>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater.check().await.map_err(|e| e.to_string())?;
+    Ok(update.map(|u| {
+        serde_json::json!({
+            "version": u.version,
+            "currentVersion": u.current_version,
+            "notes": u.body,
+            "date": u.date.map(|d| d.to_string()),
+        })
+    }))
+}
+
+/// Download and install the pending update, then relaunch into it.
+///
+/// Re-checks rather than caching the `Update` from `check_for_update`: holding
+/// it across two commands would mean parking a non-`Send` handle in app state
+/// for the sake of one request to a static JSON manifest.
+#[cfg(feature = "updater")]
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no update available".to_string())?;
+
+    update
+        .download_and_install(|_downloaded, _total| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Asks the event loop to exit and relaunch, which is what delivers
+    // `RunEvent::Exit` to the handler in `run()`: the sidecar is stopped there,
+    // so the new instance gets a free port and an unlocked database.
+    // `restart()` skips those events when it happens to run on the main
+    // thread, and a command runs wherever the runtime puts it.
+    app.request_restart();
+    Ok(())
+}
+
+/// Build without the `updater` feature: the commands still exist so the
+/// capability files and `build.rs` manifest stay identical across builds, but
+/// they report the feature as unavailable. No shipping channel takes this path
+/// since the App Store one was retired — see the `updater` feature in
+/// `Cargo.toml` before assuming it is exercised.
+#[cfg(not(feature = "updater"))]
+#[tauri::command]
+async fn check_for_update(_app: AppHandle) -> Result<Option<serde_json::Value>, String> {
+    Ok(None)
+}
+
+#[cfg(not(feature = "updater"))]
+#[tauri::command]
+async fn install_update(_app: AppHandle) -> Result<(), String> {
+    Err("this build does not support self-update".into())
+}
+
+/// Whether crash reporting is on, and whether this build can do it at all.
+///
+/// `available` is false when no reporter was compiled in, or one was but has no
+/// destination configured — the settings UI hides the toggle rather than
+/// offering a switch that changes nothing.
+#[tauri::command(async)]
+fn get_telemetry_settings() -> serde_json::Value {
+    let enabled = telemetry::default_data_dir()
+        .map(|dir| telemetry::is_enabled(&dir))
+        .unwrap_or(false);
+    serde_json::json!({
+        "enabled": enabled,
+        "available": telemetry::is_available(),
+        // So the settings copy can say "on by default" or "off by default" and
+        // be telling the truth about the build in front of the user.
+        "default_on": telemetry::default_enabled(),
+    })
+}
+
+/// Record the user's choice. Takes effect for the sidecar on next launch —
+/// it reads its reporting key from the environment the shell hands it at
+/// spawn, and this deliberately does not restart a running backend out from
+/// under the user. The shell's own reporter asks again before every send, so
+/// "off" stops it at once; "on" waits for the next launch, like the sidecar.
+#[tauri::command(async)]
+fn set_telemetry_enabled(enabled: bool) -> Result<(), String> {
+    let dir = telemetry::default_data_dir().ok_or("could not resolve the data directory")?;
+    telemetry::write_prefs(
+        &dir,
+        telemetry::TelemetryPrefs {
+            enabled: Some(enabled),
+        },
+    )
+}
+
+/// Whether a deep-link value is safe to splice into a navigation URL.
+///
+/// Anything on this machine can hand the shell a URL on our scheme, so every
+/// value out of one is untrusted input. Exchange codes and connector ids are
+/// both URL-safe tokens; drop anything else rather than reasoning about
+/// escaping.
+fn safe_deep_link_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 512
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn query_param(url: &Url, key: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(k, _)| k == key)
+        .map(|(_, value)| value.into_owned())
+}
+
+/// The URL the main window is configured to load: `app.windows[0].url` in
+/// whichever config this build merged. `None` for a bundled-frontend window.
+///
+/// The one answer to "where does the app live". The sidecar's
+/// `FRONTEND_ORIGIN`, a deep link's destination and the navigation guard all
+/// read it, so none of them can be steered by where the webview happens to be.
+pub(crate) fn configured_app_url(app: &AppHandle) -> Option<Url> {
+    match &app.config().app.windows.first()?.url {
+        WebviewUrl::External(url) => Some(url.clone()),
+        _ => None,
+    }
+}
+
+/// `path?query` on the app's own origin.
+///
+/// Built from the configured URL and never from `window.url()`: the page can
+/// send the window elsewhere (the in-window OAuth fallback did exactly that),
+/// and a deep link joined onto *that* URL would deliver the single-use code to
+/// whichever origin was showing when it arrived.
+fn deep_link_destination(app_url: &Url, path: &str, query: &str) -> Option<Url> {
+    let mut target = app_url.join(path).ok()?;
+    target.set_query(Some(query));
+    Some(target)
+}
+
+/// Navigate the main window to `path?query` on the origin this shell build is
+/// configured to load (hosted app or local dev server), then bring it to the
+/// front.
+fn navigate_webview(app: &AppHandle, path: &str, query: &str) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Some(target) = configured_app_url(app)
+        .and_then(|app_url| deep_link_destination(&app_url, path, query))
+    else {
+        return;
+    };
+    let _ = window.navigate(target);
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
+/// Where a deep link sends the webview: `(path, query)`, or `None` for a URL
+/// the shell does not act on.
+///
+/// Pure, so it can be tested without a window. Two routes, one shape:
+///
+/// - `ai.getduct.desktop://auth?auth_code=...` → `/?auth_code=...`. The login
+///   page's existing `/auth/exchange` path takes it from there; the code is
+///   single-use and expires in seconds, so it is safe to carry in the URL.
+/// - `ai.getduct.desktop://connector?connector=...&auth_code=...` →
+///   `/connections?connector=...&auth_code=...`. Connecting a data source is
+///   Google OAuth, which will not run in an embedded webview, so it happens in
+///   the system browser and has to cross back into the app. What crosses is
+///   only a single-use 60-second code — a connector refresh token is
+///   long-lived and never rides in a deep link, which any app claiming the
+///   scheme could read. The connections page redeems it via
+///   `/auth/connectors/exchange`.
+fn deep_link_target(url: &Url) -> Option<(&'static str, String)> {
+    match url.host_str()? {
+        "auth" => {
+            let code = query_param(url, "auth_code")?;
+            safe_deep_link_value(&code).then(|| ("/", format!("auth_code={code}")))
+        }
+        "connector" => {
+            let connector = query_param(url, "connector")?;
+            let code = query_param(url, "auth_code")?;
+            (safe_deep_link_value(&connector) && safe_deep_link_value(&code))
+                .then(|| ("/connections", format!("connector={connector}&auth_code={code}")))
+        }
+        _ => None,
+    }
+}
+
+fn handle_auth_deep_link(app: &AppHandle, url: &Url) {
+    if url.host_str() != Some("auth") {
+        return;
+    }
+    if let Some((path, query)) = deep_link_target(url) {
+        navigate_webview(app, path, &query);
+    }
+}
+
+fn handle_connector_deep_link(app: &AppHandle, url: &Url) {
+    if url.host_str() != Some("connector") {
+        return;
+    }
+    if let Some((path, query)) = deep_link_target(url) {
+        navigate_webview(app, path, &query);
+    }
+}
+
+/// Hand a URL on our scheme to whichever route claims it.
+fn route_deep_link(app: &AppHandle, url: &Url) {
+    handle_auth_deep_link(app, url);
+    handle_connector_deep_link(app, url);
+}
+
+/// Menu ids. Namespaced so a future menu can't collide with these.
+#[cfg(desktop)]
+const MENU_RELOAD: &str = "view:reload";
+#[cfg(all(desktop, any(debug_assertions, feature = "devtools")))]
+const MENU_DEVTOOLS: &str = "view:devtools";
+#[cfg(all(desktop, any(debug_assertions, feature = "devtools")))]
+const MENU_TRACES: &str = "window:traces";
+#[cfg(desktop)]
+const MENU_ZOOM_IN: &str = "view:zoom-in";
+#[cfg(desktop)]
+const MENU_ZOOM_OUT: &str = "view:zoom-out";
+#[cfg(desktop)]
+const MENU_ZOOM_RESET: &str = "view:zoom-reset";
+
+/// The zoom levels View steps through, in percent: the ladder browsers use, so
+/// the steps feel the way they do everywhere else. Text size is the reason —
+/// a 4K screen at 100% scaling draws the app at 3840 CSS pixels, a small
+/// laptop wants it smaller, and none of the system webviews binds a zoom key
+/// of its own inside an app window.
+#[cfg(desktop)]
+const ZOOM_STEPS: &[u32] = &[50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200];
+#[cfg(desktop)]
+const ZOOM_DEFAULT: u32 = 100;
+
+/// The main window's zoom, in percent. The webviews can set a zoom factor but
+/// not all of them report one back, so the shell remembers what it set.
+#[cfg(desktop)]
+static MAIN_ZOOM: AtomicU32 = AtomicU32::new(ZOOM_DEFAULT);
+
+/// The next step from `current` in the direction asked, clamped at the ends.
+/// A level that is not on the ladder moves to the nearest step past it.
+#[cfg(desktop)]
+fn next_zoom(current: u32, zoom_in: bool) -> u32 {
+    if zoom_in {
+        ZOOM_STEPS
+            .iter()
+            .copied()
+            .find(|step| *step > current)
+            .unwrap_or(*ZOOM_STEPS.last().unwrap_or(&current))
+    } else {
+        ZOOM_STEPS
+            .iter()
+            .rev()
+            .copied()
+            .find(|step| *step < current)
+            .unwrap_or(*ZOOM_STEPS.first().unwrap_or(&current))
+    }
+}
+
+/// Where the dev build's "Open Jaeger Traces" item goes: the UI that
+/// `scripts/jaeger.sh` serves. Not derived from `OTEL_EXPORTER_OTLP_ENDPOINT`,
+/// as it was when Phoenix took spans and served its UI on one port: Jaeger
+/// takes spans on 4318 and serves the UI on 16686, so the exporter's address
+/// says nothing about the UI's.
+#[cfg(all(desktop, any(debug_assertions, feature = "devtools")))]
+const TRACES_UI_URL: &str = "http://localhost:16686";
+#[cfg(desktop)]
+const MENU_HOME: &str = "help:home";
+#[cfg(desktop)]
+const MENU_CHANGELOG: &str = "help:changelog";
+#[cfg(desktop)]
+const MENU_REPORT_BUG: &str = "help:report-bug";
+#[cfg(desktop)]
+const MENU_SUGGEST: &str = "help:suggest";
+#[cfg(desktop)]
+const MENU_PRIVACY: &str = "help:privacy";
+
+/// Where the Help menu points. The same two destinations the in-app account
+/// drawer offers, for the same reason: an issue is a defect with a repro, a
+/// discussion is an idea that has not earned a tracker row. Kept in sync with
+/// `app/src/components/AppSidebar.jsx` by hand — two surfaces, one policy.
+#[cfg(desktop)]
+const HELP_LINKS: &[(&str, &str)] = &[
+    (MENU_HOME, "https://getduct.ai"),
+    (MENU_CHANGELOG, "https://getduct.ai/changelog/"),
+    (
+        MENU_REPORT_BUG,
+        "https://github.com/authrain-cloud-abdullahformuli/duct/issues/new?template=bug_report.yml",
+    ),
+    (
+        MENU_SUGGEST,
+        "https://github.com/authrain-cloud-abdullahformuli/duct/discussions/new?category=ideas",
+    ),
+    (MENU_PRIVACY, "https://getduct.ai/privacy"),
+];
+
+/// One line saying what this app is, for the About panel.
+///
+/// macOS and the others read different fields — `credits` there, `comments` on
+/// Windows and Linux — so it is set twice from one constant rather than
+/// written twice and left to drift.
+#[cfg(desktop)]
+const ABOUT_BLURB: &str =
+    "Duct connects your product and marketing stack and turns what it finds into briefs, \
+alerts and answers you can act on.";
+
+/// What the About panel shows, beyond the name and version Tauri fills in.
+///
+/// `Menu::default` builds this from `bundle.copyright` and `bundle.publisher`
+/// alone, and `publisher` lands in `authors`, which macOS does not render — so
+/// the panel was the app name, a version, and nothing else. Built by hand here
+/// so there is a sentence in it.
+#[cfg(desktop)]
+fn about_metadata(app: &tauri::AppHandle) -> tauri::menu::AboutMetadata<'static> {
+    let package = app.package_info();
+    tauri::menu::AboutMetadata {
+        name: Some(package.name.clone()),
+        version: Some(package.version.to_string()),
+        copyright: app.config().bundle.copyright.clone(),
+        // macOS renders `credits` and ignores `comments`; Windows and Linux do
+        // the opposite. Both are set, so neither platform gets a blank panel.
+        credits: Some(ABOUT_BLURB.into()),
+        comments: Some(ABOUT_BLURB.into()),
+        website: Some("https://getduct.ai".into()),
+        website_label: Some("getduct.ai".into()),
+        ..Default::default()
+    }
+}
+
+/// The application menu: a View menu with Reload, and a Help menu with anything
+/// in it at all.
+///
+/// The window loads a *remote* origin, so nothing on the page can rescue a bad
+/// load, and the system webview binds no reload key of its own (Tauri's default
+/// menu is App/File/Edit/Window/Help — no View, no Cmd+R). Until this, the only
+/// way to pick up a change, or to recover a window that came up blank because
+/// the dev server wasn't listening yet, was to quit and relaunch: a poor loop
+/// when developing against `localhost:3003` (`npm run dev:local`), and a dead
+/// end for a shipped user whose window failed to load once.
+///
+/// View is inserted before Window, where macOS users expect it — located by id
+/// rather than a hardcoded index, since the default menu's shape differs per
+/// platform.
+///
+/// Help is *replaced*, not extended. `Menu::default` builds its Help submenu
+/// with a single About item carrying `#[cfg(not(target_os = "macos"))]`, which
+/// leaves macOS a Help menu containing nothing: it opens onto an empty box and
+/// swallows the click. Apple's guidelines expect Help to work, and an empty one
+/// is a documented App Store rejection (tauri-apps/tauri#9371) — which matters
+/// here, because this app is headed for TestFlight.
+///
+/// The items are links rather than a bundled help book. A help book would be a
+/// second copy of the site to keep current, and the answers people want from
+/// this menu — what changed, where do I report this — live on a site that is
+/// already updated when the thing itself changes.
+#[cfg(desktop)]
+fn install_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{
+        Menu, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID, WINDOW_SUBMENU_ID,
+    };
+
+    let reload = MenuItem::with_id(app, MENU_RELOAD, "Reload", true, Some("CmdOrCtrl+R"))?;
+
+    // Toggle Full Screen is the one item the default View carries on macOS, and
+    // ours replaces that submenu rather than sitting beside it — so it has to be
+    // carried over, or the menu quietly loses it.
+    let mut view_items: Vec<Box<dyn tauri::menu::IsMenuItem<_>>> = Vec::new();
+    #[cfg(target_os = "macos")]
+    view_items.push(Box::new(PredefinedMenuItem::fullscreen(app, None)?));
+    view_items.push(Box::new(reload));
+    view_items.push(Box::new(PredefinedMenuItem::separator(app)?));
+    view_items.push(Box::new(MenuItem::with_id(
+        app,
+        MENU_ZOOM_RESET,
+        "Actual Size",
+        true,
+        Some("CmdOrCtrl+0"),
+    )?));
+    view_items.push(Box::new(MenuItem::with_id(
+        app,
+        MENU_ZOOM_IN,
+        "Zoom In",
+        true,
+        Some("CmdOrCtrl+="),
+    )?));
+    view_items.push(Box::new(MenuItem::with_id(
+        app,
+        MENU_ZOOM_OUT,
+        "Zoom Out",
+        true,
+        Some("CmdOrCtrl+-"),
+    )?));
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    view_items.push(Box::new(MenuItem::with_id(
+        app,
+        MENU_DEVTOOLS,
+        "Toggle Developer Tools",
+        true,
+        Some("CmdOrCtrl+Shift+I"),
+    )?));
+    let view_refs: Vec<&dyn tauri::menu::IsMenuItem<_>> =
+        view_items.iter().map(|item| item.as_ref()).collect();
+    let view = Submenu::with_items(app, "View", true, &view_refs)?;
+
+    // Ordered by how often a person needs them, with the two that produce work
+    // for us grouped away from the two that only read.
+    let home = MenuItem::with_id(app, MENU_HOME, "Duct Home Page", true, None::<&str>)?;
+    let changelog = MenuItem::with_id(app, MENU_CHANGELOG, "What\u{2019}s New", true, None::<&str>)?;
+    let report_bug = MenuItem::with_id(app, MENU_REPORT_BUG, "Report a Bug\u{2026}", true, None::<&str>)?;
+    let suggest = MenuItem::with_id(
+        app,
+        MENU_SUGGEST,
+        "Suggest an Improvement\u{2026}",
+        true,
+        None::<&str>,
+    )?;
+    let privacy = MenuItem::with_id(app, MENU_PRIVACY, "Privacy Policy", true, None::<&str>)?;
+
+    let help = Submenu::with_id_and_items(
+        app,
+        HELP_SUBMENU_ID,
+        "Help",
+        true,
+        &[
+            &home,
+            &changelog,
+            &PredefinedMenuItem::separator(app)?,
+            &report_bug,
+            &suggest,
+            &PredefinedMenuItem::separator(app)?,
+            &privacy,
+        ],
+    )?;
+    // Off macOS the default menu keeps About under Help, and replacing Help
+    // took it away: Windows and Linux had no About at all, so the `comments`
+    // line `about_metadata` writes for them was never shown. Put it back at
+    // the bottom, where both platforms' conventions keep it.
+    #[cfg(not(target_os = "macos"))]
+    {
+        help.append(&PredefinedMenuItem::separator(app)?)?;
+        help.append(&PredefinedMenuItem::about(
+            app,
+            Some(&format!("About {}", app.package_info().name)),
+            Some(about_metadata(app)),
+        )?)?;
+    }
+
+    let menu = Menu::default(app)?;
+
+    // The About item the default menu built has no description in it, and
+    // AboutMetadata is only settable at construction — so the whole app submenu
+    // is rebuilt rather than patched. macOS only; elsewhere About lives under
+    // Help, which is built above with it.
+    #[cfg(target_os = "macos")]
+    {
+        let package = app.package_info();
+        let app_menu = Submenu::with_items(
+            app,
+            package.name.clone(),
+            true,
+            &[
+                &PredefinedMenuItem::about(
+                    app,
+                    Some(&format!("About {}", package.name)),
+                    Some(about_metadata(app)),
+                )?,
+                &PredefinedMenuItem::separator(app)?,
+                &PredefinedMenuItem::services(app, None)?,
+                &PredefinedMenuItem::separator(app)?,
+                &PredefinedMenuItem::hide(app, None)?,
+                &PredefinedMenuItem::hide_others(app, None)?,
+                &PredefinedMenuItem::separator(app)?,
+                &PredefinedMenuItem::quit(app, None)?,
+            ],
+        )?;
+        // The app submenu is always first on macOS; replacing in place keeps it
+        // there, where the OS draws it in bold next to the Apple menu.
+        menu.remove_at(0)?;
+        menu.insert(&app_menu, 0)?;
+    }
+
+    // Tauri's default menu grew a View submenu of its own (one item, Toggle
+    // Full Screen) after this code was written, and nothing failed — the app
+    // simply shipped *two* menus called View, ours second. Take the existing one
+    // out before adding ours. Matched on the title because that submenu has no
+    // id constant to match on; if a future Tauri renames it, the fallback is the
+    // old behaviour rather than a crash.
+    if let Some(existing_view) = menu
+        .items()?
+        .into_iter()
+        .find(|item| {
+            item.as_submenu()
+                .and_then(|s| s.text().ok())
+                .is_some_and(|title| title == "View")
+        })
+    {
+        menu.remove(&existing_view)?;
+    }
+
+    let items = menu.items()?;
+    match items
+        .iter()
+        .position(|item| item.id().as_ref() == WINDOW_SUBMENU_ID)
+    {
+        Some(index) => menu.insert(&view, index)?,
+        None => menu.append(&view)?,
+    }
+
+    // Dev builds only: the trace UI this sidecar exports to, one click from
+    // the window it is tracing. Appended to the default Window submenu rather
+    // than replacing it, so the OS-provided items (Minimize, Zoom, the window
+    // list on macOS) stay exactly as the platform draws them.
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    if let Some(window_menu) = items
+        .iter()
+        .find(|item| item.id().as_ref() == WINDOW_SUBMENU_ID)
+        .and_then(|item| item.as_submenu())
+    {
+        window_menu.append(&PredefinedMenuItem::separator(app)?)?;
+        window_menu.append(&MenuItem::with_id(
+            app,
+            MENU_TRACES,
+            "Open Jaeger Traces",
+            true,
+            None::<&str>,
+        )?)?;
+    }
+
+    // Drop the default's Help before appending ours, or macOS shows two.
+    if let Some(existing) = menu
+        .items()?
+        .into_iter()
+        .find(|item| item.id().as_ref() == HELP_SUBMENU_ID)
+    {
+        menu.remove(&existing)?;
+    }
+    menu.append(&help)?;
+
+    app.set_menu(menu)?;
+
+    // Tells AppKit which submenu is *the* Help menu, which is what puts the
+    // search field at its top. Best-effort: a missing search field is cosmetic,
+    // an install that failed here would not be.
+    #[cfg(target_os = "macos")]
+    let _ = help.set_as_help_menu_for_nsapp();
+
+    Ok(())
+}
+
+/// Route a menu click: Help opens a page in the system browser, View acts on
+/// the window.
+#[cfg(desktop)]
+fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
+    let id = event.id().as_ref();
+
+    // Help items go to the real browser, never the app's own webview: this
+    // window is the product, and navigating it to a privacy policy strands the
+    // user with no back button and no tabs.
+    if let Some((_, url)) = HELP_LINKS.iter().find(|(menu_id, _)| *menu_id == id) {
+        let _ = app.opener().open_url(*url, None::<&str>);
+        return;
+    }
+    // Same rule as Help: a trace UI belongs in a real browser with tabs, not
+    // in the product's window.
+    #[cfg(any(debug_assertions, feature = "devtools"))]
+    if id == MENU_TRACES {
+        let _ = app.opener().open_url(TRACES_UI_URL, None::<&str>);
+        return;
+    }
+
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    match id {
+        MENU_RELOAD => {
+            let _ = window.reload();
+        }
+        MENU_ZOOM_IN | MENU_ZOOM_OUT | MENU_ZOOM_RESET => {
+            let current = MAIN_ZOOM.load(Ordering::SeqCst);
+            let next = match id {
+                MENU_ZOOM_IN => next_zoom(current, true),
+                MENU_ZOOM_OUT => next_zoom(current, false),
+                _ => ZOOM_DEFAULT,
+            };
+            if window.set_zoom(f64::from(next) / 100.0).is_ok() {
+                MAIN_ZOOM.store(next, Ordering::SeqCst);
+            }
+        }
+        #[cfg(any(debug_assertions, feature = "devtools"))]
+        MENU_DEVTOOLS => {
+            if window.is_devtools_open() {
+                window.close_devtools();
+            } else {
+                window.open_devtools();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The splash window, shown while the hosted app loads.
+const SPLASH_LABEL: &str = "splash";
+
+/// How long the splash waits before revealing the main window anyway.
+///
+/// `on_page_load` is the happy path, but it never fires if the hosted app is
+/// unreachable — offline, DNS down, the host erroring. A hidden main window
+/// behind a splash that never dismisses is an app with no way in and no way to
+/// quit but Force Quit, which is strictly worse than the blank window this
+/// replaces. The deadline buys that guarantee for a few seconds of ugliness in
+/// the case where something is already broken.
+///
+/// Thirty seconds because this is an escape hatch, not a loading timer: a debug
+/// build on a busy machine was measured taking 5.5 s to finish loading the
+/// hosted app, and a deadline close to that reveals a half-loaded window on any
+/// slow network. The splash says so itself after six seconds, so the user is
+/// not left guessing while it waits.
+const SPLASH_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Whether the main window has been revealed. `on_page_load` fires on every
+/// navigation the app makes, not only the first, and a `set_focus` on each
+/// pulled the window back over whatever the user had switched to every time
+/// the page reloaded. One reveal; after that the window is left where it is.
+static MAIN_REVEALED: AtomicBool = AtomicBool::new(false);
+
+/// Reveal the real window and dismiss the splash, once.
+///
+/// The page-load hook and the deadline race each other by design, and
+/// whichever arrives second finds the flag already set. Every error is ignored
+/// for the same reason — a window that is already visible or already closed is
+/// the outcome we wanted.
+fn reveal_main_window(app: &AppHandle) {
+    if MAIN_REVEALED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+    if let Some(splash) = app.get_webview_window(SPLASH_LABEL) {
+        let _ = splash.close();
+    }
+}
+
+/// Marker file recording that the first-run greeting has been shown.
+const GREETED_MARKER: &str = "greeted";
+
+/// The splash window's size, normally and on a first launch.
+///
+/// The taller one holds the `salve` panel and the line under the wordmark. The
+/// size is fixed when the window is built, which is why the first-run decision
+/// is made here in Rust and handed to the page, rather than the page deciding
+/// for itself from storage the window has already been sized without.
+const SPLASH_SIZE: (f64, f64) = (380.0, 150.0);
+const SPLASH_FIRST_RUN_SIZE: (f64, f64) = (380.0, 330.0);
+
+/// Whether this is the first launch on this machine, claiming it if so.
+///
+/// Writes the marker up front rather than once the app has finished loading,
+/// because the two ways this can go wrong are not equal: a greeting missed
+/// after a crash on the very first launch costs nothing, and a greeting shown
+/// on every launch until one succeeds is a bug the user has to watch repeat.
+///
+/// Every failure answers "no" for the same reason. If the data directory
+/// cannot be found or written, the marker could not be recorded either, so
+/// greeting now would mean greeting again next time.
+///
+/// Takes the directory rather than looking it up so the decision can be tested
+/// without an app, an environment variable, or the real data directory.
+fn claim_first_run_in(dir: &std::path::Path) -> bool {
+    let marker = dir.join(GREETED_MARKER);
+    if marker.exists() {
+        return false;
+    }
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    std::fs::write(&marker, b"").is_ok()
+}
+
+/// `claim_first_run_in` against the real data directory.
+fn claim_first_run() -> bool {
+    telemetry::default_data_dir()
+        .map(|dir| claim_first_run_in(&dir))
+        .unwrap_or(false)
+}
+
+/// Open the splash window.
+///
+/// Built here rather than declared in `tauri.conf.json` because Tauri
+/// *replaces* `app.windows` when it merges a config: the dev and self-host
+/// configs each carry their own copy of that array, so a window declared in the
+/// base config would silently vanish from both. The Rust runs identically for
+/// all three build shapes, which is the same reason `sidecar::is_available`
+/// probes at runtime instead of being compiled two ways.
+fn open_splash(app: &AppHandle, first_run: bool) -> tauri::Result<()> {
+    let (width, height) = if first_run {
+        SPLASH_FIRST_RUN_SIZE
+    } else {
+        SPLASH_SIZE
+    };
+
+    let mut builder =
+        WebviewWindowBuilder::new(app, SPLASH_LABEL, WebviewUrl::App("index.html".into()))
+            .title("Duct")
+            .inner_size(width, height)
+            .resizable(false)
+            .decorations(false)
+            .center();
+
+    if first_run {
+        // An injected global rather than a query string: `WebviewUrl::App`
+        // takes a path, and a `?` in a path is a question about encoding this
+        // does not need to answer. The script runs before the document's own.
+        builder = builder.initialization_script("window.__DUCT_FIRST_RUN__ = true;");
+    }
+
+    builder.build()?;
+    Ok(())
+}
+
+/// The foreign origins the web app embeds as frames, and nothing else.
+///
+/// Cloudflare Turnstile renders its challenge in an iframe on this origin
+/// whenever the sign-in page talks to the hosted API, which is every official
+/// build. A new `<iframe src>` on another origin in `app/` goes here in the
+/// same change, with its case in `the_window_only_ever_shows_the_app_origin`;
+/// otherwise the guard opens it in the browser and the frame stays empty.
+const EMBEDDED_FRAME_ORIGINS: [&str; 1] = ["https://challenges.cloudflare.com"];
+
+/// Whether `url` sits on one of `EMBEDDED_FRAME_ORIGINS`, compared as origins
+/// so a lookalike host or the same host over plain http does not match.
+fn is_embedded_frame_origin(url: &Url) -> bool {
+    EMBEDDED_FRAME_ORIGINS
+        .iter()
+        .filter_map(|origin| Url::parse(origin).ok())
+        .any(|origin| origin.origin() == url.origin())
+}
+
+/// What the main window may do with a navigation request.
+#[derive(Debug, PartialEq, Eq)]
+enum Navigation {
+    /// Load it here: the app's own origin, or a frame the page built itself.
+    Allow,
+    /// Not ours, but a web page: the system browser is where it belongs.
+    OpenExternally,
+    /// Neither: refuse it, and do not hand it to the OS either.
+    Block,
+}
+
+/// Decide a navigation of the main window against the configured app origin.
+///
+/// The window is the product, and the page inside it is the only thing that
+/// may call the shell. A top-level navigation anywhere else turns the window
+/// into a browser with no address bar: whatever loads there wears Duct's frame
+/// and title. So the app's origin is allowed, any other web URL is opened in
+/// the system browser instead (the in-window OAuth fallback used to land
+/// here), and everything else is dropped. Handing an arbitrary scheme to the
+/// OS would launch whatever claims it, which is the rule `open_external`
+/// already enforces for the page's explicit requests.
+///
+/// Two non-web documents pass, and only two: `about:blank` and
+/// `about:srcdoc`, which the webview produces itself for an empty frame and
+/// for every `<iframe srcdoc>` the app renders, plus a `blob:` the app's own
+/// origin created. A `data:` document or someone else's blob at the top
+/// level is the same hole as a foreign web page, just without a request, so
+/// both are dropped. The check matters for frames as much as the top level:
+/// on macOS and Linux the webview asks this function about frame navigations
+/// too (wry passes no frame information), so a foreign `<iframe src>` is
+/// decided exactly like a top-level load. The app embeds one:
+/// `EMBEDDED_FRAME_ORIGINS` names it, and passes it. A frame origin missing
+/// from that list is not blocked but *bounced*: the frame is cancelled and
+/// its URL opens in the system browser. That is what shipped in 0.7.2, where
+/// the sign-in page's Turnstile challenge opened in Safari and the page said
+/// "Security check failed to load" (sidecar builds skip Turnstile, which is
+/// why no dev build saw it). Allowing the origin at the top level too is the
+/// price of wry's missing frame flag, and for a challenge page it is nothing.
+fn navigation_policy(url: &Url, app_url: &Url) -> Navigation {
+    match url.scheme() {
+        "http" | "https" if url.origin() == app_url.origin() => Navigation::Allow,
+        "https" if is_embedded_frame_origin(url) => Navigation::Allow,
+        "http" | "https" => Navigation::OpenExternally,
+        "about" if matches!(url.path(), "blank" | "srcdoc") => Navigation::Allow,
+        // The `url` crate gives a blob the origin of the URL in its path, so
+        // this is "created by the app" and nothing else; a blob whose path is
+        // not a URL has an opaque origin and fails the comparison.
+        "blob" if url.origin() == app_url.origin() => Navigation::Allow,
+        _ => Navigation::Block,
+    }
+}
+
+/// Build the main window from its config entry, with the navigation guard on.
+///
+/// Every config marks the window `"create": false`, because a guard can only
+/// be attached while the window is being built, and Tauri builds config
+/// windows before `setup` runs. Everything else about the window (URL, size,
+/// the hidden start behind the splash) still comes from the config entry, so
+/// the `--config` overlays keep working unchanged.
+///
+/// A window with no remote URL is an error rather than an unguarded window:
+/// every build shape loads one, and a config that stopped would otherwise ship
+/// a shell whose only safeguard had quietly switched itself off.
+fn open_main_window(app: &AppHandle) -> Result<(), String> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .cloned()
+        .ok_or("no `main` window in app.windows")?;
+    let app_url = configured_app_url(app).ok_or("the main window has no remote URL to guard")?;
+
+    let handle = app.clone();
+    WebviewWindowBuilder::from_config(app, &config)
+        .map_err(|e| e.to_string())?
+        .on_navigation(move |url| match navigation_policy(url, &app_url) {
+            Navigation::Allow => true,
+            Navigation::OpenExternally => {
+                let _ = handle.opener().open_url(url.as_str(), None::<&str>);
+                false
+            }
+            Navigation::Block => false,
+        })
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// WebKitGTK's DMA-BUF renderer draws a blank or white window on NVIDIA's
+/// proprietary driver, and on some Wayland and AppImage setups — the app is
+/// then unusable with nothing to say why. Turning it off for that driver costs
+/// nothing anyone notices; elsewhere the renderer stays on. A value the user
+/// set themselves always wins.
+///
+/// Must run before anything spawns a thread: `set_var` is not thread-safe.
+#[cfg(target_os = "linux")]
+fn disable_dmabuf_renderer_on_nvidia() {
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
+        && std::path::Path::new("/proc/driver/nvidia/version").exists()
+    {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    #[cfg(target_os = "linux")]
+    disable_dmabuf_renderer_on_nvidia();
+
+    // Before the builder: a panic during setup is exactly the kind of failure
+    // worth reporting.
+    let telemetry_enabled = telemetry::default_data_dir()
+        .map(|dir| telemetry::is_enabled(&dir))
+        .unwrap_or(false);
+    // Named, not inferred: the type is the contract — whatever the compiled-in
+    // reporter needs held for the process's life. PostHog's needs nothing, but
+    // a reporter with a background transport stops it on drop, so this stays
+    // `_guard` (not `_`) for the arm that does.
+    let _guard: telemetry::Guard = telemetry::init(telemetry_enabled);
+
+    let builder = tauri::Builder::default();
+
+    // MUST be the first plugin registered (Tauri's own requirement). It only
+    // matters off macOS: there, the OS hands a deep link to the running app,
+    // whereas Windows and Linux start a new process with the URL in argv. The
+    // `deep-link` feature makes this plugin forward that argv to the running
+    // instance's deep-link handler, so `handle_auth_deep_link` below sees the
+    // auth code no matter which platform delivered it. Without this, a Windows
+    // or Linux sign-in would open a second window with a second sidecar and
+    // leave the original one still logged out.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        // The deep link itself is forwarded for us; all that is left is to put
+        // the existing window in front of the user. Which window that is
+        // depends on timing: until the hosted app finishes loading, `main` is
+        // still hidden, and focusing a hidden window activates the app with
+        // nothing on screen. Prefer whatever is actually visible.
+        let visible_main = app
+            .get_webview_window("main")
+            .filter(|w| w.is_visible().unwrap_or(false));
+        if let Some(window) = visible_main.or_else(|| app.get_webview_window(SPLASH_LABEL)) {
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+    }));
+
+    #[cfg(feature = "updater")]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+
+    builder
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_notification::init())
+        .manage(SidecarState::default())
+        .on_menu_event(handle_menu_event)
+        // The main window is configured hidden, so something has to reveal it.
+        // This fires for every navigation the app makes, not just the first;
+        // `reveal_main_window` acts once and returns on every later call, so a
+        // reload never steals focus.
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main" && payload.event() == PageLoadEvent::Finished {
+                reveal_main_window(webview.app_handle());
+            }
+        })
+        .setup(|app| {
+            // The main window first, exactly where Tauri used to build it from
+            // config before `setup` ran: hidden, pointed at the hosted app, and
+            // now with its navigation guard attached. A shell without it is
+            // not a shell, so a failure here ends setup rather than being
+            // logged past.
+            open_main_window(app.handle())?;
+
+            // Then the splash, before anything else: the whole point is to put
+            // pixels on screen while the network is still resolving. The main
+            // window points at the hosted app, which measured between 0.3 s and
+            // 2.3 s just to return the document, before a byte of script runs.
+            // Claimed before the window is built, not inside it: this writes
+            // to disk, and a reader of `open_splash` should not have to guess
+            // that opening a window spends the one first run this install has.
+            let first_run = claim_first_run();
+            if let Err(err) = open_splash(app.handle(), first_run) {
+                // A missing splash is cosmetic. A main window that stays hidden
+                // is not, so stop waiting for a page load and show it now.
+                eprintln!("duct: could not open the splash window: {err}");
+                reveal_main_window(app.handle());
+            }
+
+            // The deadline behind `SPLASH_DEADLINE`: a load that never finishes
+            // must not mean a window that never appears.
+            let deadline_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(SPLASH_DEADLINE);
+                reveal_main_window(&deadline_handle);
+            });
+
+            // macOS registers the scheme from the bundle's Info.plist. Linux and
+            // Windows register it from the *installer*, so a build that was run
+            // rather than installed — `tauri dev`, a CI smoke test, an
+            // extracted AppImage — never receives one. Registering at runtime
+            // covers that; it is a no-op where the installer already did it,
+            // and unsupported on macOS, so the error is deliberately ignored.
+            //
+            // Off the main thread: `setup` runs on it, and on Linux this shells
+            // out to `update-desktop-database` and `xdg-mime` and waits, which
+            // held the splash's first paint behind two subprocesses on every
+            // launch. Nothing this launch does needs the registration finished.
+            #[cfg(any(target_os = "linux", windows))]
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    use tauri_plugin_deep_link::DeepLinkExt as _;
+                    if let Err(err) = handle.deep_link().register_all() {
+                        eprintln!("duct: could not register deep link scheme: {err}");
+                    }
+                });
+            }
+
+            // A window that cannot be reloaded is a window that can only be
+            // quit, and an empty Help menu fails App Store review — see
+            // `install_app_menu`. Not fatal if it fails: the app is still
+            // usable, just with the default menu.
+            if let Err(err) = install_app_menu(app.handle()) {
+                eprintln!("duct: could not install the application menu: {err}");
+            }
+            // Off macOS the app menu is a bar inside each window, and setting it
+            // attaches it to every window that has none, the splash included:
+            // File, Edit, View and Help on a 380-pixel panel with no title bar.
+            #[cfg(not(target_os = "macos"))]
+            if let Some(splash) = app.get_webview_window(SPLASH_LABEL) {
+                let _ = splash.remove_menu();
+            }
+
+            let handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    route_deep_link(&handle, &url);
+                }
+            });
+
+            // A link that *launched* the app arrived before that listener
+            // existed and is not replayed to it. Windows and Linux pass it in
+            // argv, which the plugin reads during its own setup; macOS may
+            // deliver its `Opened` event on either side of `Ready`. Either
+            // way the plugin keeps the URL for `get_current`, and a link that
+            // arrives after this point reaches the listener instead — so each
+            // one is handled exactly once, and a cold-start sign-in on Windows
+            // or Linux no longer lands on a window that never hears it.
+            match app.deep_link().get_current() {
+                Ok(Some(urls)) => {
+                    for url in urls {
+                        route_deep_link(app.handle(), &url);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => eprintln!("duct: could not read the launch deep link: {err}"),
+            }
+
+            // Start the local backend, if this build shipped one. The official
+            // build does not — it talks to the hosted API, and a missing
+            // sidecar there is the design rather than a fault, so it must not
+            // reach the error path below.
+            if sidecar::is_available(app.handle()) {
+                // A failure now is recorded in SidecarState and reported through
+                // `get_sidecar_info` — the window still opens so the user sees
+                // the reason rather than nothing.
+                if let Err(err) = sidecar::spawn(app.handle()) {
+                    eprintln!("duct: sidecar failed to start: {err}");
+                    // A bundle that ships a backend and then cannot start it is
+                    // broken for everyone on that platform, not just this person.
+                    telemetry::capture_message(&format!("sidecar failed to start: {err}"));
+                }
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_provider_key,
+            set_provider_key,
+            delete_provider_key,
+            get_shell_info,
+            notify,
+            open_notification_settings,
+            get_sidecar_info,
+            open_external,
+            check_for_update,
+            install_update,
+            get_telemetry_settings,
+            set_telemetry_enabled,
+            chatgpt::chatgpt_status,
+            chatgpt::chatgpt_login,
+            chatgpt::chatgpt_login_cancel,
+            chatgpt::chatgpt_credential,
+            chatgpt::chatgpt_logout
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // The sidecar's lifetime is the app window's: no orphaned Python
+            // process holding a loopback port after the user quits.
+            if matches!(event, tauri::RunEvent::Exit) {
+                sidecar::shutdown(app);
+            }
+        });
+}
+
+/// Helpers that more than one module's tests need. The crate takes no test
+/// dependencies, so a scratch directory is built from `std` rather than a crate.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// A directory that does not exist yet, so the test exercises the same
+    /// path a real first launch takes on a machine with no data directory.
+    pub(crate) fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "duct-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::scratch_dir;
+
+    #[test]
+    fn zoom_steps_along_the_ladder_and_stops_at_the_ends() {
+        assert_eq!(next_zoom(100, true), 110);
+        assert_eq!(next_zoom(100, false), 90);
+        assert_eq!(next_zoom(200, true), 200, "the top step is a ceiling");
+        assert_eq!(next_zoom(50, false), 50, "the bottom step is a floor");
+        assert_eq!(next_zoom(105, true), 110, "off the ladder moves to the next step up");
+        assert_eq!(next_zoom(105, false), 100, "and down to the one below");
+    }
+
+    #[test]
+    fn the_greeting_is_claimed_once_and_never_again() {
+        let dir = scratch_dir("first-run");
+
+        assert!(claim_first_run_in(&dir), "the first launch is a first run");
+        assert!(
+            !claim_first_run_in(&dir),
+            "the second launch is not, or the greeting repeats forever"
+        );
+        assert!(dir.join(GREETED_MARKER).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unwritable_data_dir_is_not_a_first_run() {
+        // If the marker cannot be written, greeting now would mean greeting
+        // again on every launch, which is worse than never greeting at all.
+        // A path under a regular *file* cannot be created as a directory.
+        let blocker = scratch_dir("blocked");
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        assert!(!claim_first_run_in(&blocker.join("data")));
+
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    fn target(link: &str) -> Option<(&'static str, String)> {
+        deep_link_target(&Url::parse(link).expect("a well-formed link"))
+    }
+
+    #[test]
+    fn a_sign_in_link_lands_on_the_login_page_with_its_code() {
+        assert_eq!(
+            target("ai.getduct.desktop://auth?auth_code=abc-123_XYZ"),
+            Some(("/", "auth_code=abc-123_XYZ".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_connector_link_lands_on_connections_with_both_values() {
+        assert_eq!(
+            target("ai.getduct.desktop://connector?connector=ga4&auth_code=c0de"),
+            Some(("/connections", "connector=ga4&auth_code=c0de".to_string()))
+        );
+    }
+
+    #[test]
+    fn anything_but_a_url_safe_token_is_dropped_rather_than_escaped() {
+        // Any app on the machine can open our scheme; a code carrying query
+        // syntax or a path would otherwise be spliced into the webview URL.
+        assert_eq!(target("ai.getduct.desktop://auth?auth_code=a%26b"), None);
+        assert_eq!(target("ai.getduct.desktop://auth?auth_code=../x"), None);
+        assert_eq!(target("ai.getduct.desktop://auth?auth_code="), None);
+        assert_eq!(target("ai.getduct.desktop://connector?connector=ga4"), None);
+        assert_eq!(target("ai.getduct.desktop://connector?connector=g%2F4&auth_code=c"), None);
+        assert_eq!(target("ai.getduct.desktop://elsewhere?auth_code=abc"), None);
+        let long = "a".repeat(513);
+        assert_eq!(target(&format!("ai.getduct.desktop://auth?auth_code={long}")), None);
+    }
+
+    fn app_url() -> Url {
+        Url::parse("https://app.getduct.ai").unwrap()
+    }
+
+    #[test]
+    fn a_deep_link_lands_on_the_configured_origin_whatever_the_window_shows() {
+        // The destination takes the configured URL and nothing else, so a
+        // window the page sent to a vendor cannot receive the code.
+        assert_eq!(
+            deep_link_destination(&app_url(), "/connections", "connector=ga4&auth_code=c0de")
+                .unwrap()
+                .as_str(),
+            "https://app.getduct.ai/connections?connector=ga4&auth_code=c0de"
+        );
+        // A dev origin with a port keeps it, and a path on the configured URL
+        // does not survive: deep links are absolute routes.
+        let dev = Url::parse("http://localhost:3003/somewhere").unwrap();
+        assert_eq!(
+            deep_link_destination(&dev, "/", "auth_code=abc").unwrap().as_str(),
+            "http://localhost:3003/?auth_code=abc"
+        );
+    }
+
+    fn decide(url: &str) -> Navigation {
+        navigation_policy(&Url::parse(url).expect("a well-formed URL"), &app_url())
+    }
+
+    #[test]
+    fn the_window_only_ever_shows_the_app_origin() {
+        assert_eq!(decide("https://app.getduct.ai/connections?x=1"), Navigation::Allow);
+        // Same origin, default port spelled out.
+        assert_eq!(decide("https://app.getduct.ai:443/"), Navigation::Allow);
+
+        // Another web page goes to the real browser, including the same host
+        // over plain http and a lookalike host.
+        assert_eq!(decide("https://accounts.google.com/o/oauth2"), Navigation::OpenExternally);
+        assert_eq!(decide("http://app.getduct.ai/"), Navigation::OpenExternally);
+        assert_eq!(decide("https://app.getduct.ai.evil.tld/"), Navigation::OpenExternally);
+        assert_eq!(decide("https://api.getduct.ai/"), Navigation::OpenExternally);
+
+        // The sign-in page's Turnstile frame loads in place. The webview asks
+        // about frames with no frame flag, so bouncing it to the browser is
+        // what broke sign-in in 0.7.2. Same origin only: not a lookalike, not
+        // plain http.
+        assert_eq!(
+            decide("https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/f/x"),
+            Navigation::Allow
+        );
+        assert_eq!(decide("https://challenges.cloudflare.com.evil.tld/"), Navigation::OpenExternally);
+        assert_eq!(decide("http://challenges.cloudflare.com/"), Navigation::OpenExternally);
+
+        // What the page builds for its own frames stays: the two `about:`
+        // documents the webview makes, and a blob the app itself created.
+        assert_eq!(decide("about:srcdoc"), Navigation::Allow);
+        assert_eq!(decide("about:blank"), Navigation::Allow);
+        assert_eq!(decide("blob:https://app.getduct.ai/0f3a"), Navigation::Allow);
+
+        // A document the page could write itself, or a blob from elsewhere,
+        // is a foreign page without the request: dropped, not shown.
+        assert_eq!(decide("data:text/html,x"), Navigation::Block);
+        assert_eq!(decide("data:text/html;base64,PGgxPmhpPC9oMT4="), Navigation::Block);
+        assert_eq!(decide("blob:https://evil.tld/abc"), Navigation::Block);
+        assert_eq!(decide("blob:http://app.getduct.ai/abc"), Navigation::Block);
+        assert_eq!(decide("blob:nonsense"), Navigation::Block);
+        assert_eq!(decide("about:config"), Navigation::Block);
+
+        // A scheme the OS would route to another app is dropped, not forwarded.
+        assert_eq!(decide("mailto:someone@example.com"), Navigation::Block);
+        assert_eq!(decide("ai.getduct.desktop://auth?auth_code=x"), Navigation::Block);
+        assert_eq!(decide("file:///etc/passwd"), Navigation::Block);
+        assert_eq!(decide("tauri://localhost/"), Navigation::Block);
+    }
+
+    #[test]
+    fn a_dev_build_allows_its_own_localhost_port_and_nothing_else_on_loopback() {
+        let dev = Url::parse("http://localhost:3003").unwrap();
+        let decide = |url: &str| navigation_policy(&Url::parse(url).unwrap(), &dev);
+        assert_eq!(decide("http://localhost:3003/connections"), Navigation::Allow);
+        // The API dev server and the sidecar are APIs, not pages for this window.
+        assert_eq!(decide("http://localhost:8002/docs"), Navigation::OpenExternally);
+        assert_eq!(decide("http://127.0.0.1:3003/"), Navigation::OpenExternally);
+    }
+
+    #[test]
+    fn open_external_takes_https_and_loopback_http_by_host_not_by_prefix() {
+        for ok in [
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=x",
+            "HTTPS://getduct.ai/",
+            "http://localhost:1455/auth/callback",
+            "http://127.0.0.1:53124/auth/signin",
+        ] {
+            assert!(is_openable_externally(ok), "{ok}");
+        }
+        for rejected in [
+            // The prefix check used to pass all three of these.
+            "http://localhost.evil.tld/",
+            "http://localhost@evil.tld/",
+            "http://127.0.0.1.evil.tld/",
+            "http://evil.tld/",
+            "mailto:someone@example.com",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "ai.getduct.desktop://auth?auth_code=x",
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_openable_externally(rejected), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn a_keyring_failure_is_described_in_terms_the_user_can_act_on() {
+        let platform = describe_keyring_error(KeyringError::PlatformFailure(Box::new(
+            std::io::Error::other("errSecItemNotFound (-25300)"),
+        )));
+        // The raw cause survives for a bug report ...
+        assert!(platform.contains("errSecItemNotFound"), "{platform}");
+        if cfg!(target_os = "macos") {
+            // ... and macOS names the signature rule that actually explains it.
+            assert!(platform.contains("Saving it again fixes it"), "{platform}");
+        } else if cfg!(target_os = "linux") {
+            assert!(platform.contains("gnome-keyring"), "{platform}");
+        }
+        // A missing entry is an ordinary answer, not a platform fault: no advice attached.
+        let missing = describe_keyring_error(KeyringError::NoEntry);
+        assert_eq!(missing, KeyringError::NoEntry.to_string());
+    }
+}

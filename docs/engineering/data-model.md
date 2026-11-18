@@ -1,0 +1,103 @@
+# Data model
+
+**Author:** Shirish Kadam, Claude · **Updated:** 2026-11-11
+
+Every table the backend owns, what it records, and which one answers a given
+question. The models in [`backend/models/`](../../backend/models/) are the
+source of truth for columns; this page is for the step before that, deciding
+where something lives. `backend/tests/test_data_model_doc.py` fails when a
+table exists that this page does not list.
+
+## Where is it recorded?
+
+Read this before proposing a new table, event kind or log. Four stores already
+record what happens, and each has one job. Most "we need to store X" turns out
+to be "X is already in one of these, and nothing reads it yet."
+
+| Question | Table | Written by | Shape |
+|---|---|---|---|
+| What was said, and what did each tool return? | `agent_events` | the conversation recorder, every turn | append-only, one row per turn part, ordered by `seq` |
+| Who did what to a project, and when? | `activity_logs` | `service/activity.py::log_activity`, after each domain write | append-only, one row per lifecycle transition, with actor (`user` / `agent` / `auto`) and `conversation_id` |
+| What state is a proposed change in right now? | `execution_change_sets` | `service/execution/service.py` | mutable, one row per change set; per-change status and results in `changes` |
+| What does the agent know that it cannot re-derive? | `project_memories` | memory tools and consolidation, `service/memory.py` | bi-temporal, typed, sourced; a later value for the same key supersedes the earlier one |
+
+How they relate: `agent_events`, `activity_logs` and `artifacts` are the raw
+evidence and stay append-only. `project_memories` is the layer distilled from
+them, the only one written to be put in front of a model
+([`backend/models/memory.py`](../../backend/models/memory.py), "Layer 1 of
+four").
+
+A human decision on a change set (approve, reject, apply, rollback) is an
+`activity_logs` row and a status on `execution_change_sets`, never a third
+record.
+
+Conversation state the model resumes from (LangGraph checkpoints) is not in
+this list: LangGraph creates and migrates its own tables outside Alembic
+(`db/migrate.LANGGRAPH_TABLES`, and
+[`backend/agents/core/checkpoint.py`](../../backend/agents/core/checkpoint.py)).
+
+## Tables by area
+
+### People and access
+
+| Table | Holds |
+|---|---|
+| `users` | one row per person (or per desktop install, for a guest); user-scope switches like `memory_paused` |
+| `auth_identities` | how a user signs in: Google, guest install, or a linked ChatGPT account (a merge key, never a login alone) |
+| `oauth_states` | short-lived OAuth `state` values, single-use, with an expiry |
+| `mcp_tokens` | what an outside agent sends to Duct's MCP server: a pasted personal token, or an agent that signed in through the browser (its client id and a refresh token); hashes and a four-character hint, never a token, and accepted on `/mcp` only |
+| `projects` | the unit everything else hangs off: settings, `autonomy_level`, `memory_paused`, and `provenance` (where each drafted field came from) |
+| `project_members` | who can see a project. Authorization is membership, not `projects.user_id` |
+| `project_invitations` | pending email invites into a project |
+| `user_profile` | who the operator is and how they want to be written to |
+| `user_model_settings` | the user's model per tier, and whether a run may step down a tier when out of quota |
+
+### Connectors
+
+| Table | Holds |
+|---|---|
+| `connector_credentials` | a user's connection to one provider account (OAuth refresh token or key), with `residency` (server or device) |
+| `project_connectors` | which credential a project uses, and which entity inside it (GA4 property, GSC site, GTM container) |
+
+### Agents and conversations
+
+| Table | Holds |
+|---|---|
+| `agent_conversations` | one thread: agent type, project, run status, compaction summary, `seq` allocator, optional link to the artifact it edits; `meta` holds the memory watermark and a plan proposal waiting on the person |
+| `agent_events` | the thread's transcript (see above). `kind` is free text: `user`, `assistant`, `thinking`, `tool_use`, `tool_result`, `question`, `answer`, `context`, `compacted`, `memory_*`, `failure`, `plan_decision`, `feed` (what a plan from shipped work read) |
+| `activity_logs` | see above. The project's audit trail: change-set transitions, GTM publishes, artifact versions, a scheduled post its scheduler failed to publish (whose reason the post's card reads back). Not a mirror of tool calls |
+| `agent_contexts` | per project and agent, a JSON blob of working notes the agent carries between runs |
+| `artifacts` | every version of every output (brief, report, image): `group_id` is the identity, one immutable row per version; bytes in object storage, never a public URL |
+| `project_memories` | see above. Scopes `user`, `project`, `artifact` in one table |
+| `model_usage` | one row per model call with tokens and cost, so a user can see their own bill |
+
+### Schedules
+
+| Table | Holds |
+|---|---|
+| `agent_schedules` | a run nobody starts by hand: the job and its settings, a preset cadence in a named time zone, enabled, the host that owns it (`cloud` / `local`), the monthly cap, the loop's own claim, lease and retry state, and for an on-release schedule (#563) the last release tag it saw (`cursor`) and a Run now that skips the check once (`forced`). What each run did is an `activity_logs` row (category `schedule`), linked to the conversation it left, never a second history |
+
+### Execution
+
+| Table | Holds |
+|---|---|
+| `execution_change_sets` | see above. Status runs `proposed → approved → applying → applied / partial / failed`, or `rejected`, or `rolled_back` |
+| `execution_guardrails` | per-account rules a change may never break; checked at propose and again at apply |
+
+### Content studio
+
+| Table | Holds |
+|---|---|
+| `content_plans` | a content plan and its strategy (`strategy.feed`: the window a plan from shipped work read, where the next one starts) |
+| `content_posts` | one post, whatever platform it is bound for: type (slideshow, video, image, text), its words (`caption`), its own follow-ups under it (`replies`: an X reply, a LinkedIn first comment), slides (none for a text post), a video post's chosen clip (`video`), status, performance counts (`perf`: keys per `service/content_metrics.py`; typed-in ones listed in `manual_keys`, which no sync overwrites), its last pre-publish review, and the TikTok it was cloned from (`clone_source`), and once sent, the scheduler holding it (`publisher`) with its ids there. What differs by platform is rules, not columns: `agents/content/channels.RULES` |
+| `content_assets` | generated images and video clips (every take), uploads and references |
+| `content_formats` | a project's library of post formats |
+| `content_avatars` | a project's library of avatars |
+| `content_social_links` | social accounts linked for publishing, each at the scheduler that holds it (`publisher`: PostBridge, Zernio) |
+
+### Growth experiments
+
+| Table | Holds |
+|---|---|
+| `lead_magnets` | an email captured by a free audit, with its report once the audit finishes |
+| `execution_interest` | which done-for-you services a lead asked about |

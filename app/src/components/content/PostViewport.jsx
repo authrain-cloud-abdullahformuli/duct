@@ -1,0 +1,502 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import {
+  Check,
+  ClipboardCheck,
+  Hash,
+  Image as ImageIcon,
+  Images,
+  RefreshCw,
+  Send,
+  Sparkles,
+  Type,
+  Video,
+  Wand2,
+} from "lucide-react";
+import { msg } from "@lingui/core/macro";
+import { Plural, Trans, useLingui } from "@lingui/react/macro";
+import { patchPost } from "../../lib/contentApi";
+import { extractStyleHead } from "../../lib/slideDoc";
+import { statusMeta } from "../../lib/contentStatus";
+import { POST_TYPE_LABELS, PostStatus, PostType, isTextChannel } from "../../lib/contentEnums";
+import { PlatformGlyph, platformMeta } from "./platformGlyphs";
+import SlidesCarousel from "./SlidesCarousel";
+import PostVideo from "./PostVideo";
+import TextPostEditor from "./TextPostEditor";
+import CloneSourceNote from "./CloneSourceNote";
+import PublishReviewPanel from "./PublishReviewPanel";
+import { SanityCheckId, isScored } from "@/lib/contentReview";
+import { titleCase } from "@/lib/format";
+import { isComposing } from "@/lib/shortcuts";
+import { Spinner } from "@/components/ui/spinner";
+import { Textarea } from "@/components/ui/textarea";
+
+// Message descriptors (module-level): rendered with `i18n._`.
+const STREAMING_HINTS = [
+  msg`Picking the hook…`,
+  msg`Writing the caption…`,
+  msg`Choosing hashtags…`,
+  msg`Sketching image prompts…`,
+];
+const TEXT_STREAMING_HINTS = [
+  msg`Reading what you've already said…`,
+  msg`Picking the angle…`,
+  msg`Finding a source…`,
+  msg`Writing the hook…`,
+];
+
+const TYPE_ICON = { slideshow: Images, video: Video, image: ImageIcon, text: Type };
+
+/**
+ * Post viewport — preview-first. The right pane shows what actually ships: the
+ * live slides preview plus the publishable copy (caption + hashtags). Slide
+ * layout, image prompts, hook framing and the creative brief are all edited by
+ * talking to the agent in chat, so the pane stays focused instead of being a
+ * wall of form fields. Those fields still persist (see editedFields) — they're
+ * just no longer surfaced here. Works full-page and inside the revise split-pane.
+ *
+ * Props:
+ *   - payload   : { type:"post", id, slides, slides_html, caption, hashtags[], ... }
+ *   - canPublish, onPublish, onRevise — optional header actions (detail page)
+ *   - children — rendered under the copy. The detail page puts a posted post's
+ *     metrics form here: it owns the server copy of the post, which the agent's
+ *     draft payloads (revise mode) do not carry perf for.
+ *   - onSendMessage(text) — when present (active session), enables the
+ *     "approve & generate images" action, which sends a chat turn to the agent.
+ *     Absent on the read-only detail page.
+ *   - channel — the channel a new draft is for, before its first payload
+ *     arrives; picks the waiting copy. A text post (X, LinkedIn) swaps the
+ *     slides and caption for TextPostEditor: same shell, same save.
+ */
+// Drop transient client-only fields (e.g. _preview_uri, the instant-paint inline
+// data URI) from slides + cells before persisting — the DB stores only real urls.
+function stripTransient(slides) {
+  if (!Array.isArray(slides)) return slides;
+  return slides.map(({ _preview_uri, items, ...s }) => ({
+    ...s,
+    ...(Array.isArray(items)
+      ? { items: items.map(({ _preview_uri: _p, ...it }) => it) }
+      : items !== undefined ? { items } : {}),
+  }));
+}
+
+export default function PostViewport({ payload, canPublish = false, onPublish, onRevise, onSendMessage, channel, children }) {
+  const { t, i18n } = useLingui();
+  const [draft, setDraft] = useState(null);
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [currentIndex, setCurrentIndex] = useState(0);
+
+  useEffect(() => {
+    if (!payload || payload.type !== "post") return;
+    if (!dirty) setDraft(payload);
+  }, [payload, dirty]);
+
+  const post = draft || payload;
+  // CSS for the live preview comes from the backend-rendered slides_html (it
+  // inlines the full style registry + layout CSS, all content-independent).
+  const headHtml = useMemo(() => extractStyleHead(post?.slides_html || ""), [post?.slides_html]);
+
+  function patch(field, value) {
+    setDraft((prev) => ({ ...(prev || payload || {}), [field]: value }));
+    setDirty(true);
+  }
+
+  // The editable fields sent on every save. `slides` is the source of truth —
+  // we never send slides_html (the backend re-renders it from slides + layout).
+  // Caption + hashtags are edited here; the rest are edited via chat but still
+  // round-trip so an agent edit + a manual caption tweak persist together.
+  // `replies` and `title` are left out when the payload never had them, so a
+  // save against a backend that predates them is not refused for an unknown
+  // field (JSON drops an undefined key).
+  function editedFields() {
+    return {
+      caption: post.caption, replies: post.replies, hashtags: post.hashtags,
+      hook_type: post.hook_type, hook_text: post.hook_text, hook_emotion: post.hook_emotion,
+      save_cta: post.save_cta, title: post.title, audio_note: post.audio_note,
+      bridge_text: post.bridge_text, strategic_note: post.strategic_note,
+      visual_brief: post.visual_brief, emotional_arc: post.emotional_arc,
+      camera_ref_pool: post.camera_ref_pool,
+      layout: post.layout, slides: stripTransient(post.slides),
+      platforms: post.platforms,
+    };
+  }
+
+  async function persist(statusValue) {
+    if (!post?.id) return;
+    setSaving(true);
+    setSaveError("");
+    try {
+      const updated = await patchPost(post.id, { ...editedFields(), status: statusValue });
+      setDraft(updated);
+      setDirty(false);
+      return updated;
+    } catch (err) {
+      setSaveError(err.message || t`Your edits are still here, but they didn't save. Try again.`);
+      throw err;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // Save user edits, status unchanged.
+  function handleCommit() { return persist(post.status); }
+
+  // Keep the post: promote pending → draft (and persist current edits in the
+  // same PATCH). Until this runs, the post is hidden from the board + the agent.
+  function handleSave() { return persist(PostStatus.DRAFT); }
+
+  // Persist any pending edits before asking the agent to act, so the agent
+  // (which reads the saved post) works against the latest copy.
+  async function commitIfDirty() {
+    if (dirty) {
+      try { await handleCommit(); } catch { /* surfaced via saveError */ }
+    }
+  }
+
+  function handleDiscard() { setDraft(payload); setDirty(false); setSaveError(""); }
+
+  // Absent on the read-only detail page: there is no session to ask.
+  const requestReview = onSendMessage
+    ? async () => {
+        await commitIfDirty();
+        onSendMessage("Review this post before I publish it: score it and tell me what to fix. Don't change anything yet.");
+      }
+    : undefined;
+
+  if (!post || (post.type && post.type !== "post" && !post.id)) {
+    return <DraftingPulse text={isTextChannel(channel)} />;
+  }
+
+  const slides = Array.isArray(post.slides) ? post.slides : [];
+  const isText = post.post_type === PostType.TEXT;
+  const slideIdx = Math.min(currentIndex, Math.max(0, slides.length - 1));
+
+  const status = post.status || "pending";
+  const meta = statusMeta(status);
+  const TypeIcon = TYPE_ICON[post.post_type] || Images;
+  const isVideo = post.post_type === PostType.VIDEO;
+  const typeLabel = i18n._(POST_TYPE_LABELS[post.post_type] || POST_TYPE_LABELS[PostType.SLIDESHOW]);
+  const platforms = Array.isArray(post.platforms) ? post.platforms : [];
+  const slideCount = post.slide_count;
+  const postedOn = post.posted_at
+    ? new Date(post.posted_at).toLocaleDateString(i18n.locale, { month: "short", day: "numeric", year: "numeric" })
+    : "";
+  const scheduledOn = post.scheduled_at
+    ? new Date(post.scheduled_at).toLocaleDateString(i18n.locale, { month: "short", day: "numeric" })
+    : "";
+  const dateLabel = post.posted_at
+    ? t`Posted ${postedOn}`
+    : post.scheduled_at
+    ? t`Scheduled ${scheduledOn}`
+    : t`Not scheduled`;
+
+  return (
+    <div className="flex h-full flex-col overflow-hidden">
+      {/* Unified header */}
+      <header className="shrink-0 border-b border-border/60 px-5 py-3">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="truncate text-base font-semibold leading-tight">
+              {post.topic || post.post_dir_slug || t`Untitled post`}
+            </h1>
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+              <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-medium ${meta.accentClass}`}>
+                <span className={`size-1.5 rounded-full ${meta.dotClass}`} /> {i18n._(meta.label)}
+              </span>
+              {post.pillar && (
+                <span className="rounded-full bg-primary/10 px-2 py-0.5 font-medium text-brand">{titleCase(post.pillar)}</span>
+              )}
+              {post.format_name && (
+                <span className="rounded-full border border-border/70 px-2 py-0.5">{post.format_name}</span>
+              )}
+              <span className="inline-flex items-center gap-1"><TypeIcon className="size-3" aria-hidden="true" /> {typeLabel}</span>
+              {!isVideo && typeof slideCount === "number" && slideCount > 0 && <span>· <Plural value={slideCount} one="# slide" other="# slides" /></span>}
+              <span>· {dateLabel}</span>
+              {platforms.length > 0 && (
+                <span className="flex items-center gap-1">
+                  {platforms.map((p) => {
+                    const pm = platformMeta(p);
+                    return (
+                      <span key={p} title={pm.label} className="flex size-4 items-center justify-center rounded text-white" style={{ backgroundColor: pm.color }}>
+                        <PlatformGlyph platform={p} className="size-2.5" />
+                      </span>
+                    );
+                  })}
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-2">
+            {dirty && (
+              <button type="button" onClick={handleDiscard} className="text-xs text-muted-foreground hover:text-foreground">
+                <Trans>Discard</Trans>
+              </button>
+            )}
+            {post?.status === PostStatus.PENDING ? (
+              <button
+                type="button"
+                onClick={handleSave}
+                disabled={saving}
+                title={t`Keep this post — adds it to your board`}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
+              >
+                {saving ? <Trans>Saving…</Trans> : <><Check className="size-3.5" /> <Trans>Save</Trans></>}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleCommit}
+                disabled={!dirty || saving}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3 py-1.5 text-xs font-medium text-background transition-opacity hover:opacity-90 disabled:opacity-40"
+              >
+                {saving ? <Trans>Saving…</Trans> : dirty ? <Trans>Commit edits</Trans> : <><Check className="size-3.5" /> <Trans>Saved</Trans></>}
+              </button>
+            )}
+            {canPublish && onPublish && (
+              <button type="button" onClick={onPublish} className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium hover:bg-muted/50">
+                <Send className="size-3.5" /> <Trans>Publish</Trans>
+              </button>
+            )}
+            {onRevise && (
+              <button type="button" onClick={onRevise} className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
+                <Wand2 className="size-3.5" /> <Trans>Revise with Duct</Trans>
+              </button>
+            )}
+          </div>
+        </div>
+        {saveError && <p className="mt-2 text-xs text-destructive">{saveError}</p>}
+      </header>
+
+      {/* Body — what ships. A text post is its words, edited in a feed-shaped
+          card; a visual post is the slides preview plus its caption and
+          hashtags. Slide layout, image prompts, hook and creative-brief edits
+          all happen through the agent chat, so the pane stays on what ships. */}
+      <div className="min-h-0 flex-1 overflow-auto">
+        <div className="mx-auto max-w-2xl space-y-4 p-5">
+          {isText ? (
+            <TextPostEditor post={post} patch={patch} />
+          ) : (
+            <>
+              {isVideo ? (
+                <PostVideo
+                  postId={post.id}
+                  video={post.video}
+                  takes={Array.isArray(post.video_takes) ? post.video_takes : []}
+                  onChange={(updated) =>
+                    setDraft((prev) => ({ ...(prev || payload), video: updated.video, video_takes: updated.video_takes }))
+                  }
+                />
+              ) : (
+                <>
+                  <SlidesCarousel slides={slides} headHtml={headHtml} index={slideIdx} onIndexChange={setCurrentIndex} />
+
+                  <BulkImageBar slides={slides} onSendMessage={onSendMessage} commitIfDirty={commitIfDirty} currentIndex={slideIdx} />
+                </>
+              )}
+
+              <CloneSourceNote source={post.clone_source} />
+
+              <PostCopy post={post} patch={patch} />
+            </>
+          )}
+
+          {children}
+
+          <PostReview assessment={post.assessment} onReview={requestReview} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Primitives
+// ---------------------------------------------------------------------------
+
+function Labeled({ label, hint, children }) {
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium text-muted-foreground">{label}</span>
+        {hint && <span className="text-2xs text-muted-foreground">{hint}</span>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// The ui Textarea with a value-first onChange, which is what this form's
+// `patch(key, value)` calls want.
+function CaptionField({ value, onChange, ...props }) {
+  return <Textarea value={value} onChange={(e) => onChange(e.target.value)} {...props} />;
+}
+
+// ---------------------------------------------------------------------------
+// Hashtags
+// ---------------------------------------------------------------------------
+
+function HashtagInput({ value, onChange }) {
+  const { t } = useLingui();
+  const [draft, setDraft] = useState("");
+  function add() {
+    const tag = draft.trim().replace(/^#?/, "#");
+    if (tag === "#") { setDraft(""); return; }
+    if (!value.includes(tag)) onChange([...value, tag]);
+    setDraft("");
+  }
+  function onKey(e) {
+    if (isComposing(e)) return;
+    if (e.key === "Enter" || e.key === ",") { e.preventDefault(); add(); }
+    else if (e.key === "Backspace" && !draft && value.length) onChange(value.slice(0, -1));
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 rounded-xl border border-input bg-input/40 px-2.5 py-2">
+      {value.map((tag, i) => (
+        <span key={i} className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs text-brand">
+          {tag}
+          <button type="button" onClick={() => onChange(value.filter((_, j) => j !== i))} className="text-brand/60 hover:text-brand">×</button>
+        </span>
+      ))}
+      <span className="inline-flex min-w-[120px] flex-1 items-center gap-1 text-muted-foreground">
+        <Hash className="size-3" />
+        <input value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={onKey} onBlur={add}
+          aria-label={t`Add a hashtag`}
+          placeholder={t`Add a tag, press Enter…`} className="flex-1 rounded-sm bg-transparent text-xs outline-none focus-visible:ring-3 focus-visible:ring-ring/30" />
+      </span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Publishable copy — caption + hashtags, always visible
+// ---------------------------------------------------------------------------
+
+// The only post-level fields surfaced in the viewport: the caption and hashtags
+// that actually get published. Everything else (hook framing, slide layout,
+// image prompts, creative brief) is edited by asking the agent in chat.
+function PostCopy({ post, patch }) {
+  const { t } = useLingui();
+  return (
+    <section className="space-y-4 rounded-2xl border border-border bg-card p-4">
+      <Labeled label={t`Caption`} hint={t`first line is the hook — 2–3 sentences`}>
+        <CaptionField rows={4} value={post.caption || ""} onChange={(v) => patch("caption", v)} placeholder={t`First line is the hook. Keep it 2–3 sentences.`} />
+      </Labeled>
+      <Labeled label={t`Hashtags`}>
+        <HashtagInput value={Array.isArray(post.hashtags) ? post.hashtags : []} onChange={(v) => patch("hashtags", v)} />
+      </Labeled>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Pre-publish review — the panel once the agent has scored the post; before
+// that, in a live session, one button, offered only once every slide has its
+// image: a review of a post still waiting on pictures is mostly about that.
+// ---------------------------------------------------------------------------
+
+function PostReview({ assessment, onReview }) {
+  if (isScored(assessment)) return <PublishReviewPanel assessment={assessment} onReview={onReview} />;
+  const imagesDone = (assessment?.checks || []).some((c) => c.id === SanityCheckId.SLIDES_HAVE_IMAGES && c.passed);
+  if (!onReview || !imagesDone) return null;
+  return (
+    <button
+      type="button"
+      onClick={onReview}
+      className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-border bg-background px-3 py-2 text-xs font-semibold transition-colors hover:bg-muted/50"
+    >
+      <ClipboardCheck className="size-3.5" aria-hidden="true" /> <Trans>Review before publishing</Trans>
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Slides & images — pending/stale detection drives the batch image action
+// ---------------------------------------------------------------------------
+
+function isTargetStale(t) {
+  return Boolean(t?.image_url) && (t.image_prompt || "").trim() !== (t.image_prompt_used || "").trim();
+}
+
+// Flatten slides into image "units" — one per single-image slide, one per cell
+// of a collage / before-after slide. text slides contribute none.
+function imageUnits(slides) {
+  const units = [];
+  slides.forEach((s, si) => {
+    if (Array.isArray(s.items) && s.items.length) {
+      s.items.forEach((it, ii) => units.push({ s, si, it, ii }));
+    } else if (s.kind !== "text") {
+      units.push({ s, si, it: null, ii: null });
+    }
+  });
+  return units;
+}
+
+// Batch image actions — generate all pending, or regenerate everything stale.
+// Auto-hides when there's nothing to do, so it's invisible most of the time.
+function BulkImageBar({ slides, onSendMessage, commitIfDirty, currentIndex = 0 }) {
+  if (!onSendMessage) return null;
+  const units = imageUnits(slides);
+  const t = (u) => (u.it ? u.it : u.s);
+  const pending = units.filter((u) => (t(u).image_prompt || "").trim() && !t(u).image_url).length;
+  // Regenerate is scoped to the slide the user is viewing — never all of them.
+  // (The per-slide "outdated" badge flags the others as you navigate.)
+  const cur = slides[Math.min(currentIndex, Math.max(0, slides.length - 1))];
+  const curStale =
+    !!cur &&
+    (isTargetStale(cur) ||
+      (Array.isArray(cur.items) && cur.items.some((it) => isTargetStale(it))));
+  if (pending === 0 && !curStale) return null;
+  async function ask(text) { await commitIfDirty?.(); onSendMessage(text); }
+  return (
+    <div className="flex flex-wrap gap-2">
+      {pending > 0 && (
+        <button
+          type="button"
+          onClick={() => ask("The draft looks good — start the images, ONE AT A TIME with me in the loop. Generate the next slide (or cell) that still needs an image, critique it, render the composed slide, then STOP and wait for my feedback before the next one. Don't batch them — apply what I tell you to the following slides.")}
+          className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-90"
+        >
+          <Sparkles className="size-3.5" /> <Plural value={pending} one="Approve & generate # image — one by one" other="Approve & generate # images — one by one" />
+        </button>
+      )}
+      {curStale && (
+        <button
+          type="button"
+          onClick={() => ask(`Regenerate just the image for ${cur.slide_id} — the slide I'm viewing — to match its updated prompt. Leave every other slide exactly as it is.`)}
+          className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-warning/50 bg-warning/10 px-3 py-2 text-xs font-semibold text-warning transition-colors hover:bg-warning/20"
+        >
+          <RefreshCw className="size-3.5" /> <Trans>This slide is outdated — regenerate</Trans>
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Drafting state
+// ---------------------------------------------------------------------------
+
+function DraftingPulse({ text = false }) {
+  const { i18n } = useLingui();
+  const [idx, setIdx] = useState(0);
+  const hints = text ? TEXT_STREAMING_HINTS : STREAMING_HINTS;
+  useEffect(() => {
+    const t = setInterval(() => setIdx((i) => (i + 1) % hints.length), 1800);
+    return () => clearInterval(t);
+  }, [hints.length]);
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+      <Spinner className="size-10 border-primary/30 border-t-primary" />
+      <p className="text-sm font-medium"><Trans>Drafting the post…</Trans></p>
+      <p className="text-xs text-muted-foreground transition-opacity duration-500">{i18n._(hints[idx % hints.length])}</p>
+      <p className="max-w-xs text-2xs text-muted-foreground">
+        {text
+          ? <Trans>The post appears here as soon as the draft is ready, with its character count.</Trans>
+          : <Trans>Slides, caption, and hashtags appear here as soon as the draft is ready. Usually 20–40 seconds.</Trans>}
+      </p>
+    </div>
+  );
+}

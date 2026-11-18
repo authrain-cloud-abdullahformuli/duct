@@ -1,0 +1,361 @@
+"""LangChain binder for the insights data tools.
+
+Two tools, both thin over framework-free logic:
+
+  ``FetchData``          — one catalog entity for this project
+                           (``agents/insights/fetchers.py``).
+  ``ReadConnectorNotes`` — the gotcha pack for one connector
+                           (``agents/knowledge/``).
+
+Why the notes are a tool and not a skill
+----------------------------------------
+The phase plan said to move ``agents/knowledge/*.md`` behind ``deepagents``'
+``SkillsMiddleware``. That middleware requires a ``FilesystemBackend`` — a
+**real** filesystem rooted somewhere on disk — and mounting one would hand the
+agent's ``read_file`` a live path into the host. The isolation guarantee that
+the agent cannot reach Duct's source is held today by construction (the default
+``StateBackend`` is graph state, and there is no Bash tool), and it is asserted
+in ``tests/test_insights_session.py``. Trading it for a prompt optimisation
+would be a bad exchange, and confining a real backend to one directory is a
+path-traversal question this codebase should not have to answer.
+
+A tool gives the same progressive disclosure — an index in the cached system
+prompt, bodies on demand — with no filesystem at all, in about thirty lines.
+If ``deepagents`` ever ships a virtual skills backend, this becomes the shim.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Callable
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+from agents.core.compaction import compact
+from agents.core.errors import safe_excerpt
+from agents.core.telemetry import tool_span
+from agents.insights.fetchers import (
+    MAX_RESPONSE_CHARS,
+    fetch_entity,
+    known_entities,
+    resolve_window,
+)
+from agents.knowledge import load_knowledge_pack
+from service.github import GITHUB_CONNECTOR_ID
+
+logger = logging.getLogger(__name__)
+
+# Packs that exist under agents/knowledge/, with the one-line summary that goes
+# in the cached system prompt. Names match connector ids where one exists, so
+# the agent can go straight from a data source to its notes.
+KNOWLEDGE_INDEX: dict[str, str] = {
+    "google_ads": "Google Ads — attribution windows, conversion double-counting, shared-account contamination.",
+    "ga4": "GA4 — key events vs conversions, internal traffic, and what the UI silently samples.",
+    "gsc": "Search Console — anonymised queries, position averaging, and the 16-month limit.",
+    "gtm": "Tag Manager — tags that fire but fail at runtime, and publish-as-deploy.",
+    "stripe": "Stripe — incomplete subscriptions, expansion vs acquisition, involuntary churn.",
+    "apple_ads": "Apple Search Ads — org-scoped endpoints, string money fields, v5 field renames.",
+    "meta": "Meta Ads — cents vs dollars, one purchase under three action types.",
+    "openai_ads": "OpenAI ads — minor-unit amounts against decimal spend.",
+    "revenuecat": "RevenueCat — sandbox vs production, and trial accounting.",
+    "mixpanel": "Mixpanel — the cross-platform event truth, no internal-traffic filter, typo events.",
+    "clarity": "Clarity — rage/dead clicks after the click, 10 API calls a day, 3-day window.",
+    "growthbook": "GrowthBook — 'running' is a setting not a signal; identity mismatch; sample minimums.",
+    GITHUB_CONNECTOR_ID: "GitHub — merged is not deployed, commit dates are author-supplied, bots and squash merges.",
+    "rss": "RSS and Atom feeds — published is not edited, summaries are the feed's, a feed shows its newest items only.",
+    "reconciliation": "Cross-platform reconciliation — comparing numbers that are not comparable.",
+}
+
+
+class FetchDataArgs(BaseModel):
+    entity_id: str = Field(
+        description=(
+            "Which catalog entity to fetch, exactly as named in <entity_catalogs>. "
+            f"One of: {', '.join(known_entities())}."
+        )
+    )
+    date_from: str = Field(
+        default="",
+        description="Start date, YYYY-MM-DD. Leave both dates empty for the last 30 days ending yesterday.",
+    )
+    date_to: str = Field(default="", description="End date, YYYY-MM-DD.")
+
+
+class ConnectorNotesArgs(BaseModel):
+    connector_id: str = Field(
+        description=f"Which connector's notes to read. One of: {', '.join(sorted(KNOWLEDGE_INDEX))}."
+    )
+
+
+FETCH_DESCRIPTION = (
+    "Fetch one entity of live data for this project. The account, property or site and "
+    "the credentials are resolved server-side from the project's connections — you name "
+    "the entity and the window, nothing else. Returns the data plus the exact window it "
+    "covers; cite that window whenever you cite a number from it. Row reports also carry "
+    "`totals`, `rates` and per-channel or per-device `subtotals` that Duct computed (what "
+    "they cover is in `totals_cover`): quote those, never your own sum or average of the "
+    "rows. Fetching an entity and "
+    "window already fetched this session returns the same result instantly, so re-asking "
+    "costs nothing. A non-'ok' status is an "
+    "instruction: 'needs_account' means call SelectAccount first, 'not_connected' means "
+    "the project lacks that source, 'reauth_required' means the source is dead until the "
+    "user reconnects it, 'fetch_failed' means say what you could not read "
+    "rather than retrying the same call."
+)
+
+# Session-scoped cache of successful pulls, keyed on (entity, window). The
+# verifier runs in its own context and cannot see what the analyst fetched
+# a minute ago, so it fetches it again — in the run this was measured on, a
+# single GA4 report took 45 seconds and the verifier asked for it twice.
+# Small on purpose: a session touches a handful of entities, and the cache
+# lives exactly as long as the tool closure does.
+FETCH_CACHE_MAX = 64
+# The connector a replay miss is attributed to, so it is countable as a step.
+REPLAY_CONNECTOR = "replay"
+
+NOTES_DESCRIPTION = (
+    "Read Duct's hard-won notes on one connector before you interpret its numbers: the "
+    "specific ways that platform reports something plausible and wrong. Read the notes "
+    "for every connector you fetch from, BEFORE drawing a conclusion from it — each entry "
+    "exists because the naive reading produced a believable wrong number in a real account."
+)
+
+
+def build_data_tools_lc(
+    project_id: UUID | None,
+    *,
+    user_id: UUID | None = None,
+    compress: bool = True,
+    log_prefix: str = "agent",
+    on_fetch: Callable[[str, dict], Any] | None = None,
+    on_fetch_start: Callable[[str, str, str], Any] | None = None,
+    replay: dict[tuple[str, str, str], str] | None = None,
+) -> list:
+    """FetchData + ReadConnectorNotes as LangChain tools.
+
+    ``replay`` seeds the session cache with stored tool bodies keyed the way
+    the cache is — ``(entity_id, date_from, date_to)`` as the model asked —
+    and closes the connectors: a pull the seed does not cover comes back as
+    ``status: "not_in_replay"`` instead of reaching a provider. That is how
+    a stored session is re-run on exactly its own data (scripts/session_replay.py)
+    to compare a prompt or a model against the answer it produced the first
+    time. Hermetic by construction, not by discipline.
+
+    Without a user there is nothing to resolve credentials from, so only the
+    notes tool is mounted — reading them is still useful, and a fetch tool that
+    can only fail is worse than no fetch tool.
+
+    ``compress`` folds a payload's row arrays to typed CSV before the size
+    check — lossless, so it changes how the rows are written and never which
+    numbers they carry. Off sends raw JSON and reaches the mid-structure cut
+    sooner; see ``agents/core/compaction.py`` for why on is the default.
+
+    ``on_fetch_start(entity_id, date_from, date_to)`` fires before a pull and
+    ``on_fetch(entity_id, result)`` after it. Both are UI sugar — a pull can
+    take a while, and a step that only ever appears finished gives the user
+    nothing to watch — and neither can fail the fetch.
+    """
+    from langchain_core.tools import StructuredTool
+
+    async def read_connector_notes(connector_id: str) -> str:
+        with tool_span(tool_name="ReadConnectorNotes", agent_name=log_prefix):
+            body = load_knowledge_pack(connector_id.strip().lower())
+            if not body:
+                return json.dumps({
+                    "status": "no_notes",
+                    "connector_id": connector_id,
+                    "available": sorted(KNOWLEDGE_INDEX),
+                })
+            return body
+
+    tools = [
+        StructuredTool.from_function(
+            coroutine=read_connector_notes,
+            name="ReadConnectorNotes",
+            description=NOTES_DESCRIPTION,
+            args_schema=ConnectorNotesArgs,
+        )
+    ]
+    if user_id is None:
+        return tools
+
+    cache: dict[tuple[str, str, str], str] = dict(replay or {})
+    replaying = replay is not None
+
+    async def fetch_data(entity_id: str, date_from: str = "", date_to: str = "") -> str:
+        import asyncio
+
+        key = (entity_id.strip(), date_from.strip(), date_to.strip())
+        # The same pull asked two ways ("" for the default window, then those
+        # dates written out) is one pull. A replay keeps the typed key alone:
+        # its default window resolves against the day it ran, not today.
+        resolved = key if replaying else (key[0], *resolve_window(key[1], key[2]))
+        with tool_span(tool_name="FetchData", agent_name=log_prefix) as span:
+            cached = cache.get(key, cache.get(resolved))
+            if replaying and cached is not None and on_fetch is not None:
+                # A live session's cache hit is silent (the ladder listed the
+                # pull when it was made). In a replay the seed IS the session's
+                # pulls, so the first use of one is the moment it enters this
+                # run; without a step the replay's reader cannot tell which
+                # seeded pulls the model read.
+                try:
+                    served = json.loads(cached)
+                    if isinstance(served, dict):
+                        await _maybe_await(on_fetch(key[0], served))
+                except (ValueError, TypeError):
+                    pass
+                except Exception:  # noqa: BLE001 — UI sugar, never fatal
+                    logger.debug("insights: on_fetch hook failed", exc_info=True)
+            if cached is None and replaying:
+                span.set_attribute("duct.replay_miss", True)
+                logger.info("%s: FetchData(%s) not in the replay seed", log_prefix, key)
+                # The model read the first wording of this as an outage and
+                # wrote about GA4 being down. It is not down; it is a replay,
+                # and these are the pulls it can have.
+                available = [
+                    f"{e}" + (f" for {f} to {t}" if f else " with the default window")
+                    for (e, f, t) in cache
+                ]
+                miss = {
+                    "status": "not_in_replay",
+                    "entity_id": key[0],
+                    # Named so the step the miss becomes is countable by the
+                    # replay script and readable on a ladder.
+                    "connector_id": REPLAY_CONNECTOR,
+                    "date_from": key[1],
+                    "date_to": key[2],
+                    "available": available,
+                    "message": (
+                        "Not an outage: this is a replay of a stored session on the data "
+                        "it fetched, and this pull was not among them. The pulls available "
+                        f"in this replay are: {'; '.join(available) or 'none'}. Use those, "
+                        "and say what this one would have added."
+                    ),
+                }
+                # A miss is a step like a failed pull: the replay's reader must
+                # see which asks the seed could not answer.
+                if on_fetch is not None:
+                    try:
+                        await _maybe_await(on_fetch(key[0], miss))
+                    except Exception:  # noqa: BLE001 — UI sugar, never fatal
+                        logger.debug("insights: on_fetch hook failed", exc_info=True)
+                return json.dumps(miss)
+            if cached is not None:
+                # No step events for a hit: the pull already showed up on the
+                # ladder once, and a second identical row would read as a
+                # second network call.
+                span.set_attribute("duct.cache_hit", True)
+                logger.info("%s: FetchData(%s) served from the session cache", log_prefix, key[0])
+                return cached
+            if on_fetch_start is not None:
+                try:
+                    await _maybe_await(on_fetch_start(entity_id.strip(), date_from.strip(), date_to.strip()))
+                except Exception:  # noqa: BLE001 — UI sugar, never fatal
+                    logger.debug("insights: on_fetch_start hook failed", exc_info=True)
+            try:
+                result = await asyncio.to_thread(
+                    fetch_entity,
+                    entity_id.strip(),
+                    user_id=user_id,
+                    project_id=project_id,
+                    date_from=date_from.strip(),
+                    date_to=date_to.strip(),
+                )
+            except Exception as exc:  # noqa: BLE001 — a payload, never a raise
+                logger.exception("insights: FetchData(%s) failed", entity_id)
+                result = {"status": "fetch_failed", "entity_id": entity_id, "message": safe_excerpt(exc)}
+
+            if on_fetch is not None:
+                try:
+                    await _maybe_await(on_fetch(entity_id, result))
+                except Exception:  # noqa: BLE001 — UI sugar, never fatal
+                    logger.debug("insights: on_fetch hook failed", exc_info=True)
+
+            # Off the loop: compaction is CPU-bound Rust, tens of ms on the
+            # largest payloads, and this runs inside a server holding other
+            # customers' streams open.
+            body = await asyncio.to_thread(_truncate, result, compress=compress)
+            # Only a pull that worked is worth remembering — a failure should
+            # be retried when the agent narrows the window or the token is
+            # refreshed, not replayed.
+            # One slot per pull, under the resolved key the lookup above falls
+            # back to: storing the typed key as well held two slots per pull,
+            # so FETCH_CACHE_MAX admitted half the pulls it named and the
+            # verifier re-fetched the 45 s report the cache exists to avoid.
+            if result.get("status") == "ok" and len(cache) < FETCH_CACHE_MAX:
+                cache[resolved] = body
+            return body
+
+    tools.append(
+        StructuredTool.from_function(
+            coroutine=fetch_data,
+            name="FetchData",
+            description=FETCH_DESCRIPTION,
+            args_schema=FetchDataArgs,
+        )
+    )
+    return tools
+
+
+def knowledge_index_block() -> str:
+    """The pack index for the cached system prompt — names and one-liners only.
+
+    Cache-stable: the same for every customer. The bodies stay behind
+    ReadConnectorNotes so the prefix does not carry ten files nobody read.
+    """
+    lines = [f"- `{name}` — {summary}" for name, summary in sorted(KNOWLEDGE_INDEX.items())]
+    return "\n".join(lines)
+
+
+async def _maybe_await(value: Any) -> Any:
+    import inspect
+
+    return await value if inspect.isawaitable(value) else value
+
+
+def _compacted(result: dict[str, Any]) -> dict[str, Any]:
+    """``result`` with its row arrays folded to typed CSV, or ``result`` as-is.
+
+    Round-trips through the compactor's own output because that output is still
+    a JSON document — the envelope survives, only the arrays inside it change
+    shape — so the cut below keeps working on whichever version it is handed.
+    Any payload that does not come back as a mapping is not one we understand
+    well enough to cut, so the original stands.
+    """
+    compacted = compact(json.dumps(result, default=str))
+    try:
+        parsed = json.loads(compacted)
+    except ValueError:
+        return result
+    return parsed if isinstance(parsed, dict) else result
+
+
+def _truncate(result: dict[str, Any], *, compress: bool = True) -> str:
+    """Serialise, and cut the payload rather than the envelope when it is large.
+
+    Dropping rows off the end of a JSON blob would corrupt it, so an oversized
+    response keeps its status/window fields and replaces the data with a
+    truncated string plus a note — the agent can then narrow the window instead
+    of wondering why the numbers stopped.
+
+    Compaction runs first because the cut is the lossy step: folding the rows
+    to CSV gets most payloads under the limit with every number intact, so the
+    cut stops being reached rather than being made kinder. When it is still
+    reached, it behaves exactly as it did before.
+    """
+    if compress:
+        result = _compacted(result)
+    body = json.dumps(result, default=str)
+    if len(body) <= MAX_RESPONSE_CHARS:
+        return body
+    data = json.dumps(result.get("data"), default=str)[: MAX_RESPONSE_CHARS - 2_000]
+    trimmed = {k: v for k, v in result.items() if k != "data"}
+    trimmed["data_truncated"] = data
+    trimmed["note"] = (
+        "This response was too large to return whole and has been cut mid-structure. "
+        "Narrow the date range or analyse a more specific entity rather than relying "
+        "on the tail of this payload."
+    )
+    return json.dumps(trimmed, default=str)

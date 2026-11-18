@@ -1,0 +1,134 @@
+name: desktop — compile check
+
+# The question a pull request can actually answer about the desktop shell:
+# does the Rust compile.
+#
+# `desktop-release.yml` used to run on PRs and asked a different one. Every job
+# there ends in signing and publishing, so a PR without the release secrets saw
+# all three platforms fail whatever the code did — three red checks, one of them
+# twenty-five minutes of Windows runner, none of them about the diff. Releases
+# now happen on main only; this is what stays behind.
+#
+# One platform, not three. The shell is the same Rust either way, and a type
+# error does not respect an OS boundary — the per-platform work is bundling,
+# which is precisely what is deliberately not happening here.
+#
+# `cargo check`, not `cargo build`: it type-checks the crate and its
+# dependencies without linking or codegen, which is most of the signal for a
+# fraction of the time. It does still need the sidecar path to exist, which is
+# not the same as needing a sidecar — see the stub step below.
+#
+# Then `cargo test --lib`, which does link — the unit tests in the crate cover
+# the three places a regression reaches a user as "the app does nothing": the
+# sidecar handshake line, deep-link parsing, and the keyring error text. They
+# ran nowhere before this step existed. `--lib` only: no integration-test
+# target, no doctests, and the ChatGPT callback tests bind a fixed loopback
+# port, which a runner has free.
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - 'desktop/**'
+      - '!desktop/**.md'
+      - '.github/workflows/desktop-check.yml'
+      - '.github/scripts/check-shell-contract.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned rather than floating `stable`. This workflow builds binaries we sign
+  # and ship, so "which compiler produced that release" needs an answer that is
+  # not "whatever was stable that Tuesday". A new stable can also change codegen
+  # or start rejecting code on a PR that has nothing to do with Rust.
+  #
+  # CI-only on purpose: a rust-toolchain.toml would pin contributors too, and
+  # rustup would install a second ~540 MB toolchain byte-identical to the
+  # `stable` most of us already have. Local tracks stable; releases are pinned.
+  #
+  # Bumping is deliberate: change it here and in the sibling desktop workflow,
+  # then expect new lints from the newer compiler in the same PR. Dependabot
+  # does not manage this — there is no cargo-toolchain ecosystem.
+  RUST_TOOLCHAIN: "1.97.1"
+
+jobs:
+  check:
+    name: cargo check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The contract check diffs capabilities against the base branch, which a
+      # depth-1 checkout does not have. Shallow is enough: it only ever reads
+      # files at the tip.
+      - name: Fetch base branch
+        run: git fetch --depth=1 origin "${{ github.base_ref || 'main' }}"
+
+      # Seconds, and it catches what `cargo check` structurally cannot: a command
+      # that compiles fine but was never registered, so it is absent from the
+      # shipped binary. `invoke` then rejects it, the web app's probe swallows the
+      # rejection, and the shell silently behaves like an older build. One install
+      # shipped in exactly that state.
+      - name: Shell contract
+        run: python3 .github/scripts/check-shell-contract.py "origin/${{ github.base_ref || 'main' }}"
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned by RUST_TOOLCHAIN
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: desktop/src-tauri
+          # The first green run is what populates this cache, and a red one
+          # still paid the full dependency compile. Keeping it means a failure
+          # costs one contributor thirteen minutes rather than every one after.
+          cache-on-failure: true
+
+      # The same set desktop-release.yml installs, and for the same reasons:
+      # libwebkit2gtk-4.1 is Tauri v2's webview and libsoup-3.0 rides with it,
+      # libdbus-1 is what the `keyring` crate's secret-service backend links
+      # against. `patchelf` and `librsvg2` are bundling-time tools, so they are
+      # not here.
+      - name: Install Tauri system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libdbus-1-dev \
+            libayatana-appindicator3-dev
+
+      # This job used to stub backend/dist/duct-sidecar before checking, because
+      # tauri-build validates every `bundle.resources` path from inside build.rs
+      # and the crate would not type-check without it — `cargo check` panicked
+      # with "resource path doesn't exist" before reading a line of our Rust.
+      # The default config declares no resources any more, so there is nothing
+      # to stub. If a `bundle.resources` entry ever comes back to
+      # tauri.conf.json, this job breaks in that confusing way again and the
+      # stub is the fix.
+      - name: cargo check
+        working-directory: desktop/src-tauri
+        run: cargo check --locked --all-targets
+
+      # Release builds compile the crash reporter in; nothing else does. Without
+      # this the code that runs on every distributed install is first compiled
+      # by the release workflow, after the merge.
+      - name: cargo check (crash-reporting)
+        working-directory: desktop/src-tauri
+        run: cargo check --lib --locked --features crash-reporting
+
+      - name: cargo test
+        working-directory: desktop/src-tauri
+        run: cargo test --lib --locked

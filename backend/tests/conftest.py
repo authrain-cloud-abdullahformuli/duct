@@ -1,0 +1,271 @@
+"""Shared pytest fixtures for backend agent tests.
+
+``tests`` is a package (see tests/__init__.py) so the evaluation harness in
+``tests.eval`` and the helpers here import cleanly from individual test modules.
+"""
+
+import os
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
+from sqlmodel import SQLModel
+
+from agents.audit.schema import AuditBusinessContext
+
+
+def make_sqlite_engine(*, drop_partial_indexes: bool = False, path=None):
+    """An in-memory SQLite engine with every registered SQLModel table created.
+
+    Eleven test modules were each hand-rolling this same four-line incantation.
+    The two non-obvious parts are worth stating once:
+
+    ``StaticPool`` + ``check_same_thread=False`` share ONE connection across
+    threads. ``TestClient`` runs sync handlers on a worker thread, and without
+    this each thread would open its own empty ``:memory:`` database.
+
+    ``drop_partial_indexes`` handles the Postgres-only partial indexes. SQLAlchemy
+    drops the ``postgresql_where`` clause on other dialects, which turns "one
+    owner per project" and "one pending invite per address" into *unconditional*
+    UNIQUE constraints that reject legitimate rows. Dropping them lets these
+    tests exercise the application logic; Postgres keeps them as the real
+    backstop, and the migration is what enforces them in production.
+
+    ``path`` trades the shared connection for a file, so each thread gets its
+    own. A test that runs two sessions *at the same time* needs that: two
+    threads interleaving on one ``sqlite3`` connection read each other's rows
+    half-finished, which surfaced in CI as ``Invalid isoformat string: ''``
+    from the memory consolidation race test.
+    """
+    if path is not None:
+        engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
+    else:
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+    SQLModel.metadata.create_all(engine)
+    if drop_partial_indexes:
+        with engine.begin() as conn:
+            for index in (
+                "uq_project_members_single_owner",
+                "uq_project_invitations_pending_email",
+                "uq_agent_conv_active_artifact",
+            ):
+                conn.exec_driver_sql(f"DROP INDEX IF EXISTS {index}")
+    return engine
+
+
+# Everything desktop/local mode reads or writes. Snapshotted whole by
+# `clean_env`, so any of it a test writes is undone afterwards.
+_LOCAL_MODE_ENV_VARS = (
+    "DUCT_LOCAL", "DUCT_DESKTOP", "DUCT_DATA_DIR", "DUCT_API_KEY", "DUCT_ENV_FILE",
+    "API_PUBLIC_URL", "FRONTEND_ORIGIN", "APP_ENV", "POSTHOG_API_KEY",
+    "DATABASE_URL", "UPLOADS_DIR", "INIT_DB_ON_STARTUP",
+    # The shell's keychain copies, and the signing key bootstrap() writes from
+    # them. JWT_SECRET was missing here while `bootstrap()` has always written
+    # it straight to os.environ, so one desktop test leaked a signing key into
+    # every test that ran after it.
+    "JWT_SECRET", "DUCT_LOCAL_API_KEY", "DUCT_LOCAL_JWT_SECRET",
+    # Settings bootstrap() places in the environment from the shell's stdin
+    # line, so a desktop test's Fernet key cannot become the next test's.
+    "CREDENTIALS_ENCRYPTION_KEY", "GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET",
+)
+
+
+@pytest.fixture
+def clean_env(monkeypatch):
+    """Isolate the env vars desktop/local mode reads and writes.
+
+    Clearing the environment is not enough: Configs also reads backend/.env and
+    .env.local, deliberately, so integration tests can share the running
+    server's keys (see config._settings_env_files). A developer with a real
+    DATABASE_URL there would otherwise see these tests try to reach Railway —
+    and the failure message would print the credential.
+
+    The restore is done by hand rather than left to monkeypatch, because
+    `delenv(..., raising=False)` records *nothing* for a variable that was
+    already absent — so anything the code under test then writes straight to
+    `os.environ` survives the test. `local_server.bootstrap()` sets DUCT_LOCAL
+    exactly that way, and a stray `DUCT_LOCAL=1` silently flips every
+    desktop-shaped branch on for the rest of the session.
+    """
+    from config import Configs, get_configs
+
+    saved = {var: os.environ.get(var) for var in _LOCAL_MODE_ENV_VARS}
+    for var in _LOCAL_MODE_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setitem(Configs.model_config, "env_file", None)
+
+    yield monkeypatch
+
+    for var, value in saved.items():
+        if value is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = value
+    # Configs is lru_cached: a config built from the environment above would
+    # outlive this test however carefully the environment itself is restored.
+    get_configs.cache_clear()
+
+
+@pytest.fixture
+def acme_business_context():
+    return AuditBusinessContext(
+        business_name="Acme CRM",
+        business_goals="Improve organic search visibility and drive signups.",
+    )
+
+
+@pytest.fixture
+def maxaura_business_context():
+    return AuditBusinessContext(
+        business_name="MaxAura",
+        business_description="AI-powered grooming and self-improvement tools for men",
+        business_goals="Rank for looksmaxxing, grooming, and self-improvement keywords",
+        target_keywords=["looksmaxxing", "grooming tips for men", "face care routine", "jawline exercises"],
+        competitors=["rmrs.com", "artofmanliness.com", "tiege.com"],
+        audience_segment="men aged 18–35 interested in self-improvement and aesthetics",
+        industry="health & beauty / men's grooming",
+    )
+
+
+@pytest.fixture
+def duct_business_context():
+    return AuditBusinessContext(
+        business_name="Duct",
+        business_description="AI-powered SEO audit and organic growth intelligence for marketers",
+        business_goals="Rank for SEO audit, AIO, and organic growth keywords",
+        target_keywords=["SEO audit tool", "AI SEO", "organic growth platform"],
+        competitors=["semrush.com", "ahrefs.com", "searchatlas.com"],
+        industry="SaaS / marketing technology",
+    )
+
+
+@pytest.fixture
+def emitted():
+    """An emit callback that records what reached the stream.
+
+    The callback is what a runner takes; ``emitted.events`` is the list it
+    filled. Three agent suites declared this same fixture before it moved here.
+    """
+    events: list[dict] = []
+
+    async def emit(event: dict) -> None:
+        events.append(event)
+
+    emit.events = events  # type: ignore[attr-defined]
+    return emit
+
+
+# ---------------------------------------------------------------------------
+# The offline suite stays offline
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def no_network(request, monkeypatch):
+    """Fail any un-``live`` test that opens a socket at all.
+
+    The whole suite already ran clean under this — it is not repairing a leak,
+    it is keeping one from arriving. This repository is public and takes
+    drive-by contributions, so the alternative to a hard rule is that some
+    future test quietly depends on a key the author happened to have exported.
+    That test passes for them, fails for everyone else, and the failure reads as
+    "the API is down" rather than "this test was never hermetic". Worse, an
+    agent handed a key would keep it green and never notice.
+
+    Every vendor path bottoms out here: httpx, requests, aiohttp, grpc and
+    google-auth all reach the network through ``socket.connect``. So a test that
+    forgets to fake its transport fails on the seam it forgot, naming it.
+
+    Loopback is blocked too, and that is the whole point rather than an
+    oversight. An agent sandbox or a corporate CI runner exports ``HTTPS_PROXY=
+    http://localhost:<port>``, which makes every call to a vendor arrive at the
+    socket layer as a connection to 127.0.0.1 — a guard that waves loopback
+    through waves everything through, and does it silently, in exactly the
+    environments most likely to be holding a key. Nothing in the suite needs a
+    socket of any kind; if something ever does, it wants a fixture that says so
+    out loud, not a hole punched here.
+
+    ``live`` tests are exempt — reaching the real API is their entire job.
+    """
+    if request.node.get_closest_marker("live"):
+        yield
+        return
+
+    import socket
+
+    def guard(sock, address, *args, **kwargs):
+        raise RuntimeError(
+            f"{request.node.nodeid} tried to open a socket to {address!r}. Offline "
+            "tests must fake their transport — patch the vendor's `api()` wrapper, "
+            "or use the fakes in tests/fakes.py. If this test genuinely needs the "
+            "real API, mark it @pytest.mark.live."
+        )
+
+    monkeypatch.setattr(socket.socket, "connect", guard)
+    monkeypatch.setattr(socket.socket, "connect_ex", guard)
+    yield
+
+
+# ---------------------------------------------------------------------------
+# Vendor keys come from the test, never the developer's env file
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def no_operator_vendor_keys(request, monkeypatch):
+    """Blank the instance's own Apify, PostBridge and Zernio keys offline.
+
+    Configs reads backend/.env.local on purpose (see ``clean_env``), and local
+    dev is where ``VendorKey.server()`` spends the instance's key, so a real
+    POSTBRIDGE_API_KEY or ZERNIO_API_KEY there connected a scheduler in every
+    test. The publishing tests that assert nothing is connected, or that an
+    account belongs to one scheduler, failed in a developer's checkout and
+    passed in CI. An empty variable outranks the env file, and a test's own
+    ``Configs(postbridge_api_key=...)`` outranks both.
+    """
+    if request.node.get_closest_marker("live"):
+        yield
+        return
+    from config import get_configs
+    from service.apify.client import APIFY_KEY
+    from service.post_bridge.client import POSTBRIDGE_KEY
+    from service.zernio.client import ZERNIO_KEY
+
+    for key in (APIFY_KEY, POSTBRIDGE_KEY, ZERNIO_KEY):
+        monkeypatch.setenv(key.setting.upper(), "")
+    get_configs.cache_clear()
+    yield
+    get_configs.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Rate limits start every test with an empty window
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def fresh_rate_limits(monkeypatch):
+    """A new window for every module-level ``RateLimit`` in ``routes`` and ``service``.
+
+    Each limiter is process state keyed on an address or a user, and a
+    TestClient is always the same address. Without this, the suite's total
+    traffic through a route is what trips its limit, so a test fails for what
+    its neighbours did and a new test elsewhere turns an old one red. The
+    thresholds stay the production ones; only the counts are reset. A test
+    that wants a limit it can reach swaps in its own, after this has run.
+    """
+    import sys
+
+    from service.ratelimit import RateLimit
+
+    for name, module in list(sys.modules.items()):
+        # service.* too: a limit on one MCP tool lives beside the tool.
+        if not name.startswith(("routes.", "service.")) or module is None:
+            continue
+        for attr, value in list(vars(module).items()):
+            if isinstance(value, RateLimit):
+                monkeypatch.setattr(module, attr, RateLimit(value.limit, value.window_seconds))

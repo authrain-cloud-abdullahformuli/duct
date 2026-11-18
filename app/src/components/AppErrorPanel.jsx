@@ -1,0 +1,159 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { Trans, useLingui } from "@lingui/react/macro";
+
+import MosaicPanel, { MOSAIC } from "./MosaicPanel";
+
+function buildIncidentId(error) {
+  if (error?.digest) return `digest:${error.digest}`;
+  return `client:${Date.now().toString(36)}`;
+}
+
+export default function AppErrorPanel({ error, reset, showHtmlShell = false }) {
+  const { t } = useLingui();
+  const [copyState, setCopyState] = useState("idle");
+  const occurredAt = useMemo(() => new Date().toISOString(), []);
+  const incidentId = useMemo(() => buildIncidentId(error), [error]);
+  const route =
+    typeof window !== "undefined"
+      ? `${window.location.pathname}${window.location.search}`
+      : "unknown";
+
+  useEffect(() => {
+    // Keep full stack/details in console for developer triage.
+    // UI remains sanitized for production users.
+    console.error("Duct app error boundary", {
+      incidentId,
+      occurredAt,
+      route,
+      digest: error?.digest ?? null,
+      message: error?.message ?? "Unknown error",
+      error,
+    });
+  }, [error, incidentId, occurredAt, route]);
+
+  const handleCopyDebugInfo = async () => {
+    const userAgentData =
+      typeof navigator !== "undefined" && navigator.userAgentData
+        ? {
+            brands: navigator.userAgentData.brands ?? [],
+            mobile: navigator.userAgentData.mobile ?? null,
+            platform: navigator.userAgentData.platform ?? "unknown",
+          }
+        : null;
+    const debugPayload = {
+      incidentId,
+      occurredAt,
+      route,
+      digest: error?.digest ?? null,
+      errorMessage: error?.message ?? "Unknown error",
+      page: typeof window !== "undefined" ? window.location.href : "unknown",
+      referrer: typeof document !== "undefined" ? document.referrer || "none" : "unknown",
+      timezone:
+        typeof Intl !== "undefined"
+          ? Intl.DateTimeFormat().resolvedOptions().timeZone
+          : "unknown",
+      browser: {
+        userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "unknown",
+        language: typeof navigator !== "undefined" ? navigator.language : "unknown",
+        platform: typeof navigator !== "undefined" ? navigator.platform : "unknown",
+        userAgentData,
+      },
+      screen:
+        typeof window !== "undefined"
+          ? {
+              viewport: `${window.innerWidth}x${window.innerHeight}`,
+              screen: `${window.screen.width}x${window.screen.height}`,
+              pixelRatio: window.devicePixelRatio,
+            }
+          : null,
+      session: (() => {
+        if (typeof window === "undefined") return null;
+        const key = "duct_debug_session_id";
+        const existing = window.sessionStorage.getItem(key);
+        if (existing) return { id: existing };
+        const created = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+        window.sessionStorage.setItem(key, created);
+        return { id: created };
+      })(),
+    };
+
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(debugPayload, null, 2));
+      setCopyState("copied");
+      window.setTimeout(() => setCopyState("idle"), 1800);
+    } catch {
+      setCopyState("failed");
+      window.setTimeout(() => setCopyState("idle"), 2500);
+    }
+  };
+
+  const digest = error?.digest ?? t`Unavailable`;
+  const panel = (
+    <main id="main-content" className="app-main" tabIndex={-1}>
+      <section className="connection-card" style={{ maxWidth: 760, margin: "48px auto" }}>
+        {/* An aqueduct with one arch gone: the water arrives and stops at the
+            gap. The break is the only orange in the panel, so the eye lands on
+            the failure before it reads a word of the copy. */}
+        <MosaicPanel name={MOSAIC.fractum} className="mb-6" />
+        <h1 className="text-2xl font-semibold tracking-tight" style={{ marginBottom: 10 }}>
+          <Trans>This page stopped working</Trans>
+        </h1>
+        <p className="app-subtle" style={{ fontSize: 14, lineHeight: 1.55 }}>
+          <Trans>It’s logged on our side. Copy the details below if you report it.</Trans>
+        </p>
+
+        {/* The values are the diagnostics; only the labels are translated. The
+            "Copy debug info" payload below keeps its English keys, since that
+            is what lands in a bug report. */}
+        <div className="generate-alert-detail" style={{ marginTop: 16 }}>
+          <Trans><strong>Incident ID:</strong> {incidentId}</Trans>
+          {"\n"}
+          <Trans><strong>When:</strong> {occurredAt}</Trans>
+          {"\n"}
+          <Trans><strong>Route:</strong> {route}</Trans>
+          {"\n"}
+          <Trans><strong>Digest:</strong> {digest}</Trans>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2.5">
+          <button
+            type="button"
+            className="inline-flex items-center gap-2 rounded-4xl bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/80"
+            onClick={reset}
+          >
+            <Trans>Try again</Trans>
+          </button>
+          <button
+            type="button"
+            className="inline-flex items-center gap-2 rounded-4xl border border-border bg-background px-4 py-2.5 text-sm font-medium transition-colors hover:bg-muted"
+            onClick={handleCopyDebugInfo}
+          >
+            {copyState === "copied"
+              ? t`Copied debug info`
+              : copyState === "failed"
+                ? t`Copy failed`
+                : t`Copy debug info`}
+          </button>
+          <Link
+            href="/"
+            className="inline-flex items-center gap-2 rounded-4xl border border-border bg-background px-4 py-2.5 text-sm font-medium transition-colors hover:bg-muted"
+          >
+            <Trans>Go to home</Trans>
+          </Link>
+        </div>
+      </section>
+    </main>
+  );
+
+  if (!showHtmlShell) return panel;
+  return (
+    <html lang="en">
+      <body className="min-h-dvh bg-background font-sans text-foreground antialiased">
+        {panel}
+      </body>
+    </html>
+  );
+}

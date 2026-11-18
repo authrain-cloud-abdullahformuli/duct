@@ -1,0 +1,891 @@
+"""Fake chat models that drive the real V1 agent loop — no API key, no network.
+
+Four test modules each carried their own copy of ``ToolCallingFake``, and two
+of them the failing variants beside it. One copy here, so a change to how the
+loop is faked (a new failure shape, a provider's new stop marker) lands once.
+
+The property that matters, and the one the stock LangChain fakes lack: they
+raise ``NotImplementedError`` on ``bind_tools``, which every agent factory
+calls. These accept it and ignore the schema, so a canned response can carry
+``tool_calls`` and the harness runs the real tool.
+
+``FakeMessagesListChatModel`` *cycles* its responses rather than exhausting
+them: a two-turn test needs two entries, and a turn that must fail needs
+``RaisingFake`` or ``FlakyFake`` rather than an empty list.
+"""
+
+from __future__ import annotations
+
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage
+
+
+class ToolCallingFake(FakeMessagesListChatModel):
+    """A fake that accepts ``bind_tools``, so it can drive a real agent loop."""
+
+    def bind_tools(self, tools, **kwargs):  # noqa: ARG002 - the fake ignores the schema
+        return self
+
+
+class RaisingFake(ToolCallingFake):
+    """Answers the first call, then fails — the "one bad turn" case."""
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        if getattr(self, "_used", False):
+            raise RuntimeError("provider blew up")
+        self._used = True
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+class RateLimitError(Exception):
+    """Named like the provider SDK's, which is how the classifier knows it."""
+
+
+class AuthenticationError(Exception):
+    """Ditto — a rejected key, which must not be retried."""
+
+
+class FlakyFake(ToolCallingFake):
+    """Fails ``failures`` times with ``exc``, then answers — a provider having a moment."""
+
+    failures: int = 2
+    exc: type[Exception] = RateLimitError
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        calls = getattr(self, "_calls", 0)
+        self._calls = calls + 1
+        if calls < self.failures:
+            raise self.exc("429 rate limited")
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+class RecordingFake(ToolCallingFake):
+    """Records what every model call was sent: its messages and the tools bound.
+
+    What reaches the provider is the prompt cache's key, and a fake is the one
+    place a test can see it whole. ``tests/test_request_invariants.py`` reads
+    ``requests`` to hold the cached prefix byte-stable and the history
+    append-only, which is how Anthropic's April 2026 quality drop would have
+    been caught for free: the harness cleared older reasoning every turn.
+    """
+
+    def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+
+        self.__dict__["_bound"] = [convert_to_openai_tool(t) for t in tools]
+        return self
+
+    @property
+    def requests(self) -> list[dict]:
+        return self.__dict__.setdefault("_requests", [])
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.requests.append({"messages": list(messages), "tools": list(self.__dict__.get("_bound", []))})
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+def fake_llm(*responses: str, cls: type[ToolCallingFake] = ToolCallingFake) -> ToolCallingFake:
+    """A fake that replies with ``responses`` in order, one per model call."""
+    return cls(responses=[AIMessage(content=r) for r in responses])
+
+
+def tool_names(agent) -> set[str]:
+    """Tool names bound into a compiled agent graph.
+
+    Walks the graph rather than asking the runner, so a tool the runner
+    *believes* it mounted but the harness dropped shows up as absent.
+    """
+    for node in agent.nodes.values():
+        seq = getattr(getattr(node, "bound", None), "steps", None) or []
+        for step in seq:
+            if hasattr(step, "tools_by_name"):
+                return set(step.tools_by_name)
+    # Fall back to the ToolNode's registry wherever it lives.
+    tool_node = agent.nodes.get("tools")
+    inner = getattr(tool_node, "bound", tool_node)
+    return set(getattr(inner, "tools_by_name", {}))
+
+
+class ContextOverflowError(Exception):
+    """The provider's "prompt is too long" — LangChain's name for it, which is
+    how the classifier knows it."""
+
+
+def responses_stream_error(code: str | None, message: str = "", *, event: str = "response.failed") -> ValueError:
+    """The ValueError langchain-openai (1.6.6 on) raises when a Responses
+    stream reports a failure, built from the SDK's own event types the way
+    ``_convert_responses_chunk_to_generation_chunk`` builds it
+    (langchain-ai/langchain#40791). The SDK parses stream events without
+    validation, so a code outside its ``Literal`` — the Codex backend sends
+    several — arrives as-is; ``model_construct`` keeps that true here."""
+    from openai.types.responses import ResponseErrorEvent
+    from openai.types.responses.response_error import ResponseError
+
+    if event == "error":
+        chunk = ResponseErrorEvent.model_construct(
+            type="error", code=code, message=message, param=None, sequence_number=1
+        )
+        return ValueError(f"{chunk.code}: {chunk.message}" if chunk.code else chunk.message)
+    error = ResponseError.model_construct(code=code, message=message) if code else None
+    return ValueError(str(error or "Response resp_123 failed."))
+
+
+class OverflowFake(ToolCallingFake):
+    """Rejects the request as too long `overflows` times, the way a provider
+    does when the summariser's estimate ran behind the real count; answers
+    otherwise — including the summary an emergency compaction asks it for.
+    Set `_overflowed = -1` to let one turn through before the overflows start."""
+
+    overflows: int = 1
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        # The summary request carries the summariser's own prompt; it has to
+        # succeed or no compaction can happen.
+        is_summary = any("extract" in str(getattr(m, "content", "")).lower() for m in messages)
+        if not is_summary and getattr(self, "_overflowed", 0) < self.overflows:
+            self._overflowed = getattr(self, "_overflowed", 0) + 1
+            if self._overflowed > 0:
+                raise ContextOverflowError("prompt is too long: 213000 tokens > 200000 maximum")
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Google Ads — the real protos, with the transport taken out
+# ---------------------------------------------------------------------------
+#
+# The eight Google Ads executors mutate a customer's live ad account, and until
+# this fake existed none of their apply or rollback paths had ever run: building
+# a `GoogleAdsClient` performs an OAuth refresh against Google *at construction
+# time* (`load_from_dict` → `oauth2.get_credentials` → `credentials.refresh`), so
+# there was no offline way in.
+#
+# The temptation is a stub client made of attribute bags. That fake passes while
+# the field is misspelled, the enum is not a member, and the update mask names a
+# path the API would reject — which is the entire class of bug worth catching
+# here. So this keeps everything the library computes locally (`get_type`,
+# `enums`, `copy_from`, and the GAPIC path helpers, all pure) and replaces only
+# the part that talks: `get_service`. A test that names a field wrong fails on
+# the proto, the way production would fail on the wire.
+
+from types import SimpleNamespace  # noqa: E402
+from typing import Any, NamedTuple  # noqa: E402
+
+
+class RecordedQuery(NamedTuple):
+    customer_id: str
+    query: str
+
+
+class RecordedMutation(NamedTuple):
+    """One mutate_* call an executor made, as the API would have received it."""
+
+    method: str
+    customer_id: str
+    operations: list[Any]
+
+
+class _MutateResult:
+    def __init__(self, resource_name: str) -> None:
+        self.resource_name = resource_name
+
+
+class _MutateResponse:
+    """Only ``.results[i].resource_name`` is ever read, so only that is built.
+
+    The real response protos would add fidelity nowhere — no executor branches
+    on anything else in them, and mapping eight methods to eight response types
+    would be ceremony that tests nothing.
+    """
+
+    def __init__(self, resource_names: list[str]) -> None:
+        self.results = [_MutateResult(name) for name in resource_names]
+
+
+class FakeAdsService:
+    """A Google Ads ``*Service`` whose mutations are recorded, not sent.
+
+    Path helpers (``campaign_path`` and friends) delegate to the real generated
+    client: they are static string formatting, and a hand-written copy is one
+    more thing to drift from ``customers/{cid}/adGroupCriteria/{ag}~{crit}``.
+    """
+
+    def __init__(self, name: str, client: "FakeAdsClient") -> None:
+        self._name = name
+        self._client = client
+
+    def __getattr__(self, attr: str):
+        if attr.startswith("mutate_"):
+            return lambda customer_id, operations, **kw: self._client._mutate(
+                self._name, attr, customer_id, list(operations)
+            )
+        if attr == "search_stream":
+            return lambda customer_id, query, **kw: self._client._search_stream(
+                str(customer_id), query
+            )
+        if attr.endswith("_path"):
+            return getattr(_real_ads_service_class(self._name), attr)
+        raise AttributeError(f"{self._name} has no attribute {attr!r} (add it to FakeAdsService)")
+
+
+def _real_ads_service_class(name: str):
+    """``CampaignService`` → the generated ``CampaignServiceClient`` class."""
+    import importlib
+    import re
+
+    from google.ads.googleads.client import _DEFAULT_VERSION
+
+    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+    module = importlib.import_module(
+        f"google.ads.googleads.{_DEFAULT_VERSION}.services.services.{snake}"
+    )
+    return getattr(module, f"{name}Client")
+
+
+class FakeAdsClient:
+    """Stands in for ``GoogleAdsClient`` in an executor, minus the network.
+
+    ``rows`` is what the next query should return — set it directly, or pass
+    ``query_rows`` per test. Executors reach rows through a patched
+    ``_run_query``; the read fetchers call ``GoogleAdsService.search_stream``
+    themselves, so the fake answers that too, one batch of ``rows``, and logs
+    the GAQL it was handed in ``queries``. ``mutations`` is what the executor
+    sent, in order, for a test to assert on. ``fail_with`` makes the next
+    mutate raise, which is how the "upstream rejected it" branch gets exercised.
+    """
+
+    def __init__(
+        self,
+        rows: list[Any] | None = None,
+        *,
+        resource_names: list[str] | None = None,
+        fail_with: Exception | None = None,
+    ) -> None:
+        from google.ads.googleads.client import _EnumGetter
+
+        self.version = None
+        self.use_proto_plus = True
+        self.enums = _EnumGetter(self)
+        self.rows = list(rows or [])
+        self.queries: list[RecordedQuery] = []
+        self.mutations: list[RecordedMutation] = []
+        self.fail_with = fail_with
+        self._resource_names = resource_names
+
+    # The three the library computes locally — reused, not reimplemented.
+    from google.ads.googleads.client import GoogleAdsClient as _Real
+
+    _get_api_services_by_version = _Real._get_api_services_by_version
+    get_type = _Real.get_type
+    copy_from = staticmethod(_Real.copy_from)
+    del _Real
+
+    def get_service(self, name: str, **kwargs) -> FakeAdsService:
+        return FakeAdsService(name, self)
+
+    def _search_stream(self, customer_id: str, query: str) -> list[Any]:
+        self.queries.append(RecordedQuery(customer_id, query))
+        return [SimpleNamespace(results=list(self.rows))]
+
+    def _mutate(self, service: str, method: str, customer_id: str, operations: list) -> _MutateResponse:
+        self.mutations.append(RecordedMutation(method, str(customer_id), operations))
+        if self.fail_with is not None:
+            raise self.fail_with
+        names = self._resource_names
+        if names is None:
+            names = [f"customers/{customer_id}/{service}/{i}" for i in range(len(operations) or 1)]
+        return _MutateResponse(names)
+
+    def row(self, **fields: Any):
+        """A ``GoogleAdsRow`` from dotted paths: ``row(**{"campaign.id": 5})``.
+
+        Enum fields accept their name as a string — proto-plus resolves it — so
+        a test reads as the API docs do, and a name that is not a member raises
+        here rather than passing silently.
+        """
+        row = self.get_type("GoogleAdsRow")
+        for path, value in fields.items():
+            target = row
+            *parents, leaf = path.split(".")
+            for part in parents:
+                target = getattr(target, part)
+            setattr(target, leaf, value)
+        return row
+
+
+# ---------------------------------------------------------------------------
+# Google Discovery APIs (GA4 Admin, and anything else built by `discovery.build`)
+# ---------------------------------------------------------------------------
+#
+# `googleapiclient.discovery.build()` fetches the API's discovery document over
+# the network before it returns a client, so an executor built on one cannot be
+# reached offline at all — the same wall `FakeAdsClient` exists to get past.
+#
+# The shape it fakes is the fluent chain: `service.properties().keyEvents()
+# .list(parent=...).execute()`. Collections are the links with no arguments;
+# the named verbs below are the terminals that carry kwargs and return a
+# request. Responses are keyed by the dotted path so a test declares what the
+# API answers rather than assembling a nest of stub classes.
+#
+# The GTM fake in `test_execution_policy.py` is deliberately *not* replaced by
+# this: it keeps container state (tags by name, incrementing version ids) so it
+# can answer a read that follows a write. This one records calls and replays
+# canned answers, which is all the GA4 executors need. Two different jobs.
+
+_DISCOVERY_TERMINALS = frozenset(
+    {"list", "get", "create", "delete", "patch", "update", "batchGet", "archive"}
+)
+
+
+class _DiscoveryRequest:
+    def __init__(self, service: "FakeDiscoveryService", path: str, kwargs: dict):
+        self._service = service
+        self._path = path
+        self._kwargs = kwargs
+
+    def execute(self, **_):
+        self._service.calls.append((self._path, self._kwargs))
+        answer = self._service.responses.get(self._path, {})
+        if isinstance(answer, Exception):
+            raise answer
+        if callable(answer):
+            return answer(**self._kwargs)
+        return answer
+
+
+class FakeDiscoveryService:
+    """Stands in for a `discovery.build()` client.
+
+    ``responses`` maps a dotted call path — ``"properties.keyEvents.list"`` — to
+    the body ``execute()`` should return, an ``Exception`` it should raise, or a
+    callable taking the request kwargs. ``calls`` is every ``execute()`` that
+    happened, in order, as ``(path, kwargs)``.
+    """
+
+    def __init__(self, responses: dict[str, Any] | None = None, _path: str = "") -> None:
+        self.responses = dict(responses or {})
+        self.calls: list[tuple[str, dict]] = []
+        self._path = _path
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        path = f"{self._path}.{name}" if self._path else name
+
+        def call(**kwargs):
+            if name in _DISCOVERY_TERMINALS:
+                return _DiscoveryRequest(self, path, kwargs)
+            if kwargs:
+                raise AssertionError(
+                    f"{path}() took arguments but is not a known terminal verb; "
+                    f"add it to _DISCOVERY_TERMINALS if the API has one."
+                )
+            child = FakeDiscoveryService(_path=path)
+            # The root owns the script and the log, so a chain any depth down
+            # reads the same responses and appends to the same call list.
+            child.responses = self.responses
+            child.calls = self.calls
+            return child
+
+        return call
+
+
+# ---------------------------------------------------------------------------
+# The wire itself: one fake per transport, beneath the vendor's request code
+# ---------------------------------------------------------------------------
+#
+# `FakeAdsClient` and `FakeDiscoveryService` stand in for a *client*, which is
+# the right seam for an executor: what matters there is the mutation it sends.
+# A fetcher is different — the bug that broke GA4 landing pages for six weeks
+# (`StringFilter` imported from the wrong module) lived in the code that BUILDS
+# the request, which a client-level fake never runs. These two sit one layer
+# down, at the transport, so the real library builds the request and a test
+# reads what would have gone over the wire.
+
+
+class RecordedHttp(NamedTuple):
+    method: str
+    uri: str
+    body: str | None
+    headers: dict
+
+
+class RecordingHttp:
+    """An ``httplib2.Http`` for ``googleapiclient.discovery.build(http=...)``.
+
+    With ``static_discovery=True`` the library builds the service from the
+    discovery document it ships, so method names and parameters are validated
+    against the real API surface offline; only ``execute()`` lands here.
+    ``answers`` maps a substring of the request URI to the JSON body to return;
+    ``calls`` is every request, in order.
+
+    Install it through :func:`discovery_build_offline` rather than by hand, so
+    the credential argument the code under test passes is dropped the same way
+    every time.
+    """
+
+    def __init__(self, answers: dict[str, Any] | None = None) -> None:
+        self.answers = dict(answers or {})
+        self.calls: list[RecordedHttp] = []
+
+    def request(self, uri: str, method: str = "GET", body: str | None = None, headers=None, **_):
+        import json
+
+        import httplib2
+
+        self.calls.append(RecordedHttp(method, uri, body, dict(headers or {})))
+        for needle, answer in self.answers.items():
+            if needle in uri:
+                break
+        else:
+            raise AssertionError(f"no canned answer for {method} {uri} (add one to RecordingHttp.answers)")
+        response = httplib2.Response({"status": 200, "content-type": "application/json"})
+        return response, json.dumps(answer).encode()
+
+
+def discovery_build_offline(monkeypatch, http: RecordingHttp) -> None:
+    """Route every ``discovery.build(...)`` in the test at ``http``.
+
+    Patched on the module, which is where the connectors import ``build`` from
+    at call time. The real ``build`` still runs — it just gets the recorder
+    instead of an authorised transport, and the shipped discovery document
+    instead of a fetched one.
+    """
+    import googleapiclient.discovery as discovery
+
+    real_build = discovery.build
+
+    def build(service_name, version, **kwargs):
+        kwargs.pop("credentials", None)
+        kwargs.pop("http", None)
+        kwargs["static_discovery"] = True
+        kwargs["cache_discovery"] = False
+        return real_build(service_name, version, http=http, **kwargs)
+
+    monkeypatch.setattr(discovery, "build", build)
+
+
+class RecordedWire(NamedTuple):
+    method: str
+    url: str
+    #: Query parameters as httpx would send them, decoded.
+    query: dict[str, str]
+    json: Any
+    data: Any
+    headers: dict[str, str]
+
+
+class FakeWire:
+    """Stands in for ``httpx.request`` beneath ``service.rest.Endpoint``.
+
+    Every REST connector (Meta, Apple, Stripe, RevenueCat, ...) funnels through
+    that one call, so this is the single seam that lets a pull run end to end
+    with the vendor's own encoding, headers, pagination and error handling all
+    real. ``on(method, needle, body)`` registers an answer for any URL that
+    contains ``needle``; first match wins, so register the specific path before
+    the general one. ``body`` may be a callable taking the recorded call.
+    ``calls`` is the log, and :meth:`sent` filters it.
+    """
+
+    def __init__(self) -> None:
+        self.routes: list[tuple[str, str, Any, int]] = []
+        self.calls: list[RecordedWire] = []
+
+    def on(self, method: str, needle: str, body: Any, status: int = 200) -> "FakeWire":
+        self.routes.append((method.upper(), needle, body, status))
+        return self
+
+    def install(self, monkeypatch) -> "FakeWire":
+        import httpx
+
+        monkeypatch.setattr(httpx, "request", self)
+        return self
+
+    def sent(self, method: str, needle: str) -> list[RecordedWire]:
+        return [c for c in self.calls if c.method == method.upper() and needle in c.url]
+
+    def __call__(self, method, url, params=None, json=None, data=None, headers=None, timeout=None, **_):
+        import httpx
+
+        request = httpx.Request(method, url, params=params)
+        call = RecordedWire(
+            method.upper(), str(request.url), dict(request.url.params), json, data, dict(headers or {})
+        )
+        self.calls.append(call)
+        for route_method, needle, body, status in self.routes:
+            if route_method == call.method and needle in call.url:
+                answer = body(call) if callable(body) else body
+                return httpx.Response(status, json=answer, request=request)
+        raise AssertionError(f"unexpected {call.method} {call.url} (register it with FakeWire.on)")
+
+
+# ---------------------------------------------------------------------------
+# MCP: a real server, in process
+# ---------------------------------------------------------------------------
+
+
+class FakeMcpServer:
+    """A real MCP server (the reference SDK's MCPServer) reached in process.
+
+    Faked at the seam ``service/mcp/http.py`` gives: ``guarded_client`` is
+    swapped for an httpx2 client whose transport is the server's own ASGI app,
+    so the real SDK client speaks real Streamable HTTP to a real server and no
+    socket opens. ``token`` makes the server refuse any other bearer with a
+    401, which is how a revoked or expired grant looks from the client.
+
+        server = FakeMcpServer()
+
+        @server.mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+        def volume(keyword: str) -> dict: ...
+
+        async with server.running(monkeypatch):
+            ...
+    """
+
+    def __init__(self, *, token: str | None = None) -> None:
+        from mcp.server import MCPServer
+
+        self.token = token
+        self.authorizations: list[str] = []
+        self.mcp = MCPServer("fake")
+
+    def _app(self):
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        inner = self.mcp.streamable_http_app(
+            stateless_http=True,
+            json_response=True,
+            # The test host is not a real one; the client's own guard is what
+            # is under test, not the server's.
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
+        fake = self
+
+        async def app(scope, receive, send):
+            if scope["type"] == "http":
+                headers = dict(scope.get("headers") or [])
+                auth = headers.get(b"authorization", b"").decode()
+                fake.authorizations.append(auth)
+                if fake.token is not None and auth != f"Bearer {fake.token}":
+                    await send({"type": "http.response.start", "status": 401, "headers": [
+                        (b"www-authenticate", b'Bearer error="invalid_token"'),
+                    ]})
+                    await send({"type": "http.response.body", "body": b""})
+                    return
+            await inner(scope, receive, send)
+
+        return app
+
+    def running(self, monkeypatch):
+        import contextlib
+
+        import httpx2
+
+        import service.mcp.http as mcp_http
+
+        app = self._app()
+        monkeypatch.setattr(
+            mcp_http,
+            "guarded_client",
+            lambda headers=None: httpx2.AsyncClient(
+                transport=httpx2.ASGITransport(app=app), headers=headers or {}, timeout=10
+            ),
+        )
+
+        @contextlib.asynccontextmanager
+        async def run():
+            async with self.mcp.session_manager.run():
+                yield self
+
+        return run()
+
+
+class FakeSMTP:
+    """Stands in for ``smtplib.SMTP`` and ``SMTP_SSL`` in the email seam's SMTP
+    provider: records the conversation instead of opening a socket.
+
+    ``sessions`` is shared by both classes ``install`` patches in, one entry per
+    connection, so a test reads which class was opened, on which port, and what
+    was said, in order. ``fail_with`` makes the first command raise, the way a
+    refused login or a dropped connection would.
+    """
+
+    def __init__(self, fail_with: Exception | None = None):
+        self.sessions: list[dict] = []
+        self.fail_with = fail_with
+
+    def install(self, monkeypatch, module) -> None:
+        fake = self
+
+        class _Client:
+            implicit_tls = False
+
+            def __init__(self, host, port, timeout=None, context=None):  # noqa: ARG002
+                self.session = {"host": host, "port": port, "tls": self.implicit_tls, "calls": []}
+                fake.sessions.append(self.session)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def _record(self, name, *args):
+                if fake.fail_with is not None:
+                    raise fake.fail_with
+                self.session["calls"].append((name, *args))
+
+            def starttls(self, context=None):  # noqa: ARG002
+                self._record("starttls")
+
+            def login(self, user, password):
+                self._record("login", user, password)
+
+            def send_message(self, message):
+                self._record("send_message", message)
+
+        class _ClientSSL(_Client):
+            implicit_tls = True
+
+        monkeypatch.setattr(module.smtplib, "SMTP", _Client)
+        monkeypatch.setattr(module.smtplib, "SMTP_SSL", _ClientSSL)
+
+
+# ---------------------------------------------------------------------------
+# PostBridge
+# ---------------------------------------------------------------------------
+#
+# Faked beneath the real ``PostBridgeClient``, at the httpx transport, so the
+# client's own request building, error parsing and response models run: a fake
+# client would have passed while ``scheduled_at`` went out without its zone.
+
+import json as _json  # noqa: E402
+
+import httpx  # noqa: E402
+
+
+def post_bridge_on(transport):
+    """A factory for the real ``PostBridgePublisher`` over the real client,
+    answering from ``transport``."""
+    from service.post_bridge import PostBridgeClient
+    from service.post_bridge.publisher import PostBridgePublisher
+
+    return lambda api_key: PostBridgePublisher(
+        api_key, client=PostBridgeClient(api_key, client=httpx.AsyncClient(transport=httpx.MockTransport(transport))),
+    )
+
+
+def connect_scheduler(monkeypatch, db, owner_id, make, *, publisher_id: str = "post_bridge") -> None:
+    """Connect a scheduler for ``owner_id`` the way a person does — a saved
+    key — and open ``make(api_key)`` wherever Duct opens that scheduler
+    (``service/publishers/registry.open_publisher``)."""
+    import service.credentials as credentials
+    import service.publishers.registry as registry
+    from cryptography.fernet import Fernet
+
+    if not credentials.get_configs().credentials_encryption_key:
+        cfg = credentials.get_configs().model_copy(update={"credentials_encryption_key": Fernet.generate_key().decode()})
+        monkeypatch.setattr(credentials, "get_configs", lambda: cfg)
+    registry.spec_for(publisher_id).key.save(owner_id, "sk-fake", db)
+    db.commit()
+    real = registry.open_publisher
+    monkeypatch.setattr(
+        registry, "open_publisher",
+        lambda pid, key: make(key) if pid == publisher_id else real(pid, key),
+    )
+
+
+class PostBridgeQueue:
+    """PostBridge's posts, media and post-results endpoints over dicts,
+    recording every request.
+
+    ``posts`` is the queue by id; ``results`` maps a post id to the post
+    results PostBridge would list for it; ``uploads`` holds what reached each
+    signed upload URL, in order. ``create_status`` is the status a new post
+    comes back with, and ``down`` makes every call a 503.
+    """
+
+    POST_ID = "pb_post_1"
+    UPLOAD_HOST = "uploads.postbridge.test"
+
+    def __init__(self) -> None:
+        self.posts: dict[str, dict] = {}
+        self.results: dict[str, list[dict]] = {}
+        self.uploads: list[dict] = []
+        self.requests: list[tuple[str, str, dict | None]] = []
+        self.create_status = "scheduled"
+        self.down = False
+
+    def __call__(self, req: httpx.Request) -> httpx.Response:
+        if req.url.host == self.UPLOAD_HOST:
+            upload = next(u for u in self.uploads if u["media_id"] == req.url.path.strip("/"))
+            upload["bytes"] = req.read()
+            upload["content_type"] = req.headers.get("content-type", "")
+            self.requests.append((req.method, "<upload>", None))
+            return httpx.Response(200)
+        body = _json.loads(req.read()) if req.content else None
+        self.requests.append((req.method, req.url.path, body))
+        if self.down:
+            return httpx.Response(503, json={"message": "maintenance"})
+        if req.method == "POST" and req.url.path == "/v1/media/create-upload-url":
+            media_id = f"m{len(self.uploads) + 1}"
+            self.uploads.append({"media_id": media_id, **body})
+            return httpx.Response(200, json={
+                "media_id": media_id, "name": body["name"],
+                "upload_url": f"https://{self.UPLOAD_HOST}/{media_id}",
+            })
+        if req.method == "POST" and req.url.path == "/v1/posts":
+            post = {"id": self.POST_ID, "caption": body["caption"], "status": self.create_status,
+                    "scheduled_at": body.get("scheduled_at"), "social_accounts": body["social_accounts"],
+                    "media": body.get("media")}
+            if self.create_status == "failed":
+                post["warnings"] = ["The X account needs reconnecting."]
+            self.posts[self.POST_ID] = post
+            return httpx.Response(200, json=post)
+        if req.method == "GET" and req.url.path == "/v1/post-results":
+            return httpx.Response(200, json={"data": self.results.get(req.url.params.get("post_id"), [])})
+        post_id = req.url.path.removeprefix("/v1/posts/")
+        post = self.posts.get(post_id)
+        if post is None:
+            return httpx.Response(404, json={"message": "Post not found"})
+        if req.method == "GET":
+            return httpx.Response(200, json=post)
+        if req.method == "PATCH":
+            post.update(body)
+            return httpx.Response(200, json=post)
+        if req.method == "DELETE":
+            if post["status"] not in ("scheduled", "draft"):
+                return httpx.Response(400, json={"message": "Can only delete scheduled or draft posts"})
+            del self.posts[post_id]
+            return httpx.Response(200, json={})
+        raise AssertionError(f"unexpected PostBridge call: {req.method} {req.url.path}")
+
+    def client(self, *_args):
+        from service.post_bridge import PostBridgeClient
+
+        return PostBridgeClient("sk-fake", client=httpx.AsyncClient(transport=httpx.MockTransport(self)))
+
+    def publisher(self, api_key: str = "sk-fake"):
+        return post_bridge_on(self)(api_key)
+
+    def calls(self) -> list[tuple[str, str]]:
+        return [(method, path) for method, path, _ in self.requests]
+
+    def created(self) -> dict:
+        """The body of the last create-post request."""
+        return next(body for method, path, body in reversed(self.requests)
+                    if (method, path) == ("POST", "/v1/posts"))
+
+
+# ---------------------------------------------------------------------------
+# Zernio
+# ---------------------------------------------------------------------------
+#
+# Same layer as the PostBridge fake: beneath the real ``ZernioClient``, so its
+# request building, error envelope and response models run.
+
+
+class ZernioQueue:
+    """Zernio's accounts, media, posts and analytics endpoints over dicts,
+    recording every request. ``accounts`` is what GET /accounts lists;
+    ``posts`` the posts by id; ``analytics`` a post id's single-post answer
+    (None answers 202, still syncing); ``timeline`` its daily rows."""
+
+    POST_ID = "zp_post_1"
+    UPLOAD_HOST = "uploads.zernio.test"
+    MEDIA_HOST = "media.zernio.test"
+
+    def __init__(self) -> None:
+        self.accounts: list[dict] = [
+            {"_id": "acc_li", "platform": "linkedin", "username": "kestrel", "displayName": "Kestrel Studio",
+             "profilePicture": "https://media.zernio.test/li.png", "isActive": True},
+            {"_id": "acc_x", "platform": "twitter", "username": "kestrelhq", "isActive": True,
+             "needsReconnection": True},
+        ]
+        self.posts: dict[str, dict] = {}
+        self.analytics: dict[str, dict | None] = {}
+        self.timeline: dict[str, list[dict]] = {}
+        self.uploads: list[dict] = []
+        self.requests: list[tuple[str, str, dict | None]] = []
+        self.create_status = "scheduled"
+
+    def __call__(self, req: httpx.Request) -> httpx.Response:
+        if req.url.host == self.UPLOAD_HOST:
+            self.uploads.append({"key": req.url.path, "bytes": req.read(), "content_type": req.headers.get("content-type")})
+            self.requests.append((req.method, "<upload>", None))
+            return httpx.Response(200)
+        body = _json.loads(req.read()) if req.content else None
+        path = req.url.path.removeprefix("/api/v1")
+        self.requests.append((req.method, path, body))
+        if req.method == "GET" and path == "/accounts":
+            return httpx.Response(200, json={"accounts": self.accounts, "hasAnalyticsAccess": True})
+        if req.method == "POST" and path == "/media/presign":
+            key = f"/{len(self.uploads) + 1}-{body['filename']}"
+            return httpx.Response(200, json={
+                "uploadUrl": f"https://{self.UPLOAD_HOST}{key}", "publicUrl": f"https://{self.MEDIA_HOST}{key}",
+                "key": key, "expiresIn": 3600,
+            })
+        if req.method == "POST" and path == "/posts":
+            post = {"_id": self.POST_ID, "content": body["content"], "status": self.create_status,
+                    "scheduledFor": body.get("scheduledFor"), "mediaItems": body.get("mediaItems", []),
+                    "platforms": [{**p, "status": "pending"} for p in body["platforms"]]}
+            if self.create_status == "failed":
+                for p in post["platforms"]:
+                    p.update(status="failed", errorMessage="The account needs reconnecting.")
+            self.posts[self.POST_ID] = post
+            return httpx.Response(201, json={"message": "ok", "post": post})
+        if req.method == "GET" and path == "/analytics":
+            post_id = req.url.params.get("postId")
+            if post_id is None:
+                return httpx.Response(200, json={"posts": [], "pagination": {"page": 1, "pages": 1}})
+            found = self.analytics.get(post_id)
+            if found is None:
+                return httpx.Response(202, json={"postId": post_id, "syncStatus": "pending"})
+            return httpx.Response(200, json=found)
+        if req.method == "GET" and path == "/analytics/post-timeline":
+            return httpx.Response(200, json={"timeline": self.timeline.get(req.url.params.get("postId"), [])})
+        post_id = path.removeprefix("/posts/")
+        post = self.posts.get(post_id)
+        if post is None:
+            return httpx.Response(404, json={"error": "Post not found", "type": "not_found", "code": "post_not_found"})
+        if req.method == "GET":
+            return httpx.Response(200, json={"post": post})
+        if req.method == "PUT":
+            post.update({k: v for k, v in body.items() if k in ("content", "scheduledFor")})
+            post["platforms"] = [{**p, "status": "pending"} for p in body.get("platforms", post["platforms"])]
+            return httpx.Response(200, json={"message": "ok", "post": post})
+        if req.method == "DELETE":
+            if post["status"] == "published":
+                return httpx.Response(400, json={"error": "Cannot delete published posts.", "type": "invalid_request_error"})
+            del self.posts[post_id]
+            return httpx.Response(200, json={"message": "deleted"})
+        raise AssertionError(f"unexpected Zernio call: {req.method} {path}")
+
+    def publisher(self, api_key: str = "sk-fake"):
+        from service.zernio.client import ZernioClient
+        from service.zernio.publisher import ZernioPublisher
+
+        return ZernioPublisher(api_key, client=ZernioClient(api_key, client=httpx.AsyncClient(transport=httpx.MockTransport(self))))
+
+    def created(self) -> dict:
+        (body,) = [b for m, p, b in self.requests if m == "POST" and p == "/posts"]
+        return body
+
+
+class Approver:
+    """A person at an approval card (``PauseFn``): answers as told and keeps
+    what each card showed, so a test can assert on what was asked. Like the
+    app, a yes sends back the card's fingerprint when it has one;
+    ``fingerprint`` overrides it, as an approval of an older card would."""
+
+    def __init__(self, approved: bool = True, *, fingerprint: str | None = None):
+        self.approved = approved
+        self.fingerprint = fingerprint
+        self.asked: list[tuple[str, dict]] = []
+
+    async def __call__(self, event: str, payload: dict, *, timeout: float | None = None) -> dict:
+        self.asked.append((str(event), payload))
+        answer: dict = {"approved": self.approved}
+        sent = self.fingerprint if self.fingerprint is not None else payload.get("fingerprint")
+        if self.approved and sent is not None:
+            answer["fingerprint"] = sent
+        return answer

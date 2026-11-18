@@ -1,0 +1,247 @@
+"""The evaluation judge — a single vision-capable Gemini call.
+
+``evaluate()`` renders a rubric + artifact (text and images) into one Gemini
+``generate_content`` request, asks for structured per-dimension scores and
+marker checks as JSON, validates the result against ``JudgeVerdict``, and
+returns a computed ``Scorecard``.
+
+We call google-genai directly rather than through an agent harness: the judge
+is one multimodal call that must see the images and
+return a typed verdict, which google-genai does natively. We use the
+structured-output API — ``response_schema=JudgeVerdict`` — so the model is
+constrained to the Pydantic shape and ``response.parsed`` comes back validated
+(see service/google/brief.py for the same response_schema pattern); a text-JSON
+fallback (``_parse_verdict``) covers the rare case ``parsed`` is empty.
+
+Vision is the point — and Gemini's native multimodality is the reason this lives
+on Gemini: image dimensions (composition, legibility at a glance, on-brand
+styling, prompt fidelity) can only be graded by actually looking at the pixels,
+so an artifact's images are attached as image parts in the same request.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+
+from pydantic import ValidationError
+
+from tests.eval.client import (
+    DEFAULT_JUDGE_MODEL,
+    TEXT_JUDGE_PROVIDER,
+    TEXT_JUDGE_REASONING,
+    TEXT_JUDGE_ROUTING,
+    build_judge_client,
+    resolve_text_judge,
+    text_judge_available,
+)
+from tests.eval.prompts import build_judge_system_prompt, render_rubric
+from tests.eval.rubric import Rubric
+from tests.eval.verdict import JudgeVerdict, Scorecard, build_scorecard
+
+logger = logging.getLogger(__name__)
+
+_MAX_IMAGES = 12
+# A nine-category audit verdict with a rationale per dimension and marker runs
+# well past the 4096 that fits a content post's; the cut-off arrives as
+# "EOF while parsing a string" from pydantic.
+DEFAULT_MAX_OUTPUT_TOKENS = 8192
+_VERDICT_ATTEMPTS = 2
+# About one GLM verdict call in twelve leaves a required field out or never
+# calls the tool, and a verdict that never lands leaves the trial judged on
+# its deterministic checks alone. With two attempts 1 of 43 briefs went
+# unjudged on 2026-09-30; a third costs twenty seconds and a tenth of a cent.
+_TEXT_VERDICT_ATTEMPTS = 3
+_MAX_IMAGE_WIDTH = 768  # downscale heavy 9:16 renders to keep the request light
+
+
+class NoVerdict(RuntimeError):
+    """The text judge answered, but not with a verdict."""
+
+
+@dataclass
+class JudgeImage:
+    """One image to put in front of the judge, with a label for cross-reference."""
+
+    label: str
+    mime_type: str
+    data: bytes
+
+
+@dataclass
+class JudgeArtifact:
+    """The deliverable under evaluation: a text rendering plus its images."""
+
+    title: str
+    body: str
+    images: list[JudgeImage] = field(default_factory=list)
+
+
+def evaluate(
+    rubric: Rubric,
+    artifact: JudgeArtifact,
+    *,
+    model: str | None = None,
+    client=None,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+) -> Scorecard:
+    """Grade ``artifact`` against ``rubric`` with the Gemini judge.
+
+    ``client`` defaults to one built from the resolved Gemini key. API errors
+    (rate limit, 5xx) propagate so callers can treat them as a skip. A verdict
+    that does not parse is retried once with double the output budget: the
+    usual cause is the JSON being cut off mid-rationale, which twice failed an
+    audit run whose report was fine.
+    """
+    if client is None and not artifact.images and text_judge_available():
+        return _evaluate_text(rubric, artifact, model=model)
+    client = client or build_judge_client()
+    model = model or (
+        os.environ.get("DUCT_JUDGE_MODEL") if os.environ.get("DUCT_JUDGE_PROVIDER") == "gemini" else None
+    ) or DEFAULT_JUDGE_MODEL
+    budget = max_output_tokens
+    for attempt in range(1, _VERDICT_ATTEMPTS + 1):
+        try:
+            verdict = _run_judge(client, model, rubric, artifact, budget)
+        except ValidationError as exc:
+            if attempt == _VERDICT_ATTEMPTS:
+                raise
+            logger.warning(
+                "judge: verdict did not parse at %d output tokens (%s); retrying with %d",
+                budget, exc.errors()[0].get("type", "?"), budget * 2,
+            )
+            budget *= 2
+            continue
+        return build_scorecard(rubric, verdict)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def text_judge_model(model: str | None = None):
+    """The text judge's chat model, through Duct's own model transport.
+
+    The same transport the agents run on (``resolve_chat_model``), so an
+    OpenRouter slug, its reasoning parameter and its retries behave here as
+    they do in a session. On OpenRouter it carries ``TEXT_JUDGE_ROUTING`` and
+    ``TEXT_JUDGE_REASONING``, set here rather than in the transport so no
+    agent run is pinned or made to think less.
+    """
+    from agents.core.lc import resolve_chat_model
+    from agents.models import Provider
+
+    provider, default_model, key = resolve_text_judge()
+    llm = resolve_chat_model(Provider(provider), model or default_model, key, temperature=0.2)
+    if provider == TEXT_JUDGE_PROVIDER and hasattr(llm, "openrouter_provider"):
+        llm = llm.model_copy(update={
+            "openrouter_provider": TEXT_JUDGE_ROUTING, "reasoning": TEXT_JUDGE_REASONING,
+        })
+    return llm
+
+
+def _evaluate_text(rubric: Rubric, artifact: JudgeArtifact, *, model: str | None = None) -> Scorecard:
+    """The text judge: one structured call (``text_judge_model``). A verdict
+    that fails validation, or never comes, is asked for again."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    judge = text_judge_model(model).with_structured_output(JudgeVerdict)
+    messages = [
+        SystemMessage(content=build_judge_system_prompt(rubric.persona)),
+        HumanMessage(content=(
+            f"{render_rubric(rubric)}\n\n# Artifact under review: {artifact.title}\n\n{artifact.body}"
+        )),
+    ]
+    for attempt in range(1, _TEXT_VERDICT_ATTEMPTS + 1):
+        try:
+            verdict = judge.invoke(messages)
+        except ValidationError:
+            if attempt == _TEXT_VERDICT_ATTEMPTS:
+                raise
+            logger.warning("judge: text verdict did not parse; asking again")
+            continue
+        # A model that answers in prose instead of the forced tool call
+        # parses to None, which is no verdict rather than an empty one.
+        if verdict is None:
+            if attempt == _TEXT_VERDICT_ATTEMPTS:
+                raise NoVerdict("the text judge answered without calling the verdict tool")
+            logger.warning("judge: text judge answered without a verdict; asking again")
+            continue
+        if isinstance(verdict, dict):
+            verdict = JudgeVerdict.model_validate(verdict)
+        return build_scorecard(rubric, verdict)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _run_judge(client, model: str, rubric: Rubric, artifact: JudgeArtifact, max_output_tokens: int) -> JudgeVerdict:
+    from google.genai import types
+
+    parts = [
+        types.Part.from_text(text=render_rubric(rubric)),
+        types.Part.from_text(text=f"# Artifact under review: {artifact.title}\n\n{artifact.body}"),
+    ]
+    if artifact.images:
+        parts.append(types.Part.from_text(
+            text="# Images (each is labeled — inspect them for the image dimensions and markers):"
+        ))
+        for img in artifact.images[:_MAX_IMAGES]:
+            data, mime = _downscale(img.data, img.mime_type)
+            parts.append(types.Part.from_text(text=f"Image — {img.label}:"))
+            parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+
+    config = types.GenerateContentConfig(
+        system_instruction=build_judge_system_prompt(rubric.persona),
+        response_mime_type="application/json",
+        response_schema=JudgeVerdict,
+        temperature=0.2,
+        max_output_tokens=max_output_tokens,
+    )
+    resp = client.models.generate_content(
+        model=model,
+        contents=[types.Content(role="user", parts=parts)],
+        config=config,
+    )
+    # Structured output gives us the validated object directly; fall back to
+    # parsing the text only if the SDK didn't populate `.parsed`.
+    parsed = getattr(resp, "parsed", None)
+    if isinstance(parsed, JudgeVerdict):
+        return parsed
+    return _parse_verdict(resp)
+
+
+def _parse_verdict(resp) -> JudgeVerdict:
+    """Pull the JSON verdict out of a Gemini response and validate it."""
+    text = (getattr(resp, "text", None) or "").strip()
+    if not text:
+        # Some SDK versions only expose text via candidates[].content.parts[].text
+        chunks: list[str] = []
+        for cand in (getattr(resp, "candidates", None) or []):
+            content = getattr(cand, "content", None)
+            for part in (getattr(content, "parts", None) or []):
+                piece = getattr(part, "text", None)
+                if piece:
+                    chunks.append(piece)
+        text = "".join(chunks).strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
+    if fenced:
+        text = fenced.group(1).strip()
+    return JudgeVerdict.model_validate_json(text)
+
+
+def _downscale(data: bytes, mime: str) -> tuple[bytes, str]:
+    """Best-effort downscale to ``_MAX_IMAGE_WIDTH``. Returns the original bytes
+    unchanged if Pillow is unavailable or the bytes aren't a decodable image."""
+    try:
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(data))
+        if img.width > _MAX_IMAGE_WIDTH:
+            height = max(1, round(img.height * _MAX_IMAGE_WIDTH / img.width))
+            img = img.resize((_MAX_IMAGE_WIDTH, height))
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=85)
+        return out.getvalue(), "image/jpeg"
+    except Exception:
+        return data, mime

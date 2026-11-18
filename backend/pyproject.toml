@@ -1,0 +1,166 @@
+[project]
+name = "duct-backend"
+version = "0.1.0"
+description = "Duct reporting backend"
+# Minimum 3.12 for project standard; <3.14 keeps supported set to 3.12–3.13 (CI uses 3.12).
+requires-python = ">=3.12,<3.14"
+# Dependencies stay in [tool.poetry.dependencies] (Poetry's caret syntax); declared
+# dynamic so Poetry sources them from there under PEP 621 metadata.
+dynamic = ["dependencies"]
+
+[tool.poetry]
+packages = [
+    { include = "agents" },
+    { include = "db" },
+    { include = "models" },
+    { include = "routes" },
+    { include = "service" },
+    { include = "utils" },
+]
+
+[tool.poetry.dependencies]
+fastapi = "^0.162"
+uvicorn = {version = "^0.54", extras = ["standard"]}
+# Starlette's form parser. FastAPI needs it at *import* time for any route
+# declaring Form()/File() — routes/content.py:/content/uploads does — so an
+# app missing it does not degrade, it fails to boot. It was only ever present
+# transitively through a dev dependency, and Railway installs --only main,
+# which is why every deploy died on "Form data requires python-multipart".
+# Not a caret: poetry reads ^0.0.31 as <0.0.32, so a floor is what we want here.
+# FastAPI's own is 0.0.18; Dependabot walks ours forward as releases land.
+python-multipart = ">=0.0.33"
+# 32.0.0 (2026-09-09) dropped developer_token from the client's required
+# config keys, the same day Google sunset developer tokens. Access level now
+# follows the Cloud project that owns the OAuth client, so there is no token
+# left to send. Do not float back below this.
+google-ads = "^35.0"
+google-analytics-data = "^0.23"
+google-api-python-client = "^2.201.0"
+google-genai = "^2.34"
+python-dotenv = "^1.2"
+pydantic = "^2.14"
+pydantic-settings = "^2.16"
+langchain = "^1.4.7"
+# Declared, not inherited: agents/core imports langchain_core directly
+# (messages, tools, fake chat models), so its floor is Duct's to hold. 1.7.0
+# is where streamed tool-call arguments became `tool-call-delta` events
+# instead of `block-delta` snapshots; nothing in Duct reads either (lc.py's
+# split_chunk takes text and thinking blocks and ignores the rest, and
+# routes/chat.py reads chunk.content), which was checked when this moved.
+langchain-core = "^1.7.6"
+langchain-openai = "^1.7.4"
+langchain-google-genai = "^4.4.3"
+langchain-anthropic = "^1.7.10"
+langgraph = "^1.2.20"
+pyjwt = "^2.15"
+httpx = "^0.28"
+# The client for MCP servers a user connects (service/mcp/). The reference SDK
+# rather than fastmcp: its client covers discovery, client metadata documents
+# and registration without fastmcp's server stack in production.
+mcp = "^2.3"
+# Cloudflare R2 image storage over the S3 API (service/storage.py). Only loaded
+# when the 'r2' storage backend is active.
+boto3 = "^1.43"
+sqlmodel = "^0.0.48"
+alembic = "^1.20"
+psycopg = {version = "^3.3", extras = ["binary"]}
+# Server analytics, request context, and automatic exception capture for FastAPI.
+posthog = ">=7.86.0"
+dlt = "^1.32.0"
+selectolax = ">=1.0.2"
+extruct = ">=0.16"
+trafilatura = ">=2.3.1"
+# Lossless payload compaction before a connector result reaches the model
+# (agents/core/compaction.py). Pinned to a minor: 0.x, and the knob this
+# depends on is `lossless_only` — a release that changed its meaning would
+# change what numbers a brief quotes. Ships an abi3 Rust extension with
+# manylinux_2_28 and macOS wheels, so no toolchain is needed to build it, and
+# agents/core/compaction.py degrades to plain JSON wherever it is absent.
+headroom-ai = "~0.42"
+deepagents = "0.7.32"   # exact: 0.x with no stability policy; changes behaviour in minors (task planning became opt-in in 0.7). tests/test_deepagents_harness.py is the upgrade gate.
+# OTel GenAI spans for the agents (agents/core/telemetry.py). The API is what
+# the spans are opened with; the SDK and the OTLP/HTTP exporter are what
+# `configure_tracing` installs when OTEL_EXPORTER_OTLP_ENDPOINT is set
+# (Jaeger locally, any collector in production). Declared explicitly because
+# the API used to arrive transitively via google-adk, removed with v2.
+opentelemetry-api = "^1.44"
+opentelemetry-sdk = "^1.44"
+opentelemetry-exporter-otlp-proto-http = "^1.44"
+reportlab = ">=5.1.0"
+cloudflare = ">=5.10.0"
+# Durable conversation state (agents/core/checkpoint.py). Both, not one: the
+# same app serves Postgres on Railway and SQLite in the desktop sidecar, and the
+# checkpointer follows DATABASE_URL rather than forcing a database of its own.
+# Separate distributions from `langgraph` itself, and MIT like it — unlike
+# `langgraph-api` (the Platform server, Elastic-2.0), which Duct does not use:
+# the library runs in-process inside FastAPI, with our own SSE transport.
+langgraph-checkpoint-postgres = "^3.2.0"
+langgraph-checkpoint-sqlite = "^3.1.3"
+# OpenRouter's first-party LangChain integration — `init_chat_model(
+# model_provider="openrouter")` resolves to it. Duct never imports it directly;
+# LangChain does, which is why no agents/ file gains a framework import and the
+# harness-boundary allowlist is untouched.
+#
+# It replaced ChatOpenAI-pointed-at-their-base-URL, which worked but had nowhere
+# to put OpenRouter's own surface: `openrouter_provider` routing preferences,
+# the unified `reasoning` object, data-collection controls, app attribution.
+#
+# Two things to know before using more of it. It does NOT depend on
+# langchain-openai — it brings its own `openrouter` SDK, so this is a real
+# second client, not a wrapper. And `route=` / `n>1` are declared fields that
+# raise TypeError before any network I/O, because the underlying SDK's
+# `Chat.send()` has no such parameters (langchain-ai/langchain#39180, closed
+# `not planned`). Express failover through `openrouter_provider` instead, and
+# do not reach for `route`.
+langchain-openrouter = "^0.2.9"
+langchain-xai = "^1.3.0"
+# Open models on the instance's own Ollama server (Provider.OLLAMA). The native
+# integration rather than ChatOpenAI at Ollama's /v1: the OpenAI-compatible
+# route drops `reasoning_content`, and `num_ctx` — the context Ollama loads,
+# 4,096 tokens by default on most laptops — has no field there at all.
+langchain-ollama = "^1.1.0"
+# Text out of the PDFs a user adds at onboarding (service/documents.py). Pure
+# Python and no dependencies of its own; Word and PowerPoint need no library
+# because they are zip files of XML. Duct extracts text rather than handing
+# the model a PDF block because DeepSeek, among others, reads no PDF at all.
+pypdf = "^7.0.0"
+feedparser = "^6.0.14"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9"
+pytest-asyncio = "^1.4"
+ruff = "^0.17"
+pyinstaller = "^6.22"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s  %(name)-35s  %(levelname)-7s  %(message)s"
+log_cli_date_format = "%H:%M:%S"
+markers = [
+    "live: live end-to-end tests requiring API keys (ANTHROPIC_API_KEY + DATABASE_URL).",
+]
+# `live` tests spend real money (model calls, image generation) and hit real
+# third-party accounts. Deselect them by default so neither CI nor a developer
+# with keys exported in their shell can fire them by typing `pytest`. Opt in
+# explicitly with `pytest -m live` — a command-line -m overrides this one.
+# `--durations=10` prints the slowest tests after every run, so a slow one is
+# noticed the day it lands rather than found later by coverage archaeology.
+addopts = ["-m", "not live", "--durations=10"]
+filterwarnings = [
+    # Starlette form parser; third-party until FastAPI/Starlette adopts python_multipart import.
+    "ignore:Please use `import python_multipart` instead\\.:PendingDeprecationWarning",
+]
+
+[tool.ruff.lint]
+# ruff 0.16 changed what an unconfigured project lints under: an unpinned
+# `select` went from the historical E4/E7/E9/F baseline to several hundred
+# rules (bandit, flake8-datetimez, pylint, refurb, pyupgrade, ...), which
+# would turn every future ruff bump into a repo-wide lint sweep rather than
+# a version bump. Pin to the baseline this codebase has always run under.
+select = ["E4", "E7", "E9", "F"]
+
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"

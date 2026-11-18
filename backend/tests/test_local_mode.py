@@ -1,0 +1,628 @@
+"""Desktop (local sidecar) mode — data dir, handshake, SQLite persistence.
+
+Covers the contract the Tauri shell depends on: `local_server.bootstrap()`
+prepares the environment and returns a handshake, and `Configs` in local mode
+points persistence at the per-user data dir instead of Railway.
+
+Every test drives an explicit `--data-dir` into tmp_path so nothing touches the
+developer's real ~/Library or ~/.local/share.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import re
+import stat
+import sys
+import threading
+import types
+
+import pytest
+from sqlmodel import Session, SQLModel, select
+
+import local_server
+from config import Configs, cors_kwargs
+from utils.appdirs import default_data_dir, resolve_data_dir
+
+
+# ---------------------------------------------------------------------------
+# Data directory
+# ---------------------------------------------------------------------------
+
+def test_default_data_dir_is_os_conventional():
+    path = str(default_data_dir())
+    if sys.platform == "darwin":
+        assert path.endswith("Library/Application Support/ai.getduct.desktop")
+    elif sys.platform == "win32":
+        assert path.endswith("Duct")
+    else:
+        assert path.endswith("duct")
+
+
+def test_explicit_override_wins_over_env(clean_env, tmp_path):
+    clean_env.setenv("DUCT_DATA_DIR", str(tmp_path / "from-env"))
+    assert resolve_data_dir(str(tmp_path / "explicit")) == tmp_path / "explicit"
+
+
+def test_env_used_when_no_override(clean_env, tmp_path):
+    clean_env.setenv("DUCT_DATA_DIR", str(tmp_path / "from-env"))
+    assert resolve_data_dir() == tmp_path / "from-env"
+
+
+# ---------------------------------------------------------------------------
+# Handshake
+# ---------------------------------------------------------------------------
+
+def test_bootstrap_returns_handshake_and_sets_env(clean_env, tmp_path):
+    handshake = local_server.bootstrap(["--data-dir", str(tmp_path)])
+
+    assert handshake["duct_sidecar"] == 1
+    assert handshake["port"] > 0
+    assert handshake["url"] == f"http://127.0.0.1:{handshake['port']}"
+    assert handshake["data_dir"] == str(tmp_path)
+    assert handshake["api_key"]
+
+    assert os.environ["DUCT_LOCAL"] == "1"
+    assert os.environ["DUCT_DATA_DIR"] == str(tmp_path)
+    assert os.environ["DUCT_API_KEY"] == handshake["api_key"]
+    assert os.environ["API_PUBLIC_URL"] == handshake["url"]
+
+
+def test_handshake_is_one_json_line(clean_env, tmp_path):
+    """The shell reads exactly one line and json-decodes it."""
+    handshake = local_server.bootstrap(["--data-dir", str(tmp_path)])
+    line = json.dumps(handshake)
+    assert "\n" not in line
+    assert json.loads(line)["duct_sidecar"] == 1
+
+
+def test_bootstrap_binds_loopback_only(clean_env, tmp_path):
+    handshake = local_server.bootstrap(["--data-dir", str(tmp_path)])
+    assert handshake["url"].startswith("http://127.0.0.1:")
+
+
+def test_explicit_port_is_honoured(clean_env, tmp_path):
+    handshake = local_server.bootstrap(["--data-dir", str(tmp_path), "--port", "51999"])
+    assert handshake["port"] == 51999
+
+
+def test_ports_differ_across_instances(clean_env, tmp_path):
+    """Two windows must not collide — port 0 asks the OS each time."""
+    first = local_server.bootstrap(["--data-dir", str(tmp_path)])["port"]
+    second = local_server.bootstrap(["--data-dir", str(tmp_path)])["port"]
+    assert first != second
+
+
+def test_bootstrap_does_not_override_explicit_app_env(clean_env, tmp_path):
+    clean_env.setenv("APP_ENV", "local")
+    local_server.bootstrap(["--data-dir", str(tmp_path)])
+    assert os.environ["APP_ENV"] == "local"
+
+
+# ---------------------------------------------------------------------------
+# Local API key
+# ---------------------------------------------------------------------------
+
+def test_api_key_persists_across_restarts(clean_env, tmp_path):
+    first = local_server.bootstrap(["--data-dir", str(tmp_path)])["api_key"]
+    second = local_server.bootstrap(["--data-dir", str(tmp_path)])["api_key"]
+    assert first == second
+
+
+def test_the_shell_supplies_the_api_key_and_the_file_is_retired(clean_env, tmp_path):
+    """The keychain copy wins, and the weaker file it replaces is deleted.
+
+    That deletion *is* the migration — an existing install moves on its next
+    launch and nothing has to detect a version — so it is the behaviour worth
+    pinning: a 0600 file is private to this account, not to this application,
+    and leaving it behind would keep the weaker copy readable forever.
+    """
+    first = local_server.bootstrap(["--data-dir", str(tmp_path)])["api_key"]
+    on_disk = tmp_path / local_server._API_KEY_FILE
+    assert on_disk.exists(), "the no-shell path should still mint a file"
+
+    clean_env.setenv("DUCT_LOCAL_API_KEY", "from-the-keychain")
+    handshake = local_server.bootstrap(["--data-dir", str(tmp_path)])
+
+    assert handshake["api_key"] == "from-the-keychain" != first
+    assert not on_disk.exists()
+
+
+def test_the_shell_supplies_the_signing_key_and_the_file_is_retired(clean_env, tmp_path):
+    """Tested on the function, not through two `bootstrap()` calls.
+
+    `bootstrap` writes JWT_SECRET into `os.environ` with `setdefault`, so a
+    second call in the same process reads back the first call's value and the
+    test would be measuring the fixture rather than the code. The sidecar boots
+    once per process; the unit is where the precedence actually lives.
+    """
+    on_disk = tmp_path / local_server._JWT_SECRET_FILE
+    minted = local_server.load_or_create_jwt_secret(tmp_path)
+    assert on_disk.exists()
+
+    clean_env.setenv("DUCT_LOCAL_JWT_SECRET", "signing-key-from-the-keychain")
+    from_keychain = local_server.load_or_create_jwt_secret(tmp_path)
+
+    assert from_keychain == "signing-key-from-the-keychain" != minted
+    assert not on_disk.exists()
+
+
+def test_a_pinned_signing_key_still_beats_the_keychain(clean_env, tmp_path):
+    """A developer pointing the sidecar at a deployment pins JWT_SECRET itself.
+
+    That has to keep winning, or running the desktop build against staging
+    signs tokens the deployment will reject — which is why `bootstrap` uses
+    `setdefault` and why the shell passes its copy under a *different* name.
+    """
+    clean_env.setenv("DUCT_LOCAL_JWT_SECRET", "signing-key-from-the-keychain")
+    clean_env.setenv("JWT_SECRET", "pinned-to-the-deployment")
+
+    local_server.bootstrap(["--data-dir", str(tmp_path)])
+
+    assert os.environ["JWT_SECRET"] == "pinned-to-the-deployment"
+
+
+def test_without_a_shell_the_sidecar_still_boots(clean_env, tmp_path):
+    """A headless `duct-sidecar --data-dir ...` has no keychain to ask.
+
+    The fallback is not a nicety: it is what keeps the self-host build and every
+    CI run working, so it must not quietly become a hard dependency.
+    """
+    handshake = local_server.bootstrap(["--data-dir", str(tmp_path)])
+    assert handshake["api_key"]
+    assert (tmp_path / local_server._API_KEY_FILE).exists()
+    assert (tmp_path / local_server._JWT_SECRET_FILE).exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions only")
+def test_api_key_file_is_owner_only(clean_env, tmp_path):
+    local_server.bootstrap(["--data-dir", str(tmp_path)])
+    mode = (tmp_path / local_server._API_KEY_FILE).stat().st_mode
+    assert stat.S_IMODE(mode) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# Supervision by the shell
+# ---------------------------------------------------------------------------
+
+def test_the_watchdog_fires_when_the_shell_closes_the_pipe():
+    """EOF on stdin is the only thing a dead shell can still say, so it has to
+    be what ends the sidecar; a live shell with nothing to say must not."""
+    read_fd, write_fd = os.pipe()
+    stream = os.fdopen(read_fd, "rb", buffering=0)
+    fired = threading.Event()
+    try:
+        thread = local_server.watch_stdin(stream, fired.set)
+        os.write(write_fd, b"still here")
+        assert not fired.wait(0.2), "bytes on stdin are not EOF"
+        os.close(write_fd)
+        assert fired.wait(5.0), "EOF on stdin must stop the sidecar"
+        thread.join(5.0)
+        assert not thread.is_alive()
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(write_fd)
+        stream.close()
+
+
+def test_a_torn_down_pipe_counts_as_a_lost_shell():
+    class Broken:
+        def read(self, _size):
+            raise OSError("pipe torn down")
+
+    fired = threading.Event()
+    local_server.watch_stdin(Broken(), fired.set).join(5.0)
+    assert fired.is_set()
+
+
+def test_the_watchdog_is_opt_in():
+    """A sidecar run by hand reads a terminal or /dev/null; neither may stop it."""
+    assert local_server._parse_args([]).exit_on_stdin_eof is False
+    assert local_server._parse_args(["--exit-on-stdin-eof"]).exit_on_stdin_eof is True
+
+
+# ---------------------------------------------------------------------------
+# Secrets on stdin
+#
+# The shell used to put its keychain copies in the sidecar's environment, which
+# every process this user runs can read and every subprocess inherits. They
+# now arrive as one JSON line on the stdin pipe the shell already holds for the
+# watchdog, and bootstrap() scrubs the names from os.environ once Configs has
+# read them.
+# ---------------------------------------------------------------------------
+
+_SECRETS_LINE = (
+    json.dumps(
+        {
+            "duct_secrets": 1,
+            "DUCT_LOCAL_API_KEY": "api-key-from-stdin",
+            "DUCT_LOCAL_JWT_SECRET": "signing-key-from-stdin-and-long-enough",
+            "CREDENTIALS_ENCRYPTION_KEY": "fernet-key-from-stdin",
+        }
+    )
+    + "\n"
+).encode()
+
+
+def _stdin_holding(monkeypatch, payload: bytes) -> None:
+    """Stand in for the pipe the shell writes: binary, one line, left open."""
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(payload)))
+
+
+def test_reading_secrets_from_stdin_is_opt_in():
+    """Without the flag nothing touches stdin, so a terminal or /dev/null is fine."""
+    assert local_server._parse_args([]).secrets_on_stdin is False
+    assert local_server._parse_args(["--secrets-on-stdin"]).secrets_on_stdin is True
+
+
+def test_the_shell_supplies_the_secrets_on_stdin_and_no_file_is_minted(clean_env, tmp_path):
+    _stdin_holding(clean_env, _SECRETS_LINE)
+
+    handshake = local_server.bootstrap(["--data-dir", str(tmp_path), "--secrets-on-stdin"])
+
+    assert handshake["api_key"] == "api-key-from-stdin"
+    assert not (tmp_path / local_server._API_KEY_FILE).exists()
+    assert not (tmp_path / local_server._JWT_SECRET_FILE).exists()
+    assert os.environ["JWT_SECRET"] == "signing-key-from-stdin-and-long-enough"
+    # Configs reads this one from the environment, so bootstrap places it there.
+    assert os.environ["CREDENTIALS_ENCRYPTION_KEY"] == "fernet-key-from-stdin"
+
+
+def test_a_supplied_secret_beats_the_environment_which_beats_the_file(clean_env, tmp_path):
+    """The three sources in order, so the headless and developer paths stay
+    exactly what they were: only a shell that spoke on stdin can outrank an
+    exported name."""
+    clean_env.setenv("DUCT_LOCAL_API_KEY", "from-the-environment")
+    clean_env.setenv("CREDENTIALS_ENCRYPTION_KEY", "pinned-by-the-developer")
+    _stdin_holding(clean_env, _SECRETS_LINE)
+
+    handshake = local_server.bootstrap(["--data-dir", str(tmp_path), "--secrets-on-stdin"])
+
+    assert handshake["api_key"] == "api-key-from-stdin"
+    assert os.environ["CREDENTIALS_ENCRYPTION_KEY"] == "pinned-by-the-developer"
+
+
+def test_the_secrets_line_leaves_the_rest_of_stdin_for_the_watchdog(clean_env, tmp_path):
+    """The watchdog reads the same stream afterwards; the line must not take
+    more than itself with it, or EOF detection would start from the wrong place."""
+    _stdin_holding(clean_env, _SECRETS_LINE + b"still here")
+
+    local_server.bootstrap(["--data-dir", str(tmp_path), "--secrets-on-stdin"])
+
+    assert sys.stdin.buffer.read() == b"still here"
+
+
+@pytest.mark.parametrize(
+    ("payload", "cause"),
+    [
+        (b"", "closed before a line"),
+        (b"not json\n", "not valid JSON"),
+        (b'{"DUCT_LOCAL_API_KEY": "k"}\n', "duct_secrets object"),
+        (b'["duct_secrets", 1]\n', "duct_secrets object"),
+    ],
+)
+def test_a_missing_or_malformed_secrets_line_is_a_failed_start(clean_env, tmp_path, payload, cause):
+    """Falling back to minted files would hand the webview a key the shell does
+    not hold, and every request would 401 with nothing in the log saying why.
+    The message names the cause and never a value."""
+    _stdin_holding(clean_env, payload)
+
+    with pytest.raises(SystemExit) as stop:
+        local_server.bootstrap(["--data-dir", str(tmp_path), "--secrets-on-stdin"])
+
+    assert stop.value.code != 0
+    assert cause in str(stop.value.code)
+    assert '"k"' not in str(stop.value.code), "the line goes to the shell's log; its values must not"
+    assert not (tmp_path / local_server._API_KEY_FILE).exists()
+
+
+def test_only_string_values_are_taken_from_the_secrets_line():
+    supplied = local_server.read_secrets_line(
+        io.BytesIO(b'{"duct_secrets": 1, "DUCT_LOCAL_API_KEY": "k", "nested": {"a": 1}, "n": 2}\n')
+    )
+    assert supplied == {"DUCT_LOCAL_API_KEY": "k"}
+
+
+def test_the_scrub_removes_exactly_the_secret_names(clean_env):
+    for name in local_server.SECRET_ENV_NAMES:
+        clean_env.setenv(name, "x")
+    clean_env.setenv("DUCT_LOCAL", "1")
+    clean_env.setenv("FRONTEND_ORIGIN", "tauri://localhost")
+
+    local_server.scrub_secrets_from_environment()
+
+    assert not any(name in os.environ for name in local_server.SECRET_ENV_NAMES)
+    assert os.environ["DUCT_LOCAL"] == "1"
+    assert os.environ["FRONTEND_ORIGIN"] == "tauri://localhost"
+
+
+def test_the_scrub_covers_every_name_bootstrap_writes_or_reads():
+    """The list is the contract: a secret added to the shell's line or derived
+    in bootstrap() that is not here stays in the environment for good."""
+    assert set(local_server.SECRET_ENV_NAMES) == {
+        "DUCT_LOCAL_API_KEY",
+        "DUCT_LOCAL_JWT_SECRET",
+        "CREDENTIALS_ENCRYPTION_KEY",
+        "GOOGLE_DESKTOP_OAUTH_CLIENT_SECRET",
+        "DUCT_API_KEY",
+        "JWT_SECRET",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Config derivation
+# ---------------------------------------------------------------------------
+
+def test_local_mode_derives_sqlite_and_uploads(clean_env, tmp_path):
+    cfg = Configs(duct_local=True, duct_data_dir=str(tmp_path))
+
+    assert cfg.database_url == f"sqlite:///{tmp_path / 'duct.db'}"
+    assert cfg.uploads_dir == str(tmp_path / "uploads")
+    # Alembic owns the desktop schema too — see db/migrate.py.
+    assert cfg.init_db_on_startup is False
+
+
+def test_local_mode_respects_explicit_database_url(clean_env, tmp_path):
+    """A developer can still run desktop mode against Postgres."""
+    cfg = Configs(
+        duct_local=True,
+        duct_data_dir=str(tmp_path),
+        database_url="postgresql://user:pw@host/db",
+    )
+    assert cfg.database_url == "postgresql://user:pw@host/db"
+
+
+# ---------------------------------------------------------------------------
+# The credentials key the desktop shell mints
+#
+# Desktop had none: CREDENTIALS_ENCRYPTION_KEY is a server setting and the frozen
+# bundle ships no `.env`, so service/credentials.py raised on every encrypt and
+# connecting a data source could finish OAuth and then fail to persist. The
+# shell now mints a Fernet key into the OS keychain and exports it under that
+# same name, skipping it when one is already set (desktop/src-tauri/src/sidecar.rs).
+#
+# The handover is plain environment, so there is nothing left for config.py to
+# do and nothing here to test about it. What no single language can check is
+# whether the two halves agree on the key's *shape*:
+# ---------------------------------------------------------------------------
+
+
+def test_a_url_safe_base64_of_32_bytes_is_a_valid_fernet_key():
+    """`credentials_encryption_key` in desktop/src-tauri/src/lib.rs builds the
+    key as URL_SAFE base64 (with padding) of 32 random bytes, and nothing links
+    the Rust and Python halves at compile time. Standard rather than url-safe
+    base64, or a stripped pad, would compile on one side and fail at the first
+    encrypt on a user's machine.
+    """
+    import base64 as b64
+    import os as _os
+
+    from cryptography.fernet import Fernet
+
+    minted = b64.urlsafe_b64encode(_os.urandom(32)).decode()
+    assert len(minted) == 44 and minted.endswith("=")
+    token = Fernet(minted.encode()).encrypt(b"connector refresh token")
+    assert Fernet(minted.encode()).decrypt(token) == b"connector refresh token"
+
+
+def test_server_mode_is_untouched(clean_env):
+    """Railway config must not acquire desktop defaults."""
+    cfg = Configs()
+    assert cfg.duct_local is False
+    assert cfg.database_url == ""
+    assert cfg.init_db_on_startup is False
+
+
+def test_duct_local_accepts_env_string(clean_env, tmp_path):
+    """DUCT_LOCAL arrives from the env as "1", not a bool."""
+    clean_env.setenv("DUCT_LOCAL", "1")
+    clean_env.setenv("DUCT_DATA_DIR", str(tmp_path))
+    cfg = Configs()
+    assert cfg.duct_local is True
+    assert cfg.database_url.startswith("sqlite:///")
+
+
+# ---------------------------------------------------------------------------
+# SQLite engine
+# ---------------------------------------------------------------------------
+
+def test_sqlite_engine_creates_schema_and_round_trips(clean_env, tmp_path, monkeypatch):
+    """The real model metadata must create cleanly on SQLite, not just Postgres."""
+    import db.session as db_session
+    import models  # noqa: F401 — registers SQLModel metadata
+
+    cfg = Configs(duct_local=True, duct_data_dir=str(tmp_path))
+    monkeypatch.setattr(db_session, "get_configs", lambda: cfg)
+    db_session.get_engine.cache_clear()
+
+    engine = db_session.get_engine()
+    assert engine is not None
+    SQLModel.metadata.create_all(engine)
+    assert (tmp_path / "duct.db").exists()
+
+    from models.auth import User
+
+    with Session(engine) as session:
+        session.add(User(email="local@example.com"))
+        session.commit()
+    with Session(engine) as session:
+        found = session.exec(select(User).where(User.email == "local@example.com")).first()
+        assert found is not None
+
+    db_session.get_engine.cache_clear()
+
+
+def test_sqlite_engine_enables_wal(clean_env, tmp_path, monkeypatch):
+    """WAL lets an agent write while a request reads — without it, streaming
+    sessions hit 'database is locked'."""
+    import db.session as db_session
+
+    cfg = Configs(duct_local=True, duct_data_dir=str(tmp_path))
+    monkeypatch.setattr(db_session, "get_configs", lambda: cfg)
+    db_session.get_engine.cache_clear()
+
+    engine = db_session.get_engine()
+    with engine.connect() as conn:
+        mode = conn.exec_driver_sql("PRAGMA journal_mode").scalar()
+    assert str(mode).lower() == "wal"
+
+    db_session.get_engine.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+#
+# These drive desktop mode through DUCT_LOCAL rather than `Configs(duct_local=True)`.
+# The field carries `validation_alias=AliasChoices("DUCT_LOCAL", "DUCT_DESKTOP")`,
+# so the field *name* is not accepted as an init kwarg: passing it applies the
+# local-mode defaults (which read the raw input dict) but leaves `cfg.duct_local`
+# False, and `cors_kwargs` branches on exactly that attribute. The env var is
+# also how the sidecar really runs — `local_server.bootstrap()` sets it.
+
+def _allows(cfg, origin: str) -> bool:
+    """Mirror how CORSMiddleware decides, for whichever branch cors_kwargs picked."""
+    kwargs = cors_kwargs(cfg)
+    if "allow_origin_regex" in kwargs:
+        return re.search(kwargs["allow_origin_regex"], origin) is not None
+    return origin in kwargs["allow_origins"]
+
+
+def _desktop_cfg(clean_env, tmp_path) -> Configs:
+    clean_env.setenv("DUCT_LOCAL", "1")
+    clean_env.setenv("DUCT_DATA_DIR", str(tmp_path))
+    clean_env.setenv("APP_ENV", "desktop")
+    return Configs()
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "tauri://localhost",          # bundled frontend (the eventual shape)
+        "https://app.getduct.ai",     # hosted app, during the transition
+        "http://localhost:3003",      # `tauri dev` against the Next dev server
+        "http://127.0.0.1:3003",
+    ],
+)
+def test_desktop_mode_allows_every_origin_the_shell_can_load(clean_env, tmp_path, origin):
+    cfg = _desktop_cfg(clean_env, tmp_path)
+    assert cfg.duct_local is True, "guard: desktop mode did not actually engage"
+    assert _allows(cfg, origin), f"{origin} must be allowed in desktop mode"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://evil.example",
+        "http://app.getduct.ai.evil.example",
+        "https://app.getduct.ai.evil.example",
+        "tauri://localhost.evil.example",
+    ],
+)
+def test_desktop_mode_rejects_foreign_origins(clean_env, tmp_path, origin):
+    """The regex is anchored — a lookalike host must not slip through."""
+    cfg = _desktop_cfg(clean_env, tmp_path)
+    assert not _allows(cfg, origin)
+
+
+def test_deployed_mode_keeps_an_explicit_allowlist(clean_env):
+    """Railway must not inherit the desktop regex."""
+    clean_env.setenv("APP_ENV", "production")
+    clean_env.setenv("FRONTEND_ORIGIN", "https://app.getduct.ai")
+    clean_env.setenv("SITE_ORIGIN", "https://getduct.ai")
+    cfg = Configs()
+    kwargs = cors_kwargs(cfg)
+    assert "allow_origin_regex" not in kwargs
+    assert kwargs["allow_origins"] == ["https://app.getduct.ai", "https://getduct.ai"]
+
+
+def test_local_dev_mode_allows_any_loopback_port(clean_env):
+    clean_env.setenv("APP_ENV", "local")
+    cfg = Configs()
+    assert _allows(cfg, "http://localhost:6006")
+    assert not _allows(cfg, "https://evil.example")
+
+
+def test_bootstrap_provides_a_jwt_secret(clean_env, tmp_path):
+    """Sign-in mints a session JWT, and a frozen bundle carries no JWT_SECRET.
+
+    Without this the callback fails as a bare 500 *after* the user has already
+    approved at Google - the one failure in the flow that cannot be seen until
+    the round-trip is nearly complete.
+    """
+    import local_server
+
+    clean_env.delenv("JWT_SECRET", raising=False)
+    local_server.bootstrap(["--data-dir", str(tmp_path), "--port", "1"])
+
+    secret = os.environ["JWT_SECRET"]
+    assert len(secret) >= 32, "Configs rejects a JWT_SECRET shorter than 32 chars"
+
+    mode = (tmp_path / local_server._JWT_SECRET_FILE).stat().st_mode
+    assert mode & 0o077 == 0, "the signing key must not be group/other readable"
+
+
+def test_jwt_secret_survives_a_restart(clean_env, tmp_path):
+    """A per-boot key would sign every user out on every relaunch."""
+    import local_server
+
+    clean_env.delenv("JWT_SECRET", raising=False)
+    local_server.bootstrap(["--data-dir", str(tmp_path), "--port", "1"])
+    first = os.environ["JWT_SECRET"]
+
+    clean_env.delenv("JWT_SECRET", raising=False)
+    local_server.bootstrap(["--data-dir", str(tmp_path), "--port", "1"])
+    assert os.environ["JWT_SECRET"] == first
+
+
+# --- Which environment a run embodies -------------------------------------
+#
+# Duct is configured entirely through the environment: a user picks their own
+# database and API URL, and the desktop sidecar is expected to embody whichever
+# env it was started with rather than a hardcoded default. DUCT_ENV_FILE is the
+# knob that selects one, so these pin its resolution rules.
+
+
+def test_env_file_defaults_to_the_developer_pair(clean_env):
+    from config import _settings_env_files
+
+    assert [p.name for p in _settings_env_files()] == [".env", ".env.local"]
+
+
+def test_env_file_override_resolves_against_the_backend_dir(clean_env):
+    """A bare name has to work from any cwd — and from a frozen bundle, whose
+    own directory holds no env files."""
+    from config import _BACKEND_DIR, _settings_env_files
+
+    clean_env.setenv("DUCT_ENV_FILE", ".env.prod")
+
+    assert _settings_env_files() == (_BACKEND_DIR / ".env.prod",)
+
+
+def test_env_file_override_accepts_absolute_paths_and_lists(clean_env, tmp_path):
+    from config import _settings_env_files
+
+    first, second = tmp_path / "base.env", tmp_path / "over.env"
+    clean_env.setenv("DUCT_ENV_FILE", f"{first}{os.pathsep}{second}")
+
+    assert _settings_env_files() == (first, second)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("postgresql://u:secret@db.example.com:5432/duct", "postgresql db.example.com:5432/duct"),
+        ("sqlite:////data/duct.db", "sqlite //data/duct.db"),
+        ("", "(unset)"),
+    ],
+)
+def test_describe_database_never_leaks_the_password(url, expected):
+    """This string is printed at startup and pasted into bug reports."""
+    from config import describe_database
+
+    described = describe_database(url)
+    assert described == expected
+    assert "secret" not in described

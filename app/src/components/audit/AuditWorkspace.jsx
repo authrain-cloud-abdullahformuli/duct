@@ -1,0 +1,384 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { FolderOpen } from "lucide-react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { Button } from "@/components/ui/button";
+import AgentChat from "../workspace/AgentChat";
+import AuditReport from "./AuditReport";
+import ShareReport from "./ShareReport";
+import AuditStepProgress from "./AuditStepProgress";
+import SplitWorkspace from "../workspace/SplitWorkspace";
+import { useAgentSession } from "../../hooks/useAgentSession";
+import { Action, Row } from "../../lib/agentSession";
+import { AuditEvent, STEP_LABELS } from "../../lib/auditEvents";
+import { Phase } from "../../lib/agentPhase";
+import { useAuditNav } from "../../lib/auditNavContext";
+import { applyProjectDraft } from "../../lib/projectDraft";
+import { PROJECT_EXISTING } from "../../lib/auditSession";
+import { KICKOFF_SOURCES } from "../../lib/signInSources";
+import { CornerNotice } from "../ui/corner-notice";
+
+// Re-export so consumers can import Phase from AuditWorkspace if they prefer
+export { Phase } from "../../lib/agentPhase";
+
+const AGENT_TYPE = "audit_seo";
+
+// What a resumed conversation is asked on the user's behalf, by kickoff name.
+// The audit agent holds no Search Console reader of its own, so the honest
+// ask after the bundled sign-in is "confirm and bind", not "re-run": it can
+// list the sources, pick the property, and say what the next run gains.
+const KICKOFF_MESSAGES = {
+  [KICKOFF_SOURCES]:
+    "I've just signed in with Google. Check which data sources this project can reach now. " +
+    "If Search Console or Analytics is connected, select the right property for this site and tell me what that unlocks for the next check.",
+};
+
+/**
+ * The SEO audit workspace. The session lifecycle is `useAgentSession`; what is
+ * audit's own is the report — its versions, the HTML streaming in before a
+ * version lands, and the public lead-magnet banner.
+ */
+export default function AuditWorkspace({
+  sessionId,
+  auditParams,
+  publicMode = false,
+  onReportReady,
+  leadToken = null,
+  leadEmail = null,
+  // A message to send once the resumed conversation is ready (lib/auditResume.js).
+  kickoff = "",
+  // "existing" when this run is drafting into a project the user already had.
+  // The write happens in the background while they read the report, so it is
+  // the one thing here they have to be told about.
+  projectMode = "",
+}) {
+  const { t } = useLingui();
+  const { setIsAuditRunning } = useAuditNav();
+
+  const [reportVersions, setReportVersions] = useState([]);
+  const [selectedVersionId, setSelectedVersionId] = useState(null);
+  const [streamingHtml, setStreamingHtml] = useState("");
+  // { id, name } once a draft has landed on a pre-existing project, until dismissed.
+  const [drafted, setDrafted] = useState(null);
+
+  const htmlBatchRef = useRef("");
+  const htmlBatchTimer = useRef(null);
+  const reportReceivedRef = useRef(false);
+  const reportFiredRef = useRef(false); // onReportReady fires once
+
+  // The page's own session key is unique per audit, so a reload of this
+  // page reattaches to this audit's run — and to the draft typed into it.
+  const handleKey = `${AGENT_TYPE}:${sessionId}`;
+  const agent = useAgentSession({
+    agentType: AGENT_TYPE,
+    notifyAs: t`The SEO audit`,
+    body: auditParams,
+    handleKey,
+    onEvent: handleEvent,
+  });
+  const { phase, dispatch } = agent;
+
+  // The kickoff fires once, the first time the resume is ready to talk.
+  const kickoffSentRef = useRef(false);
+  useEffect(() => {
+    const text = KICKOFF_MESSAGES[kickoff];
+    if (!text || kickoffSentRef.current || phase !== Phase.READY || !agent.attached) return;
+    kickoffSentRef.current = true;
+    agent.send(text);
+  }, [kickoff, phase, agent]);
+
+  // Onboarding audit, before sign-in: the connector prompt can send a guest
+  // through the Google sign-in that also connects the source, then bring them
+  // back to this conversation. Only this run — every other audit's prompt
+  // connects the ordinary way (lib/signInSources.js says why).
+  const signInToConnect =
+    auditParams?.draft_project && agent.conversationId
+      ? {
+          conversationId: agent.conversationId,
+          projectId: auditParams?.project_id || null,
+          siteUrl: auditParams?.url || "",
+        }
+      : null;
+
+  // Tell the nav bar whether to lock the back button
+  useEffect(() => {
+    setIsAuditRunning(phase === Phase.STARTING || phase === Phase.PIPELINE);
+  }, [phase, setIsAuditRunning]);
+
+  // Clear on unmount so the back button re-enables if the user navigates away
+  useEffect(() => () => setIsAuditRunning(false), [setIsAuditRunning]);
+
+  // Fire onReportReady once when the first complete report is available
+  useEffect(() => {
+    if (!onReportReady || reportFiredRef.current) return;
+    if (phase !== Phase.READY || reportVersions.length === 0) return;
+    const latest = reportVersions[reportVersions.length - 1];
+    if (!latest?.report) return;
+    reportFiredRef.current = true;
+    onReportReady(latest.report);
+  }, [onReportReady, phase, reportVersions]);
+
+  function upsertVersion(event) {
+    setReportVersions((prev) =>
+      [
+        ...prev.filter((v) => v.version_id !== event.version_id),
+        { version_id: event.version_id, label: event.label, report: event.payload },
+      ].sort((a, b) => a.version_id - b.version_id),
+    );
+    setSelectedVersionId(event.version_id);
+  }
+
+  function handleEvent(event, { appendMessage }) {
+    switch (event.event) {
+      case AuditEvent.ARTIFACT_CHUNK:
+      case AuditEvent.LEGACY_REPORT_CHUNK:
+        // Throttled, not debounced: chunks arrive closer together than the
+        // window, so restarting the timer on each one held the report back
+        // until the stream paused.
+        htmlBatchRef.current += event.text;
+        if (!htmlBatchTimer.current) {
+          htmlBatchTimer.current = setTimeout(() => {
+            htmlBatchTimer.current = null;
+            setStreamingHtml(htmlBatchRef.current);
+          }, 80);
+        }
+        break;
+
+      case AuditEvent.ARTIFACT_VERSION:
+      case AuditEvent.LEGACY_REPORT_UPDATED:
+        reportReceivedRef.current = true;
+        // replay=True: a stored version re-emitted on resume — render it, but
+        // skip the celebration meant for a fresh run.
+        if (event.replay) {
+          upsertVersion(event);
+          break;
+        }
+        setStreamingHtml("");
+        htmlBatchRef.current = "";
+        clearTimeout(htmlBatchTimer.current);
+        htmlBatchTimer.current = null;
+        upsertVersion(event);
+        if (event.version_id === 1) {
+          appendMessage({
+            role: Row.ASSISTANT,
+            text: t`Your report is on the right. Ask me to explain a finding, suggest a fix, or update the report.`,
+          });
+        }
+        break;
+
+      case AuditEvent.PROJECT_DRAFT: {
+        // Onboarding: the run learned something about the site. It lands on
+        // the project this audit belongs to, provenance and all; the rules
+        // for what may overwrite what live in lib/projectDraft.js.
+        const saved = applyProjectDraft(event, { projectId: auditParams?.project_id || null });
+        // Changing a project someone already had is not something to do
+        // quietly, even when every rule says the change was safe.
+        if (projectMode === PROJECT_EXISTING && saved?.id) {
+          setDrafted({ id: saved.id, name: saved.name });
+        }
+        break;
+      }
+
+      case AuditEvent.PIPELINE_FINISHED:
+        if (event.payload) {
+          reportReceivedRef.current = true;
+          setReportVersions((prev) =>
+            prev.some((v) => v.version_id === 1)
+              ? prev
+              : [{ version_id: 1, label: t`Initial audit`, report: event.payload }, ...prev],
+          );
+          setSelectedVersionId(1);
+        } else if (!reportReceivedRef.current) {
+          // Pipeline completed but no report was ever produced.
+          dispatch({ type: Action.FAILED, error: t`AI synthesis finished but no report was generated.` });
+        }
+        break;
+
+      case AuditEvent.PIPELINE_FAILED:
+        // A partial report exists: keep the panel, surface the error inline
+        // rather than replacing everything with the failure state.
+        if (reportReceivedRef.current) {
+          dispatch({ type: Action.STOPPED, keepReady: true });
+          const error = event.error;
+          appendMessage({
+            role: Row.SEND_ERROR,
+            text: error
+              ? t`Pipeline stopped early: ${error} — your partial report is still available above.`
+              : t`The pipeline ended unexpectedly. Your partial report is still available.`,
+            content: null,
+          });
+        }
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  function handleRetry() {
+    setReportVersions([]);
+    setSelectedVersionId(null);
+    setStreamingHtml("");
+    htmlBatchRef.current = "";
+    clearTimeout(htmlBatchTimer.current);
+    htmlBatchTimer.current = null;
+    reportReceivedRef.current = false;
+    agent.retry();
+  }
+
+  function handleStop() {
+    // During the pipeline: FAILED (no report yet); mid-chat with a report: READY.
+    agent.stop({ keepReady: phase === Phase.CHATTING && reportVersions.length > 0 });
+  }
+
+  function handleSend(content) {
+    agent.send(content, { context_version_id: selectedVersionId });
+  }
+
+  const showPublicCta = publicMode && phase === Phase.READY && reportVersions.length > 0;
+  const rightStatus = reportVersions.length > 0 ? "ready" : phase === Phase.PIPELINE ? "busy" : "idle";
+
+  const draftedName = drafted?.name;
+
+  const banner = showPublicCta ? (
+    <div className="shrink-0 flex items-center justify-between gap-3 px-4 py-2.5 bg-brand/10 border-b border-brand/25 text-sm">
+      <div className="flex flex-col gap-0.5 min-w-0">
+        <span className="font-semibold text-foreground leading-tight"><Trans>Want the full picture?</Trans></span>
+        <span className="text-brand text-xs leading-tight">
+          <Trans>This is a quick scan. Sign up for a deeper audit with competitor analysis, keyword gaps, and a prioritized action plan.</Trans>
+        </span>
+      </div>
+      <a
+        href="/"
+        className="shrink-0 inline-flex items-center gap-1 rounded-md bg-brand px-3 py-1.5 text-xs font-semibold text-brand-foreground hover:bg-brand/90 transition-colors"
+      >
+        <Trans>Get the full audit →</Trans>
+      </a>
+    </div>
+  ) : null;
+
+  return (
+    <>
+    <SplitWorkspace
+      storageKey="audit_split_w"
+      rightLabel={t`Report`}
+      rightStatus={rightStatus}
+      banner={banner}
+      left={
+        <AgentChat
+          title={t`Agent Chat`}
+          draftKey={handleKey}
+          phase={phase}
+          steps={agent.steps}
+          todos={agent.todos}
+          messages={agent.messages}
+          pending={agent.pending}
+          errorMsg={agent.error}
+          actions={
+            !publicMode && (
+              <ShareReport
+                conversationId={agent.conversationId}
+                projectId={auditParams?.project_id || null}
+                siteUrl={auditParams?.url || ""}
+              />
+            )
+          }
+          errorCode={agent.errorCode}
+          errorRetryable={agent.errorRetryable}
+          retrying={agent.retrying}
+          tierStepDown={agent.tierStepDown}
+          usage={agent.usage}
+          compacting={agent.compacting}
+          draft={agent.draft}
+          isAgentTyping={agent.isAgentTyping}
+          isStreaming={phase === Phase.PIPELINE || (phase === Phase.CHATTING && agent.isAgentTyping)}
+          reconnecting={agent.reconnecting}
+          // Audit accepts a follow-up while the crawl runs (it is queued
+          // server-side); only a pending card, a dropped link or a failure
+          // closes the composer.
+          inputDisabled={agent.inputDisabled}
+          answerDisabled={!agent.attached}
+          remembering={auditParams?.remember !== false}
+          // Ambient state, per the memory UX rules: a session that is not being
+          // remembered should say so while it runs, not only at the point the
+          // switch was flipped.
+          onAnswer={agent.answer}
+          onSendMessage={handleSend}
+          onRetrySend={handleSend}
+          onRetry={handleRetry}
+          onStop={handleStop}
+          renderSteps={(steps) => <AuditStepProgress steps={steps} />}
+          stepLabels={STEP_LABELS}
+          questionsCopy={{ submitLabel: t`Continue audit` }}
+          signInToConnect={signInToConnect}
+          inputPlaceholder={t`Ask a follow-up question…`}
+          inputAriaLabel={t`Message the audit agent`}
+          inputAccept="image/*,.pdf"
+          startingLabel={t`Starting audit…`}
+          failedTitle={t`Audit failed`}
+          retryLabel={t`↺ Retry audit`}
+          readyHint={
+            reportVersions.length > 0 ? (
+              <p className="text-sm text-center mt-6 px-2 py-3 rounded-lg bg-success/5 text-success border border-success/30">
+                <Trans>✓ Report ready — ask me anything about the findings.</Trans>
+              </p>
+            ) : null
+          }
+        />
+      }
+      right={
+        <AuditReport
+          phase={phase}
+          steps={agent.steps}
+          versions={reportVersions}
+          selectedVersionId={selectedVersionId}
+          onSelectVersion={setSelectedVersionId}
+          streamingHtml={streamingHtml}
+          errorMsg={agent.error}
+          actions={
+            !publicMode && (
+              <ShareReport
+                conversationId={agent.conversationId}
+                projectId={auditParams?.project_id || null}
+                siteUrl={auditParams?.url || ""}
+              />
+            )
+          }
+          errorCode={agent.errorCode}
+          errorRetryable={agent.errorRetryable}
+          retrying={agent.retrying}
+          tierStepDown={agent.tierStepDown}
+          usage={agent.usage}
+          compacting={agent.compacting}
+          draft={agent.draft}
+          onRetry={handleRetry}
+          leadToken={leadToken}
+          leadEmail={leadEmail}
+        />
+      }
+    />
+    {drafted && (
+      <CornerNotice
+        icon={FolderOpen}
+        title={t`Added to your ${draftedName} project`}
+        onDismiss={() => setDrafted(null)}
+        dismissLabel={t`Dismiss project update`}
+        actions={
+          <Button asChild size="sm" variant="outline">
+            <Link href={`/project/${encodeURIComponent(drafted.id)}`}><Trans>Review what changed</Trans></Link>
+          </Button>
+        }
+      >
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          <Trans>
+            Duct filled in what it learned from your site. Anything you had entered yourself was left
+            alone, and every drafted field is marked.
+          </Trans>
+        </p>
+      </CornerNotice>
+    )}
+    </>
+  );
+}

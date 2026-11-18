@@ -1,0 +1,144 @@
+[package]
+name = "desktop"
+version = "0.7.3"
+description = "Duct desktop shell"
+authors = ["Duct"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["updater"]
+# Self-update. `--no-default-features` drops the plugin AND the `autoUpdate`
+# capability the web app gates its update UI on, so the two can never disagree.
+#
+# NO BUILD USES THAT ESCAPE HATCH ANY MORE. It existed for the Mac App Store,
+# where shipping a self-updater is grounds for rejection; that channel was
+# retired 2026-09-06. A feature flag nothing exercises stops compiling without
+# anyone noticing — delete this and its `#[cfg]` gates in `src/lib.rs`, or give
+# it a consumer (a distro-packaged .deb would be a real one).
+updater = ["dep:tauri-plugin-updater"]
+# Crash reporting. Deliberately NOT a default feature: the builds we distribute
+# pass `--features crash-reporting` (see .github/workflows/desktop-release.yml),
+# and everyone else gets a shell with no reporting dependency compiled in at
+# all. Someone self-hosting Duct did not sign up to run our observability, and
+# a default they have to discover in order to remove is not a real choice.
+#
+# The vendor lives behind `src/telemetry/reporter.rs`, which has a complete
+# no-op arm — so building without this is a supported configuration, not a
+# degraded one. Swapping PostHog for something else means a third arm there and
+# nothing anywhere else.
+#
+# No vendor crate. A report is one JSON POST, and the shell already links an
+# HTTPS client; what the feature adds is reqwest's blocking front end, because a
+# panic hook runs on a thread that is about to die and has to wait for its own
+# request. posthog-rs was the alternative and was turned down: it pulls regex,
+# chrono, os_info, uuid and derive_builder for that one POST, and shipped three
+# releases in the week this was written.
+crash-reporting = ["reqwest/blocking"]
+# Webview inspector in a release build. Off by default; debug builds get it
+# regardless. Passed through so `View → Toggle Developer Tools` and Tauri's own
+# `open_devtools` are compiled in together — gating them on different flags is
+# how you get a menu item that does nothing.
+devtools = ["tauri/devtools"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+# Custom URL scheme (ai.getduct.desktop://) for the browser-based OAuth
+# return leg. Scheme registration lands in the bundle's Info.plist; no
+# extra sandbox entitlements needed (unlike a localhost listener).
+tauri-plugin-deep-link = "2"
+# System notifications for "the agent is done / needs you" while the window is
+# in the background. Reached through the `notify` command, not the plugin's JS
+# bindings — the window loads a remote origin (see `notify` in lib.rs).
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# OS keychain for bring-your-own provider keys: macOS Keychain, Windows
+# Credential Manager, Linux Secret Service (libsecret via D-Bus).
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# The sidecar encrypts stored connector credentials with a Fernet key, and the
+# frozen bundle ships no `.env` to put one in. The shell mints it on first run
+# and keeps it in the same keychain as the provider keys — see
+# `credentials_encryption_key` in lib.rs. Fernet's key format is exactly
+# url-safe base64 of 32 random bytes, which is all these two are for.
+base64 = "0.23"
+getrandom = "0.4"
+# "Continue with ChatGPT" (src/chatgpt.rs): PKCE needs SHA-256, the token
+# exchange needs an HTTPS client. reqwest is already in the tree through the
+# updater. rustls rather than the default native-tls: adding OpenSSL would mean
+# another library to sign and notarize on macOS. Crash reports ride the same
+# client (see the `crash-reporting` feature above).
+sha2 = "0.11"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form"] }
+# Self-update for the Developer ID / NSIS / AppImage channels — every channel
+# there is, now that the Mac App Store one (the only place self-update is
+# grounds for rejection) has been retired.
+tauri-plugin-updater = { version = "2", optional = true }
+
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+# macOS routes a deep link to the already-running app; Windows and Linux instead
+# launch a SECOND process with the URL in argv. For this app that would mean a
+# second window and a second sidecar, with the auth code delivered to the wrong
+# one. Single-instance forwards argv to the running instance instead.
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+
+# ---------------------------------------------------------------------------
+# Build profiles
+#
+# `target/debug` reached 11 GB before anyone measured it. Roughly half of every
+# .rlib is Rust metadata that no profile setting can remove, but a quarter is
+# DWARF, and 60% of that DWARF is `__debug_str` — mangled symbol names,
+# dominated by the objc2 bindings that wrap the whole of AppKit and Foundation.
+# We step through `desktop_lib`; nobody has ever stepped through objc2's
+# generated accessors. So dependencies keep their code and lose their symbols.
+[profile.dev]
+# Backtraces keep file and line. What this drops is variable inspection in
+# lldb, and only for our own crate, which is a fair trade at this size.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# The 606 dependencies. Nothing here is ever a debugging target.
+debug = false
+# Left unset, `debug = false` makes Cargo strip whatever it links, and on a Mac
+# that has rust-objcopy rewrite every proc-macro library. A library with an odd
+# number of indirect symbols loses the padding before its string table, macOS
+# 27's loader refuses it, and rustc reports that only as E0463 "can't find crate
+# for `tauri_macros`". The count moves with the code, so any version bump could
+# break any macro crate. `desktop/AGENTS.md` has the one-line diagnosis.
+strip = "none"
+# Dependencies compile once and then run on every launch; `desktop_lib` is the
+# opposite. Optimising them costs a single rebuild and makes a debug build
+# responsive rather than sluggish.
+opt-level = 1
+
+[profile.release]
+codegen-units = 1
+lto = true
+
+# NO `strip = true` HERE, deliberately, and this is the comment that should stop
+# you adding it. Distributed builds pass `--features crash-reporting`, and the
+# reporter names each frame from the binary's own symbol table, in process,
+# because nothing in desktop-release.yml uploads debug symbols to PostHog.
+# Cargo's default for this profile already drops the DWARF and keeps that
+# table; `strip = true` removes the table too. That fails no build and no test —
+# it quietly turns every crash report from a shipped binary into frames with no
+# names, and we would find out from an incident. Add it only in the same change
+# that uploads symbols (`posthog-cli`) and sends instruction addresses.
+#
+# `panic = "abort"` is absent too, and not for the reporter's sake: its hook
+# waits for the report before returning, so it works under either strategy.
+# Under unwind, a panic inside a command ends in tokio, which catches it, and
+# the window stays up; under abort the same panic closes the app. That is a
+# behaviour decision, not a binary-size one, and should be argued as one.

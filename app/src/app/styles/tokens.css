@@ -1,0 +1,113 @@
+/* tokens — Brand + shadcn design tokens, and the dark variant they hang off.
+   Split out of globals.css; see that file for the load order. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  color-scheme: light;
+
+  /* Brand tokens (mirrors `site/assets/duct.css`) */
+  --orange: #ff5c00;
+  --orange-h: #e05000;
+  --navy: #0d0f1a;
+  --navy-2: #2a2d3e;
+  --navy-3: #5c6174;
+  --white: #ffffff;
+  --off: #f7f7f6;
+  --serif: Georgia, "Times New Roman", Times, serif;
+  --sans: var(--font-dm-sans), ui-sans-serif, system-ui, sans-serif;
+  /* Reading measure. 50–75 characters is the readable band and 100 the
+     ceiling; a full-width report on a wide monitor blows straight past it.
+     `ch` so the cap follows the font, not a guess in pixels. */
+  --measure: 68ch;
+  --measure-tight: 56ch;
+  --pill: 100px;
+  --r: 12px;
+  --r-lg: 20px;
+
+  /* shadcn semantic tokens — Duct brand (see docs/archive/2026-Q2/2026-04-06-dashboard-library-evaluation.md) */
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.2 0.012 55);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.2 0.012 55);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.2 0.012 55);
+  /* The brand orange is the one accent (DESIGN.md, "One accent"). It was the
+     shadcn default violet until 2026-11-02, the most-cited "generated app"
+     tell, and the reason no screen looked like Duct. Same value as `--brand`:
+     white on it holds 4.6:1. */
+  --primary: oklch(0.58 0.18 45);
+  --primary-foreground: oklch(1 0 0);
+  --secondary: oklch(0.965 0.006 75);
+  --secondary-foreground: oklch(0.2 0.012 55);
+  --muted: oklch(0.965 0.006 75);
+  --muted-foreground: oklch(0.46 0.014 60);
+  --accent: oklch(0.955 0.008 70);
+  --accent-foreground: oklch(0.2 0.012 55);
+  --destructive: oklch(0.52 0.22 27);
+  --destructive-foreground: oklch(1 0 0);
+  /* The other two status colours, beside the one that already existed.
+     DESIGN.md ("No semantic success/warning tokens") asks for these: every
+     site was re-picking a green and an amber with a hand-managed dark partner,
+     and the raw #eab308 those hand-picks landed on measures 1.9:1 on a light
+     background — unreadable as label text, however fine it looks as a dot.
+     Darkened here for text contrast; the .dark pair below is lifted instead,
+     which is the direction dark themes need (Material dark-theme guidance). */
+  --success: oklch(0.55 0.15 149);
+  --success-foreground: oklch(1 0 0);
+  --warning: oklch(0.55 0.13 78);
+  --warning-foreground: oklch(1 0 0);
+  /* The third status colour, for a state that is neither a win nor a problem:
+     a key that works but is not yours — this machine's env file, or Duct's own
+     account. Amber was the only non-green available and it read as a fault,
+     which is wrong about a run that will succeed. Hue 250 is far enough from
+     orange primary to stay a status colour rather than a second accent. */
+  --info: oklch(0.52 0.15 250);
+  --info-foreground: oklch(1 0 0);
+  /* The brand orange, as a colour you can put words on. `--orange` above is
+     the literal `#ff5c00` the site paints and stays exactly that, because a
+     logo mark is not a contrast question; but white on it measures 3.10:1 and
+     the lead-magnet CTA and the audit upsell banner were both setting 12-13px
+     white on it. Same hue, taken down to where a small label survives: 4.6:1.
+     `--primary` carries the same value. */
+  --brand: oklch(0.58 0.18 45);
+  --brand-foreground: oklch(1 0 0);
+  /* Two different jobs, which is why one token could not do both. `--border`
+     separates things that are already distinguishable — a card from the page,
+     a row from the next row — and is decorative, so a whisper is correct.
+     `--control` is the edge that tells you *this is a field you can type in*.
+     At 1.27:1 the old shared value told nobody anything, so it went to the
+     3:1 WCAG 1.4.11 asks for, and at 3:1 every field on a form drew a bright
+     outline that out-shouted the text inside it ("too intense… focus is
+     scattered", 2026-11-03). It sits near 2:1 now, the band Apple's and
+     GitHub's fields use: every Duct field has a visible label above it and a
+     filled background, and the focused one gets the 3:1 ring. That is a
+     deliberate step below 1.4.11's letter, recorded in check-contrast.mjs.
+     `--input` stays the fill behind a field and the track behind a switch;
+     it is a surface, not a boundary. */
+  --border: oklch(0.92 0.005 80);
+  --input: oklch(0.92 0.005 80);
+  --control: oklch(0.79 0.008 80);
+  --ring: oklch(0.62 0.17 45);
+  /* Series colours clear 3:1 against the canvas so adjacent marks stay apart
+     for a low-vision reader; the old `--chart-3`/`-5` sat at 2.6 and 1.9. */
+  --chart-1: oklch(0.58 0.18 45);
+  --chart-2: oklch(0.3 0.03 60);
+  --chart-3: oklch(0.52 0.15 265);
+  --chart-4: oklch(0.55 0.06 70);
+  --chart-5: oklch(0.58 0.11 165);
+  /* 8px: controls are rounded-lg (8), cards rounded-xl (11), dialogs
+     rounded-2xl (14), pills rounded-full. Apple's scale (8 controls, 12 cards,
+     16 dialogs) with concentric corners: a card's inner control sits at the
+     card radius minus its padding. Was 10px under shadcn's Luma style, which
+     also rounded every input and button into a capsule. */
+  --radius: 0.5rem;
+  --sidebar: oklch(0.982 0.008 75);
+  --sidebar-foreground: oklch(0.2 0.012 55);
+  --sidebar-primary: oklch(0.58 0.18 45);
+  --sidebar-primary-foreground: oklch(1 0 0);
+  --sidebar-accent: oklch(0.945 0.01 70);
+  --sidebar-accent-foreground: oklch(0.2 0.012 55);
+  --sidebar-border: oklch(0.92 0.006 75);
+  --sidebar-ring: oklch(0.62 0.17 45);
+}
+

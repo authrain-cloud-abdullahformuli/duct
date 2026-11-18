@@ -1,0 +1,58 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+/* `prose` for rendered markdown — briefs, chat, connector notes. Twelve
+ * components used the classes for months with the plugin never installed, so
+ * every markdown brief rendered as unstyled text and looked broken. */
+@plugin "@tailwindcss/typography";
+
+/* ---------------------------------------------------------------------------
+ * Duct's own CSS, split by concern.
+ *
+ * This file is a manifest now, not a stylesheet. It used to be 2,000+ lines in
+ * which a page's private styling sat next to the design tokens, so `rpt-`,
+ * `conn-`, `generate-` and `signin-` all grew here by default and nothing was
+ * ever deleted because nobody could tell what still used it.
+ *
+ * ORDER IS LOAD-BEARING. Several selectors are deliberately overridden by a
+ * later one at equal specificity (`.app-textarea` is defined in forms.css and
+ * refined in generate.css), and theme.css must follow the component files so
+ * its layers and .dark overrides win. Add an import in the position its
+ * cascade needs, not alphabetically.
+ *
+ * TWO RULERS, ONE SCALE. Content inside `.app-main` / `.app-main-wide` or a
+ * SplitWorkspace pane sizes off its CONTAINER (`@container`, on Tailwind's
+ * @-scale: 28/32/36/42rem), because the viewport is 16rem wider than the
+ * content area whenever the sidebar is open. Only surfaces outside those
+ * regions — the sign-in page — use viewport media queries, and those use
+ * Tailwind's own breakpoints in rem (40rem = sm, 48rem = md). There are no
+ * hand-picked pixel breakpoints left; please don't reintroduce one.
+ *
+ * Lengths that should follow the reader's text size — type, spacing, sticky
+ * offsets — are in `rem`. Device units (borders, outlines, shadows, radii,
+ * optical 1px nudges) stay in `px` on purpose.
+ * ------------------------------------------------------------------------- */
+
+@import "./styles/tokens.css";
+@import "./styles/base.css";
+@import "./styles/skeleton.css";
+@import "./styles/app-shell.css";
+@import "./styles/forms.css";
+@import "./styles/layout-grids.css";
+@import "./styles/chat.css";
+@import "./styles/connections.css";
+@import "./styles/ads-report.css";
+@import "./styles/pills.css";
+@import "./styles/generate.css";
+@import "./styles/signin.css";
+@import "./styles/onboarding.css";
+@import "./styles/project.css";
+@import "./styles/typography.css";
+@import "./styles/theme.css";
+@import "./styles/mode-selector.css";
+@import "./styles/connector-tiles.css";
+@import "./styles/model-tiers.css";
+@import "./styles/profile.css";
+@import "./styles/usage.css";
+@import "./styles/spec-editor.css";
+@import "./styles/feed.css";

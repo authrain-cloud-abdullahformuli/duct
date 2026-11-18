@@ -1,0 +1,367 @@
+"""The stream translator's units: token usage, compaction, middleware nodes.
+
+`stream_agent` reads two LangGraph streams and turns them into Duct events.
+These pin the parts that were wrong in ways nobody saw: a summariser's prose
+arriving as the agent's reply, and every old tool call replaying as a fresh
+step after each compaction.
+"""
+
+from __future__ import annotations
+
+import pytest
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, RemoveMessage, ToolMessage
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
+from agents.core.events import AgentEvent
+from agents.core.lc import (
+    MODEL_RETRY_HEADER_MAX_DELAY,
+    UsageTracker,
+    _dispatch_updates,
+    is_middleware_node,
+    is_summarization_node,
+    retry_delay,
+    stream_agent,
+    usage_from_messages,
+)
+from agents.models import CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW, PRICING, ModelName, cost_usd
+from tests.fakes import ToolCallingFake, fake_llm
+
+
+def _usage(inp, out, cached=0):
+    return {
+        "input_tokens": inp,
+        "output_tokens": out,
+        "total_tokens": inp + out,
+        "input_token_details": {"cache_read": cached},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+
+def test_a_call_is_billed_once_at_its_stop_marker():
+    tracker = UsageTracker(ModelName.CLAUDE_SONNET)
+    # Anthropic: model name on the first chunk, usage on the last.
+    first = AIMessageChunk(content="", response_metadata={"model_name": "claude-sonnet-5-5"})
+    assert tracker.feed(first, {}) is None
+    middle = AIMessageChunk(content="Hel")
+    assert tracker.feed(middle, {}) is None
+    last = AIMessageChunk(
+        content="", usage_metadata=_usage(1200, 40, cached=900),
+        response_metadata={"stop_reason": "end_turn"},
+    )
+    billed = tracker.feed(last, {})
+    assert billed == {
+        "event": AgentEvent.TOKEN_USAGE,
+        "input_tokens": 1200,
+        "output_tokens": 40,
+        "cache_read_tokens": 900,
+        "cache_creation_tokens": 0,
+        "model": "claude-sonnet-5-5",
+        "scope": "thread",
+        "total_tokens": 1240,
+        "context_window": 200_000,
+        # 300 uncached in at $2 + 900 cached at $0.20 + 40 out at $10, per million.
+        "cost_usd": round((300 * 2.0 + 900 * 0.2 + 40 * 10.0) / 1_000_000, 6),
+    }
+    assert tracker.flush() is None  # nothing left over
+
+
+def test_chunk_usage_is_additive_across_a_call():
+    tracker = UsageTracker("gpt-5-mini")
+    tracker.feed(AIMessageChunk(content="", usage_metadata=_usage(500, 0)), {})
+    billed = tracker.feed(
+        AIMessageChunk(content="", usage_metadata=_usage(0, 30), response_metadata={"finish_reason": "stop"}),
+        {},
+    )
+    assert (billed["input_tokens"], billed["output_tokens"]) == (500, 30)
+    assert billed["context_window"] == 400_000  # from the table, by string id
+
+
+def test_a_call_without_a_stop_marker_is_billed_at_the_end_of_the_turn():
+    tracker = UsageTracker("some-model-we-do-not-know")
+    assert tracker.feed(AIMessage(content="whole reply", usage_metadata=_usage(10, 5)), {}) is None
+    billed = tracker.flush()
+    assert billed["total_tokens"] == 15
+    assert billed["context_window"] == DEFAULT_CONTEXT_WINDOW
+    assert billed["cost_usd"] is None  # unpriced: tokens shown, no dollar figure
+
+
+# What each summariser's model call carries in the stream. deepagents' runs
+# inside the model node, so only its `lc_source` tag tells it from the reply;
+# LangChain's has a `before_model` node of its own.
+DEEPAGENTS_SUMMARY_META = {
+    "langgraph_node": "model", "langgraph_checkpoint_ns": "model:abc", "lc_source": "summarization",
+}
+LANGCHAIN_SUMMARY_META = {
+    "langgraph_node": "SummarizationMiddleware.before_model",
+    "langgraph_checkpoint_ns": "SummarizationMiddleware.before_model:abc",
+    "lc_source": "summarization",
+}
+
+
+@pytest.mark.parametrize("meta", [DEEPAGENTS_SUMMARY_META, LANGCHAIN_SUMMARY_META])
+def test_the_summarisers_call_is_billed_but_does_not_drive_the_gauge(meta):
+    tracker = UsageTracker(ModelName.CLAUDE_SONNET)
+    billed = tracker.feed(
+        AIMessageChunk(content="", usage_metadata=_usage(150_000, 900), response_metadata={"stop_reason": "end_turn"}),
+        meta,
+    )
+    assert billed["scope"] == "compaction"
+    assert billed["input_tokens"] == 150_000  # still on the bill
+
+
+def test_a_subagents_summariser_is_the_subagents_not_the_threads():
+    """deepagents mounts a summariser on every subagent. Its state update
+    never reaches the parent's stream, so reading it as the thread's
+    compaction would leave the chat "compacting" with no end."""
+    tracker = UsageTracker(ModelName.CLAUDE_SONNET)
+    billed = tracker.feed(
+        AIMessageChunk(content="", usage_metadata=_usage(1, 1), response_metadata={"stop_reason": "end_turn"}),
+        {**DEEPAGENTS_SUMMARY_META, "langgraph_checkpoint_ns": "tools:abc|model:def"},
+    )
+    assert billed["scope"] == "subagent"
+
+
+def test_a_nested_call_is_a_subagents_not_the_threads():
+    tracker = UsageTracker(ModelName.CLAUDE_SONNET)
+    billed = tracker.feed(
+        AIMessageChunk(content="", usage_metadata=_usage(1, 1), response_metadata={"stop_reason": "end_turn"}),
+        {"langgraph_checkpoint_ns": "tools:abc|model:def"},
+    )
+    assert billed["scope"] == "subagent"
+
+
+def test_stored_usage_is_the_last_call_and_the_sum_of_what_survives():
+    messages = [
+        AIMessage(content="a", usage_metadata=_usage(100, 10)),
+        ToolMessage(content="x", tool_call_id="1"),
+        AIMessage(content="b", usage_metadata=_usage(300, 20, cached=50)),
+    ]
+    usage = usage_from_messages(messages, ModelName.CLAUDE_OPUS)
+    first = cost_usd(ModelName.CLAUDE_OPUS, input_tokens=100, output_tokens=10)
+    second = cost_usd(ModelName.CLAUDE_OPUS, input_tokens=300, output_tokens=20, cache_read_tokens=50)
+    assert usage["last"] == {"input_tokens": 300, "output_tokens": 20, "cache_read_tokens": 50, "cost_usd": second}
+    assert usage["total"] == {
+        "input_tokens": 400, "output_tokens": 30, "cache_read_tokens": 50, "calls": 2,
+        "cost_usd": round(first + second, 6),
+    }
+    assert usage["context_window"] == CONTEXT_WINDOW[ModelName.CLAUDE_OPUS]
+    assert usage["model"] == "claude-opus-5-5"
+    assert usage_from_messages([], ModelName.CLAUDE_SONNET)["last"] is None
+
+
+def test_a_thread_served_by_a_retired_model_keeps_its_own_price():
+    """A thread Opus 5 answered was billed at Opus 5's $5/$25. Repricing it at
+    its successor's $4/$20 on reopen would under-report what the user paid, and
+    dropping the price would blank a figure they saw yesterday."""
+    served = AIMessage(
+        content="a", usage_metadata=_usage(1_000, 100),
+        response_metadata={"model_name": "claude-opus-5"},
+    )
+    usage = usage_from_messages([served], "claude-opus-5")
+    assert usage["last"]["cost_usd"] == round((1_000 * 5.0 + 100 * 25.0) / 1_000_000, 6)
+    assert usage["context_window"] == 200_000
+
+
+# ---------------------------------------------------------------------------
+# Middleware nodes
+# ---------------------------------------------------------------------------
+
+def test_middleware_nodes_are_recognised_by_their_hook_suffix():
+    assert is_middleware_node("SummarizationMiddleware.before_model")
+    assert is_middleware_node("ContextEditingMiddleware.before_model")
+    assert not is_middleware_node("model")
+    assert not is_middleware_node("tools")
+    assert is_summarization_node("SummarizationMiddleware.before_model")
+    assert not is_summarization_node("ContextEditingMiddleware.before_model")
+
+
+async def _collect():
+    calls = {"tool_use": [], "compacted": 0, "summaries": []}
+
+    async def on_tool_use(name, args, call_id):
+        calls["tool_use"].append(name)
+
+    async def on_compacted(summary):
+        calls["compacted"] += 1
+        calls["summaries"].append(summary)
+
+    return calls, on_tool_use, on_compacted
+
+
+async def test_a_compaction_is_reported_and_its_surviving_tool_calls_are_not_replayed():
+    calls, on_tool_use, on_compacted = await _collect()
+    surviving = AIMessage(
+        content="", tool_calls=[{"name": "fetch_ga4", "args": {}, "id": "old"}]
+    )
+    # The summariser's own message is a HumanMessage like the user's; only
+    # its tag tells them apart, and the transcript gets the text without the
+    # framing sentence.
+    summary = HumanMessage(
+        content="Here is a summary of the conversation to date:\n\nSessions fell 12% after the pricing change.",
+        additional_kwargs={"lc_source": "summarization"},
+    )
+    # LangChain's summariser: its own node, and a rewrite of the history.
+    await _dispatch_updates(
+        {"SummarizationMiddleware.before_model": {
+            "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), summary, surviving],
+        }},
+        on_todo=None, on_tool_use=on_tool_use, on_tool_result=None, on_compacted=on_compacted,
+    )
+    assert calls["compacted"] == 1
+    assert calls["summaries"] == ["Sessions fell 12% after the pricing change."]
+    assert calls["tool_use"] == []  # the old fetch did not become a new step
+
+
+async def test_deepagents_summary_rides_on_the_model_nodes_own_update():
+    """deepagents keeps the history and records the summary as an event on
+    the model node's update, wrapped in its own framing (the offloaded file,
+    <summary> tags). The reply's tool calls on that update are still new."""
+    from deepagents.backends import StateBackend
+    from deepagents.middleware.summarization import SUMMARIZATION_EVENT_KEY, SummarizationMiddleware
+
+    framed = SummarizationMiddleware(model=fake_llm("x"), backend=StateBackend())._build_new_messages_with_path(
+        "Sessions fell 12% after the pricing change.", "/conversation_history/abc.md"
+    )[0]
+    calls, on_tool_use, on_compacted = await _collect()
+    await _dispatch_updates(
+        {"model": {
+            "messages": [AIMessage(content="", tool_calls=[{"name": "fetch_ga4", "args": {}, "id": "n"}])],
+            SUMMARIZATION_EVENT_KEY: {"cutoff_index": 4, "summary_message": framed, "file_path": "/conversation_history/abc.md"},
+        }},
+        on_todo=None, on_tool_use=on_tool_use, on_tool_result=None, on_compacted=on_compacted,
+    )
+    assert calls["summaries"] == ["Sessions fell 12% after the pricing change."]
+    assert calls["tool_use"] == ["fetch_ga4"]
+
+
+async def test_the_deep_rungs_summariser_is_a_compaction_not_the_agents_reply(emitted):
+    """The real summariser on the real assembly. A model profile with a small
+    window makes deepagents summarise turn one's history before turn two's
+    call — inside that call's `model` node. Before the fix the summary
+    streamed into the chat as the agent's prose, was billed to the thread,
+    and no divider appeared."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from agents.core.deep_session import RunLimits, build_deep_session_agent
+
+    def _answer(text, inp):
+        return AIMessage(content=text, usage_metadata=_usage(inp, 5), response_metadata={"stop_reason": "end_turn"})
+
+    summary = "Sessions fell 12% after the pricing change."
+    # Calls in order: turn one's reply, turn two's summary, turn two's reply.
+    llm = ToolCallingFake(
+        responses=[_answer("First look done.", 9_000), _answer(summary, 9_000), _answer("Second answer.", 4_000)],
+        profile={"max_input_tokens": 20_000},
+    )
+    agent = build_deep_session_agent(
+        llm=llm, tools=[], system_prompt="x", checkpointer=InMemorySaver(),
+        limits=RunLimits(
+            model_calls_per_run=5, model_calls_per_thread=50, tool_calls_per_run=10,
+            tool_calls_per_thread=100, tool_result_prune_trigger=1_000, tool_results_kept=2,
+        ),
+    )
+    config = {"configurable": {"thread_id": "summarised"}, "recursion_limit": 100}
+
+    async def _no_artifact(_raw, _text):
+        return None
+
+    long_message = "hello " * 5_000  # ~7.5k tokens by the summariser's estimate
+    await stream_agent(agent, long_message, emitted, on_artifact_close=_no_artifact, config=config)
+    emitted.events.clear()
+    await stream_agent(agent, long_message, emitted, on_artifact_close=_no_artifact, config=config)
+
+    kinds = [e["event"] for e in emitted.events]
+    prose = "".join(e["text"] for e in emitted.events if e["event"] == AgentEvent.AGENT_MESSAGE_CHUNK)
+    assert prose == "Second answer."
+    assert kinds.count(AgentEvent.CONTEXT_COMPACTING) == 1
+    compacted = [e for e in emitted.events if e["event"] == AgentEvent.CONTEXT_COMPACTED]
+    assert [e["summary"] for e in compacted] == [summary]  # once, though the update also carries it
+    # The divider precedes the reply that runs on the summary.
+    assert kinds.index(AgentEvent.CONTEXT_COMPACTED) < kinds.index(AgentEvent.AGENT_MESSAGE_CHUNK)
+    assert [e["scope"] for e in emitted.events if e["event"] == AgentEvent.TOKEN_USAGE] == ["compaction", "thread"]
+
+
+async def test_pruning_tool_results_is_not_a_compaction():
+    calls, on_tool_use, on_compacted = await _collect()
+    await _dispatch_updates(
+        {"ContextEditingMiddleware.before_model": {"messages": [AIMessage(content="edited")]}},
+        on_todo=None, on_tool_use=on_tool_use, on_tool_result=None, on_compacted=on_compacted,
+    )
+    assert calls["compacted"] == 0
+    assert calls["tool_use"] == []
+
+
+async def test_the_agent_loops_own_tool_calls_still_dispatch():
+    calls, on_tool_use, on_compacted = await _collect()
+    await _dispatch_updates(
+        {"model": {"messages": [AIMessage(content="", tool_calls=[{"name": "fetch_ga4", "args": {}, "id": "n"}])]}},
+        on_todo=None, on_tool_use=on_tool_use, on_tool_result=None, on_compacted=on_compacted,
+    )
+    assert calls["tool_use"] == ["fetch_ga4"]
+    assert calls["compacted"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Steering
+# ---------------------------------------------------------------------------
+
+def test_the_steer_middleware_hands_the_model_what_arrived_mid_turn():
+    import asyncio
+
+    from agents.core.lc import SteerMiddleware
+
+    class Session:
+        steer_queue = asyncio.Queue()
+
+    session = Session()
+    session.steer_queue.put_nowait({"role": "user", "content": "also mobile", "client_message_id": "m1"})
+    session.steer_queue.put_nowait({"role": "user", "content": [{"type": "text", "text": "and tablets"}]})
+    session.steer_queue.put_nowait({"role": "user", "content": ""})  # nothing to say
+
+    update = SteerMiddleware(session).before_model({}, None)
+    assert [m.content for m in update["messages"]] == ["also mobile", [{"type": "text", "text": "and tablets"}]]
+    assert session.steer_queue.empty()
+    # Nothing waiting: no update, so the graph state is untouched.
+    assert SteerMiddleware(session).before_model({}, None) is None
+    assert SteerMiddleware(object()).before_model({}, None) is None  # a harness with no queue
+
+
+# ---------------------------------------------------------------------------
+# Cost
+# ---------------------------------------------------------------------------
+
+def test_every_model_with_a_context_window_has_a_price():
+    """The two tables describe the same chat models; a model added to one and
+    not the other shows a gauge with no cost, or a cost with no gauge."""
+    assert set(PRICING) == set(CONTEXT_WINDOW)
+
+
+def test_cached_tokens_are_priced_at_the_cache_rate_not_the_input_rate():
+    # 10 000 in, of which 8 000 were read from cache: only 2 000 at full price.
+    full = cost_usd(ModelName.CLAUDE_SONNET, input_tokens=10_000, output_tokens=0)
+    mostly_cached = cost_usd(ModelName.CLAUDE_SONNET, input_tokens=10_000, output_tokens=0, cache_read_tokens=8_000)
+    assert full == 0.02
+    assert mostly_cached == round((2_000 * 2.0 + 8_000 * 0.2) / 1_000_000, 6)
+    assert cost_usd("a-model-nobody-priced", input_tokens=1, output_tokens=1) is None
+
+
+# ---------------------------------------------------------------------------
+# Retry delay
+# ---------------------------------------------------------------------------
+
+class _Told(Exception):
+    def __init__(self, seconds):
+        super().__init__("429")
+        self.response = type("R", (), {"headers": {"retry-after": str(seconds)}})()
+
+
+def test_the_providers_retry_after_wins_over_the_schedule_up_to_a_cap():
+    assert retry_delay(1, _Told(7)) == 7.0
+    assert retry_delay(3, _Told(0)) == 0.0
+    assert retry_delay(1, _Told(600)) == MODEL_RETRY_HEADER_MAX_DELAY
+    # Nothing said: the jittered schedule, which grows with the attempt.
+    assert 0.7 <= retry_delay(1, Exception("429")) <= 1.3
+    assert 5.9 <= retry_delay(4) <= 10.1

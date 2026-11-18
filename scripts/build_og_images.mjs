@@ -1,0 +1,187 @@
+#!/usr/bin/env node
+// Per-page Open Graph images for the site: `node scripts/build_og_images.mjs`.
+//
+// One 670 KB PNG used to serve every page, so a shared link to the paid-ads
+// page previewed the same card as the privacy policy. Each page gets its own
+// card now: the wordmark, the page's headline in the site's serif, one line
+// under it, and, where the page has one, its product shot bleeding off the
+// corner. JPEG, 1200×630, each under 150 KB. Drawn with sharp from app/'s
+// node_modules, like scripts/shots; the text is SVG in Georgia, which the
+// renderer resolves from the system, so run this on a machine that has it
+// (a Mac does) and commit the output.
+import { createRequire } from "node:module";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const REPO = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const req = createRequire(import.meta.url);
+const sharp = req(req.resolve("sharp", { paths: [join(REPO, "app")] }));
+const MEDIA = join(REPO, "site/assets/media");
+const ICONS = join(REPO, "site/assets/icons");
+const POSTS = join(REPO, "site/blog/posts");
+const OUT = join(REPO, "site/assets/og");
+const W = 1200, H = 630, LIMIT = 150 * 1024;
+const FOOTER_Y = H - 56, FOOTER_CLEARANCE = 44;
+// Title sizes to try, largest first, when a long title would crowd the footer.
+const TITLE_STEPS = [46, 40];
+
+// slug → the card. `shot` is a file in site/assets/media; its top-left corner
+// is what shows, so pick shots whose first 620×480 carry the point.
+const PAGES = {
+  "index": { title: "See the whole picture. Fix it in the same moment.", sub: "Open-source AI marketing agent: a growth analyst with every login.", shot: "insights-session.webp" },
+  "compare": { title: "Claude Cowork, n8n or Duct?", sub: "Three good tools, three different jobs. Where each one is the right call." },
+  "for-product-intelligence": { title: "See why the number moved. Fix it before the standup.", sub: "Your product analytics, read as one.", shot: "product-session.webp" },
+  "for-organic-growth": { title: "See which content actually converts. Fix it in the same sitting.", sub: "GSC, GA4 and Clarity, read together.", shot: "content-session.webp" },
+  "for-paid-ads": { title: "See what your ad spend bought. Move it in the same moment.", sub: "Ads, GA4 and Stripe, read together.", shot: "paid-session.webp" },
+  "download": { title: "The whole picture, in one window.", sub: "Mac, Windows and Linux. Free, open source, your own keys.", shot: "insights-session.webp" },
+  "seo-audit": { title: "See exactly what's hurting your rankings.", sub: "A free SEO audit from the open-source Duct agent. No account.", shot: "audit-report.webp" },
+  "mcp": { title: "Bring your own MCP servers.", sub: "OpenSEO, Notion, Linear, PostHog or any public server, called by Duct's agent." },
+  "skills": { kicker: "Agent skills", title: "Is your site ready to launch? Ask your agent.", sub: "launch-check reads the page and the code, scores six areas and ranks three fixes." },
+  "connect-agent": { title: "Use Duct from your agent.", sub: "Claude Code, Codex, Cursor and more: one address, one Allow in your browser." },
+  "open-source": { title: "Open source, MIT, your own keys.", sub: "What runs where, how to self-host it, and a plain answer on what will cost money." },
+  "about": { title: "Built because my tools wouldn't talk.", sub: "Why an agent that reads your whole business is open source." },
+  "doctrine": { title: "The Duct doctrine.", sub: "Seven opinions the project is built on, each linked to the file that enforces it." },
+  "privacy": { title: "Privacy policy.", sub: "What Duct stores, where, and what never leaves your machine." },
+  "terms": { title: "Terms of service.", sub: "The terms for the hosted app and the desktop download." },
+  "changelog": { title: "What changed in Duct.", sub: "Release notes, newest first: connectors, agents, desktop builds." },
+  "tools": { title: "Free tools for growth teams.", sub: "Calculators and generators that run in your browser. No account." },
+  "blog": { title: "What your tools don't tell you on their own.", sub: "Growth without a data team, and an open-source agent built in the open." },
+  // The integrations pages are generated (scripts/build_integrations.py), which
+  // refuses a connector page whose card is missing; `logo` is a file in
+  // site/assets/icons, drawn on a white tile where a shot would go.
+  "integrations": { title: "Twelve tools. Read as one.", sub: "What Duct reads in each one, what it can change, and how to connect it." },
+  "integrations/google-ads": { kicker: "Integration", title: "Google Ads, read next to your revenue.", sub: "Eight kinds of change, each one waiting for your Apply.", logo: "google-ads.svg" },
+  "integrations/chatgpt-ads": { kicker: "Integration", title: "ChatGPT Ads, judged on revenue.", sub: "The Ads API has no conversions. Duct reads it beside Stripe and GA4.", logo: "openai-ads.svg" },
+  "integrations/ga4": { kicker: "Integration", title: "GA4, with the rest of the story.", sub: "Read beside Search Console, your ads and Stripe.", logo: "googleanalytics.svg" },
+  "integrations/stripe": { kicker: "Integration", title: "Stripe, the number your ads answer to.", sub: "Every platform's conversions, checked against money that settled.", logo: "stripe.svg" },
+  "integrations/meta-ads": { kicker: "Integration", title: "Meta Ads, counted once.", sub: "Purchases recounted on the window you choose, then checked against Stripe.", logo: "meta.svg" },
+  "integrations/apple-search-ads": { kicker: "Integration", title: "Apple Search Ads, past the install.", sub: "Installs checked against the subscribers RevenueCat sees.", logo: "apple-search-ads.svg" },
+  "integrations/google-search-console": { kicker: "Integration", title: "Search Console, down to the query that converts.", sub: "Query by page, joined to GA4.", logo: "googlesearchconsole.svg" },
+  "integrations/google-tag-manager": { kicker: "Integration", title: "Tag Manager, with the rollback named first.", sub: "Fixes staged in a workspace. The publish waits for you.", logo: "google-tag-manager.svg" },
+  "integrations/mixpanel": { kicker: "Integration", title: "Mixpanel, without the QA team in it.", sub: "Clean counts across web and app, checked against Stripe.", logo: "mixpanel.svg" },
+  "integrations/microsoft-clarity": { kicker: "Integration", title: "Clarity, what happened after the click.", sub: "Friction per page, read beside GA4 and your ads.", logo: "clarity.svg" },
+  "integrations/growthbook": { kicker: "Integration", title: "GrowthBook, before you call the test.", sub: "Stale tests and small samples flagged, outcomes read in Stripe.", logo: "growthbook.svg" },
+  "integrations/revenuecat": { kicker: "Integration", title: "RevenueCat, the app's half of the revenue.", sub: "App and web MRR, read as one number.", logo: "revenuecat.svg" },
+  "tools/saas-metrics-calculator": { title: "SaaS metrics benchmark calculator.", sub: "Churn, LTV:CAC, payback and trial-to-paid against industry medians.", shot: "insights-session.webp" },
+  "tools/cac-ltv-calculator": { title: "CAC and LTV calculator.", sub: "CAC, LTV, the ratio and payback, with benchmark context.", shot: "insights-session.webp" },
+  "tools/mrr-growth-calculator": { title: "MRR growth rate calculator.", sub: "Net MRR growth, CMGR, and the rate you need to hit a target.", shot: "insights-session.webp" },
+  "tools/ctr-calculator": { title: "CTR calculator.", sub: "Click-through rate, projected clicks, and the CTR you need.", shot: "paid-session.webp" },
+  "tools/cpm-calculator": { title: "CPM calculator.", sub: "Cost per thousand impressions, spend scenarios, efficiency targets.", shot: "paid-session.webp" },
+  "tools/cpc-calculator": { title: "CPC calculator.", sub: "Cost per click and what spend looks like at your target.", shot: "paid-session.webp" },
+  "tools/cpa-calculator": { title: "CPA calculator.", sub: "Cost per acquisition, conversion scenarios, budget-safe CPAs.", shot: "paid-session.webp" },
+  "tools/roas-calculator": { title: "ROAS calculator.", sub: "Return on ad spend, target gaps, margin-aware contribution ROAS.", shot: "paid-session.webp" },
+  "tools/marketing-roi-calculator": { title: "Marketing ROI calculator.", sub: "ROI, profit and revenue scenarios for campaign decisions.", shot: "paid-session.webp" },
+  "tools/utm-builder": { title: "UTM builder.", sub: "GA4-friendly campaign links with live preview and validation.", shot: "paid-session.webp" },
+  "tools/weekly-brief-template": { title: "Weekly marketing brief template.", sub: "A report structure for your role and your stack, one slot per tool.", shot: "insights-session.webp" },
+  "tools/engagement-rate-calculator": { title: "Engagement rate calculator.", sub: "Engagement by followers, reach or impressions, comparable across posts.", shot: "content-session.webp" },
+};
+
+// Blog posts draw their own row from front matter, so a new post needs no
+// entry here: its category is the kicker, the author and read time the line
+// under the title. The same card is the cover on the blog index, which is why
+// the excerpt is left off it: it sits right under the cover there already.
+// A post with a `hero` gets it on the card in place of a product shot, so two
+// covers on the index are not the same beige rectangle with different words.
+function blogCards() {
+  const cards = {};
+  for (const file of readdirSync(POSTS).filter((f) => f.endsWith(".md")).sort()) {
+    const front = readFileSync(join(POSTS, file), "utf8").split(/^---\s*$/m)[1] ?? "";
+    const field = (key, optional = false) => {
+      const m = front.match(new RegExp(`^${key}:\\s*"?(.*?)"?\\s*$`, "m"));
+      if (!m && !optional) throw new Error(`${file}: front matter has no ${key}`);
+      return m?.[1];
+    };
+    const hero = field("hero", true);
+    cards[`blog/${file.slice(0, -3)}`] = {
+      kicker: field("category"), title: field("title"),
+      sub: `By ${field("author")} · ${field("readTime")} min read`,
+      ...(hero && { art: join(REPO, "site/blog", hero) }),
+    };
+  }
+  return cards;
+}
+
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/'/g, "&#39;");
+function wrap(text, max) {
+  const lines = []; let cur = "";
+  for (const w of text.split(" ")) {
+    if ((cur + " " + w).trim().length > max) { lines.push(cur.trim()); cur = w; } else cur += " " + w;
+  }
+  if (cur.trim()) lines.push(cur.trim());
+  return lines;
+}
+
+async function card(slug, { title, sub, shot, art, kicker, logo }) {
+  const withShot = Boolean(shot || art || logo);
+  const x = 72, y = 236;
+  const subLines = wrap(sub, withShot ? 36 : 62);
+  // Three lines fit under a three-line title with the footer still clear;
+  // a fourth runs into it, and a fourth line is a paragraph, not a subtitle.
+  if (subLines.length > 3) throw new Error(`${slug}: the line under the title runs to ${subLines.length} lines; shorten it`);
+  // The title steps down a size until the line under it clears the footer.
+  // Only the size was chosen before, from the line count, so a five-line
+  // post title put its byline on top of the footer, on the share card and on
+  // the post's cover in the blog index. A smaller size fits more characters
+  // per line, so each step re-wraps.
+  const chars = withShot ? 18 : 30;
+  const fits = (lines, size) =>
+    y + lines.length * size * 1.12 + 22 + (subLines.length - 1) * 34 <= FOOTER_Y - FOOTER_CLEARANCE;
+  let titleLines = wrap(title, chars);
+  let size = titleLines.length > 2 ? 54 : 64;
+  for (const step of TITLE_STEPS) {
+    if (fits(titleLines, size)) break;
+    size = step;
+    // Georgia bold's capitals run wide, so a step holds slightly fewer
+    // characters than the size ratio alone suggests.
+    titleLines = wrap(title, Math.round(chars * 54 / step * 0.95));
+  }
+  if (!fits(titleLines, size)) throw new Error(`${slug}: the title does not fit the card at ${size}px; shorten it`);
+  const subY = y + titleLines.length * size * 1.12 + 22;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">
+    <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff1e8"/><stop offset=".55" stop-color="#f7f4f0"/><stop offset="1" stop-color="#e9ecf5"/></linearGradient></defs>
+    <rect width="${W}" height="${H}" fill="url(#bg)"/>
+    <text x="${x}" y="112" font-family="Georgia, serif" font-size="44" fill="#0d0f1a">duct</text><circle cx="${x + 112}" cy="98" r="9" fill="#ff5c00"/>
+    ${kicker ? `<rect x="${x}" y="${y - size - 22}" width="22" height="3" rx="1.5" fill="#ff5c00"/><text x="${x + 32}" y="${y - size - 12}" font-family="Helvetica, Arial, sans-serif" font-size="19" font-weight="bold" letter-spacing="2.5" fill="#ff5c00">${esc(kicker.toUpperCase())}</text>` : ""}
+    ${titleLines.map((l, i) => `<text x="${x}" y="${y + i * size * 1.12}" font-family="Georgia, serif" font-size="${size}" font-weight="bold" fill="#0d0f1a" letter-spacing="-1">${esc(l)}</text>`).join("")}
+    ${subLines.map((l, i) => `<text x="${x}" y="${subY + i * 34}" font-family="Helvetica, Arial, sans-serif" font-size="24" fill="#4b5068">${esc(l)}</text>`).join("")}
+    <text x="${x}" y="${FOOTER_Y}" font-family="Helvetica, Arial, sans-serif" font-size="20" fill="#7a7f95">getduct.ai · open source · MIT</text>
+  </svg>`;
+  const layers = [];
+  if (shot) {
+    const sw = 600, sh = 470, left = W - sw + 70, top = H - sh + 70;
+    const crop = await sharp(join(MEDIA, shot)).resize({ width: 1180 }).extract({ left: 0, top: 0, width: sw, height: sh }).toBuffer();
+    const mask = Buffer.from(`<svg width="${sw}" height="${sh}"><rect width="${sw}" height="${sh}" rx="18" fill="#fff"/></svg>`);
+    const rounded = await sharp(crop).composite([{ input: mask, blend: "dest-in" }]).png().toBuffer();
+    const shadow = Buffer.from(`<svg width="${W}" height="${H}"><defs><filter id="s" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="18"/></filter></defs><rect x="${left}" y="${top + 20}" width="${sw}" height="${sh}" rx="18" fill="#0d0f1a" opacity=".22" filter="url(#s)"/></svg>`);
+    layers.push({ input: shadow, left: 0, top: 0 }, { input: rounded, left, top });
+  } else if (art) {
+    // An illustration is a composed picture, so it is shown whole in the
+    // bottom-right corner rather than cropped off the edge like a shot.
+    const aw = 520, left = W - aw - 48;
+    const img = await sharp(art).resize({ width: aw }).toBuffer();
+    const { height: ah } = await sharp(img).metadata();
+    const top = Math.round((H - ah) / 2);
+    const mask = Buffer.from(`<svg width="${aw}" height="${ah}"><rect width="${aw}" height="${ah}" rx="14" fill="#fff"/></svg>`);
+    const rounded = await sharp(img).composite([{ input: mask, blend: "dest-in" }]).png().toBuffer();
+    const shadow = Buffer.from(`<svg width="${W}" height="${H}"><defs><filter id="s" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="14"/></filter></defs><rect x="${left}" y="${top + 14}" width="${aw}" height="${ah}" rx="14" fill="#0d0f1a" opacity=".18" filter="url(#s)"/></svg>`);
+    layers.push({ input: shadow, left: 0, top: 0 }, { input: rounded, left, top });
+  } else if (logo) {
+    // A brand mark is not a picture to crop: it sits whole, centred on a tile.
+    const tile = 300, mark = 168, left = W - tile - 110, top = Math.round((H - tile) / 2);
+    const icon = await sharp(join(ICONS, logo), { density: 600 })
+      .resize({ width: mark, height: mark, fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } }).png().toBuffer();
+    const plate = Buffer.from(`<svg width="${W}" height="${H}"><defs><filter id="s" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="18"/></filter></defs><rect x="${left}" y="${top + 18}" width="${tile}" height="${tile}" rx="40" fill="#0d0f1a" opacity=".16" filter="url(#s)"/><rect x="${left}" y="${top}" width="${tile}" height="${tile}" rx="40" fill="#fff"/></svg>`);
+    layers.push({ input: plate, left: 0, top: 0 }, { input: icon, left: left + (tile - mark) / 2, top: top + (tile - mark) / 2 });
+  }
+  const out = join(OUT, slug.replace("/", "-") + ".jpg");
+  await sharp(Buffer.from(svg)).composite(layers).jpeg({ quality: 84, mozjpeg: true }).toFile(out);
+  const size_ = statSync(out).size;
+  if (size_ > LIMIT) throw new Error(`${out} is ${Math.round(size_ / 1024)} KB, over the 150 KB budget`);
+  return size_;
+}
+
+const ALL = { ...PAGES, ...blogCards() };
+let total = 0;
+for (const [slug, spec] of Object.entries(ALL)) total += await card(slug, spec);
+console.log(`${Object.keys(ALL).length} cards in site/assets/og, ${Math.round(total / 1024)} KB together`);

@@ -1,0 +1,366 @@
+// Agent streams for the mock backend, built from the story so the session
+// screenshots tell the same week as the component ones. The shape mirrors
+// app/src/lib/__fixtures__/*.json: one object per SSE frame, with two escape
+// hatches the mock understands — `{ __answer__ }` answers the pending
+// question, `{ __send__ }` is the user typing the next message.
+import { readFileSync } from "node:fs";
+import * as story from "../../app/src/lib/__fixtures__/solo-story.mjs";
+import * as content from "./routes/content.mjs";
+import * as library from "./routes/library.mjs";
+import * as onboarding from "./routes/onboarding.mjs";
+import * as settings from "./routes/settings.mjs";
+import * as toolbox from "./routes/toolbox.mjs";
+import { ANSWERS, AUDIT_REPORT, BRIEF_HTML, CHANGE_SET, CHANGE_SET_HISTORY, CONNECTOR_SESSIONS, DRAFT_POST, MEMORIES, PAID_BRIEF_HTML, PLAN, PRODUCT_BRIEF_HTML, PRODUCT_CHANGE_SET, STORY } from "../../app/src/lib/__fixtures__/solo-story.mjs";
+
+// The backend's slide CSS, rendered once from agents/content/templates.py
+// (see assets/slides-head.html for how). The live slide preview reads its
+// styles out of slides_html, so a draft without it renders unstyled.
+const SLIDES_HEAD = readFileSync(new URL("./assets/slides-head.html", import.meta.url), "utf8");
+const slidesHtml = () => `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n${SLIDES_HEAD}\n</head>\n<body>\n</body>\n</html>`;
+
+const usage = (input, output) => ({
+  event: "token_usage",
+  input_tokens: input, output_tokens: output, cache_read_tokens: Math.round(input * 0.6), cache_creation_tokens: 0,
+  total_tokens: input + output, model: "claude-sonnet-5-5", context_window: 200000, scope: "thread",
+});
+const step = (id, label, connector) => [
+  { event: "step_started", step_id: id, label, status: "running" },
+  { event: "step_finished", step_id: id, label, status: "success", ...(connector ? { connector_id: connector } : {}) },
+];
+const say = (text) => ({ event: "agent_message_chunk", text });
+// A memory's id is its place in the story, so it is stable and unique; the
+// digits of the slug were neither (every slug without one got the same id).
+const memoryId = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+const recall = (ids) => ids.map((id) => {
+  const at = MEMORIES.findIndex((x) => x.id === id);
+  return { id, memory_id: memoryId(at + 1), title: MEMORIES[at].title, kind: MEMORIES[at].kind };
+});
+
+export function insightsFrames() {
+  const m = (id) => MEMORIES.find((x) => x.id === id);
+  const recalled = recall(["mem-cpa", "mem-legacy", "mem-android"]);
+  const range = `${STORY.week.start} → ${STORY.week.end}`;
+  return [
+    { event: "pipeline_started", status: "running", autonomy: "ask", autonomy_configured: "assisted" },
+    { event: "memory_recalled", memories: recalled },
+    { event: "todo_update", todos: [
+      { content: "Pull Ads, GA4, Stripe and Clarity for the week", status: "in_progress" },
+      { content: "Compare the PMax cohort against organic", status: "pending" },
+      { content: "Write the brief and propose changes", status: "pending" },
+    ] },
+    ...step("collect_source_data:google_ads", `google ads campaigns · ${range}`, "google_ads"),
+    ...step("collect_source_data:ga4", `ga4 retention by acquisition source · ${range}`, "ga4"),
+    ...step("collect_source_data:stripe", `stripe subscriptions · ${range}`, "stripe"),
+    ...step("collect_source_data:clarity", `clarity rage clicks · ${range}`, "clarity"),
+    { event: "thinking_chunk", text: "ROAS is up but signups are down. " },
+    { event: "thinking_chunk", text: "Split retention by campaign before saying anything." },
+    say("One thing before I write this up."),
+    { event: "questions_required", interrupt_id: "int_solo_1", questions: [
+      { question: "Which matters more this week?", header: "Goal", options: [
+        { label: "Signups", description: "Hit 900 signups, retention second" },
+        { label: "Retention", description: "Keep the signups that stay" },
+      ] },
+    ] },
+    { event: "message_stop" },
+    usage(41200, 900),
+    { __answer__: { "Which matters more this week?": "Retention" } },
+    { event: "todo_update", todos: [
+      { content: "Pull Ads, GA4, Stripe and Clarity for the week", status: "completed" },
+      { content: "Compare the PMax cohort against organic", status: "completed" },
+      { content: "Write the brief and propose changes", status: "in_progress" },
+    ] },
+    ...step("verify", "verification sub-agent · re-checking 6 numbers"),
+    say("Retention it is. **ROAS is up 14%, and that is the problem:** the campaign driving it brings in Android users who leave within a week. The brief is on the right. One change to approve below."),
+    { event: "artifact_version", version_id: 1, label: "Version 1", payload: { title: `Signups brief · ${STORY.week.label}`, format: "html", content: BRIEF_HTML } },
+    { event: "execution_proposed", change_set: CHANGE_SET },
+    { event: "memory_written", memories: [
+      { id: "mem-clarity", memory_id: "00000000-0000-4000-8000-000000000099", title: m("mem-clarity").title, kind: "watch" },
+    ] },
+    say(" The Legacy brand campaign stays untouched, as you asked in August."),
+    { event: "message_stop" },
+    usage(68400, 2100),
+    { event: "pipeline_finished", status: "success" },
+    { __send__: "How long has the Android retention been like this?" },
+    say("Since the cohort that started on 4 Sep, two days after the onboarding rebuild. The cohorts before the rebuild retained at 49%, so this is new, and it lines up with the Connect bank rage clicks. I would fix the screen before turning PMax back on."),
+    { event: "message_stop" },
+    usage(74900, 600),
+  ];
+}
+
+// A source with an entity is a pull the way the agent reports one now: a
+// tool_activity row, started then finished under one id, which the app draws
+// with the connector's logo. The older sessions' labelled steps stay steps.
+const pulls = (list) => list.flatMap((s, i) => s.entity ? [
+  { event: "tool_activity", activity_id: `pull_${i}_${s.entity}`, tool: "FetchData", kind: "data", status: "running", title: s.entity, source: s.id, meta: { date_from: s.from, date_to: s.to } },
+  { event: "tool_activity", activity_id: `pull_${i}_${s.entity}`, tool: "FetchData", kind: "data", status: "success", title: s.entity, source: s.id, meta: { date_from: s.from, date_to: s.to } },
+] : step(`collect_source_data:${s.id}:${i}`, s.label, s.id));
+const sources = (key) => pulls(ANSWERS[key].sources);
+
+// The same week asked from the product side: not "why are signups down" but
+// "why did activation drop". Same rebuild, same rage clicks, same Android
+// cohort; what it proposes is two GA4 key events, not a paused campaign.
+export function productFrames() {
+  const a = STORY.numbers.activation;
+  return [
+    { event: "pipeline_started", status: "running", autonomy: "ask", autonomy_configured: "assisted" },
+    { event: "memory_recalled", memories: recall(["mem-android", "mem-clarity", "mem-pref"]) },
+    { event: "todo_update", todos: [
+      { content: "Pull GA4 funnels, Clarity and Stripe either side of 2 Sep", status: "in_progress" },
+      { content: "Split activation by platform and cohort", status: "pending" },
+      { content: "Write it up and propose what to track", status: "pending" },
+    ] },
+    ...sources("product"),
+    { event: "thinking_chunk", text: "iOS is flat. Android moved the day the rebuild shipped. " },
+    { event: "thinking_chunk", text: "Check the Connect bank step before blaming the release as a whole." },
+    say("One thing before I split this."),
+    { event: "questions_required", interrupt_id: "int_solo_2", questions: [
+      { question: "Which step counts as activated?", header: "Activation", options: [
+        { label: "Connect bank", description: "The step the rebuild moved" },
+        { label: "First budget", description: "The first moment the app is useful" },
+      ] },
+    ] },
+    { event: "message_stop" },
+    usage(38700, 800),
+    { __answer__: { "Which step counts as activated?": "Connect bank" } },
+    { event: "todo_update", todos: [
+      { content: "Pull GA4 funnels, Clarity and Stripe either side of 2 Sep", status: "completed" },
+      { content: "Split activation by platform and cohort", status: "completed" },
+      { content: "Write it up and propose what to track", status: "in_progress" },
+    ] },
+    ...step("verify", "verification sub-agent · re-checking 5 numbers"),
+    say(`Connect bank it is. ${ANSWERS.product.answer} The brief is on the right.`),
+    { event: "artifact_version", version_id: 1, label: "Version 1", payload: { title: `Activation brief · ${STORY.week.label}`, format: "html", content: PRODUCT_BRIEF_HTML } },
+    { event: "execution_proposed", change_set: PRODUCT_CHANGE_SET },
+    { event: "memory_written", memories: [
+      { id: "mem-activation", memory_id: "00000000-0000-4000-8000-000000000098", title: `Android activation dropped to ${a.androidAfter} after the 2 Sep rebuild; the permission prompt is the cause`, kind: "conclusion" },
+    ] },
+    say(" The fix is in the app, not the funnel: ask for the permission after the first budget, not before it."),
+    { event: "message_stop" },
+    usage(61200, 1700),
+    { event: "pipeline_finished", status: "success" },
+    { __send__: "Did iOS move at all?" },
+    say(`No. iOS activation was ${a.iosBefore} the fortnight before and ${a.iosAfter} since, inside its usual week-to-week range. The permission prompt only exists on Android, so the rest of the rebuild looks fine.`),
+    { event: "message_stop" },
+    usage(66900, 500),
+  ];
+}
+
+// The same week asked from the paid side: where is the budget leaking. Same
+// change set as the signups session, reached from the spend rather than the
+// retention.
+export function paidFrames() {
+  const n = STORY.numbers;
+  return [
+    { event: "pipeline_started", status: "running", autonomy: "ask", autonomy_configured: "assisted" },
+    { event: "memory_recalled", memories: recall(["mem-cpa", "mem-legacy", "mem-brief"]) },
+    { event: "todo_update", todos: [
+      { content: "Pull spend, search terms and conversions for the week", status: "in_progress" },
+      { content: "Cost every campaign against the €12 target", status: "pending" },
+      { content: "Propose the moves", status: "pending" },
+    ] },
+    ...sources("paid"),
+    { event: "thinking_chunk", text: "PMax is €7.40 over target and brand search is €3.30 under. " },
+    { event: "thinking_chunk", text: "Read the search terms before touching budgets." },
+    say("One thing before I move anything."),
+    { event: "questions_required", interrupt_id: "int_solo_3", questions: [
+      { question: "What do you want to protect this week?", header: "Priority", options: [
+        { label: "The €12 CPA", description: "Cut what runs over it" },
+        { label: "Signup volume", description: "Hold 900 signups, cost second" },
+      ] },
+    ] },
+    { event: "message_stop" },
+    usage(39900, 850),
+    { __answer__: { "What do you want to protect this week?": "The €12 CPA" } },
+    { event: "todo_update", todos: [
+      { content: "Pull spend, search terms and conversions for the week", status: "completed" },
+      { content: "Cost every campaign against the €12 target", status: "completed" },
+      { content: "Propose the moves", status: "in_progress" },
+    ] },
+    ...step("verify", "verification sub-agent · re-checking 6 numbers"),
+    say(`The CPA it is. ${ANSWERS.paid.answer} The brief is on the right.`),
+    { event: "artifact_version", version_id: 1, label: "Version 1", payload: { title: `Spend brief · ${STORY.week.label}`, format: "html", content: PAID_BRIEF_HTML } },
+    { event: "execution_proposed", change_set: CHANGE_SET },
+    { event: "memory_written", memories: [
+      { id: "mem-terms", memory_id: "00000000-0000-4000-8000-000000000097", title: "Watch PMax search terms weekly for template hunters", kind: "watch" },
+    ] },
+    say(" The Legacy brand campaign stays untouched, as you asked in August."),
+    { event: "message_stop" },
+    usage(64300, 1900),
+    { event: "pipeline_finished", status: "success" },
+    { __send__: "What do we lose by pausing PMax?" },
+    say(`About 110 signups a week at this week's rate, and 69% of those are gone by day 7. Brand search at €60 a day buys about 48 a week at €${n.brandCpa}, and half of those stay.`),
+    { event: "message_stop" },
+    usage(70100, 550),
+  ];
+}
+
+// One session per connector page (CONNECTOR_SESSIONS): the same shape as the
+// three above, told from that connector's question. A change set only where
+// Duct can act on the tool; the rest end on the answer and what to do by hand.
+export function connectorFrames(s, i) {
+  const todos = (done) => s.todos.map((content, k) => ({ content, status: k < done ? "completed" : k === done ? "in_progress" : "pending" }));
+  const ask = s.ask;
+  return [
+    { event: "pipeline_started", status: "running", autonomy: "ask", autonomy_configured: "assisted" },
+    { event: "memory_recalled", memories: recall(s.recalled) },
+    { event: "todo_update", todos: todos(0) },
+    ...pulls(s.sources),
+    ...s.thinking.map((text) => ({ event: "thinking_chunk", text })),
+    say("One thing before I go on."),
+    { event: "questions_required", interrupt_id: `int_${s.shot}`, questions: [
+      { question: ask.question, header: ask.header, options: ask.options },
+    ] },
+    { event: "message_stop" },
+    usage(36000 + i * 900, 800),
+    { __answer__: { [ask.question]: ask.pick } },
+    { event: "todo_update", todos: todos(2) },
+    ...step("verify", `verification sub-agent · re-checking ${s.verify} numbers`),
+    say(s.answer),
+    { event: "artifact_version", version_id: 1, label: "Version 1", payload: { title: `${s.brief.title} brief · ${STORY.week.label}`, format: "html", content: s.brief.html } },
+    ...(s.change_set ? [{ event: "execution_proposed", change_set: s.change_set }] : []),
+    { event: "memory_written", memories: [{ id: `mem-${s.shot}`, memory_id: memoryId(100 + i), title: s.memory.title, kind: s.memory.kind }] },
+    say(` ${s.close}`),
+    { event: "message_stop" },
+    usage(58000 + i * 1100, 1800),
+    { event: "pipeline_finished", status: "success" },
+  ];
+}
+
+// The content agent drafting one post from the plan: the carousel for day 3,
+// six slides, the first image already in. It stops there, mid-run, with the
+// other five waiting for a go-ahead — that is the moment the screenshot wants.
+export function contentFrames() {
+  const day = PLAN.days[DRAFT_POST.day_index];
+  const withoutImage = { ...DRAFT_POST, slides: DRAFT_POST.slides.map((s) => ({ ...s, image_url: "", image_prompt_used: "" })) };
+  return [
+    { event: "pipeline_started", status: "running", channel: "tiktok", channel_supported: true, channel_label: "TikTok" },
+    ...step("load_project", "Loading Solo"),
+    { event: "step_started", step_id: "enriching", label: "Reading the plan and the last 30 posts", status: "running" },
+    ...step("dispatch_subagent:research_pillar", "Sub-agent · how freelancers talk about tax money"),
+    { event: "step_finished", step_id: "enriching", status: "success" },
+    { event: "todo_update", todos: [
+      { content: `Draft day 3 · ${day.topic}`, status: "completed" },
+      { content: "Render the first slide", status: "in_progress", activeForm: "Rendering the first slide" },
+      { content: "Generate the other three images, one at a time", status: "pending" },
+    ] },
+    { event: "thinking_chunk", text: "Tax posts did best in August. Lead with the rule, not the fear." },
+    say(`Day 3, *${day.topic}*. Six slides: the rule, why 12%, the one account that makes it stick, and a save prompt for the 25th.`),
+    { event: "post_draft_updated", payload: { ...withoutImage, slides_html: slidesHtml() } },
+    ...step("generate_image:slide-01", "Image · slide 1 of 6"),
+    { event: "post_draft_updated", payload: { ...DRAFT_POST, slides_html: slidesHtml() } },
+    say(" Slide 1 is in so you can see the look. Three more images to go: say the word, or change the hook first."),
+    { event: "message_stop" },
+    usage(23800, 3400),
+    { __send__: "Go ahead" },
+  ];
+}
+
+// A recorded run's frames, from app/src/lib/__fixtures__.
+const recorded = (name) => JSON.parse(readFileSync(new URL(`../../app/src/lib/__fixtures__/${name}`, import.meta.url), "utf8"));
+
+// The recorded audit run with the story's report as its first version, in
+// the shape the backend emits (agents/audit/v1/runner.py: AuditReport's
+// model_dump). The recording's version carries only the URL, so without the
+// swap the report pane says "Working on your report" forever.
+export function auditFrames() {
+  const report = {
+    url: AUDIT_REPORT.url,
+    generated_at: AUDIT_REPORT.generated_at,
+    update_label: "Initial audit",
+    executive_summary: AUDIT_REPORT.key_signals.join(" · "),
+    report_mode: "template",
+    structured_data: AUDIT_REPORT,
+  };
+  return recorded("audit-run.json").map((frame) => (frame.event === "artifact_version" ? { ...frame, payload: report } : frame));
+}
+
+// A plan session (mode plan_month) over the story's plan: the recorded run,
+// whose plan_generated carries an empty September, with the plan the board
+// shows in its place, so the session and the board are the same week.
+export function planFrames() {
+  const plan = content.routes(story)[`GET /api/content/plans/${PLAN.id}`];
+  return recorded("content-plan.json").map((frame) => (frame.event === "plan_generated" ? { ...frame, payload: plan } : frame));
+}
+
+// A change set as GET /api/execute/{id} returns it. ChangeSetCard re-reads
+// its row as it mounts, and the mock's catch-all `[]` has no status, so a
+// card without its row here throws.
+const apiRow = (cs) => ({
+  ...cs,
+  changes: cs.changes.map((c) => ({
+    id: c.id, op_type: c.op_type, status: c.status, summary: "",
+    preview: { diff: c.diff, warnings: c.warnings || [] },
+    guardrail_violations: c.guardrail_violations || [],
+  })),
+});
+const PROPOSED = [CHANGE_SET, PRODUCT_CHANGE_SET, ...CONNECTOR_SESSIONS.map((s) => s.change_set).filter(Boolean)];
+
+// GET …/memory as the backend answers it: newest first, the kinds present.
+function memoryList(rows) {
+  const items = [...rows].sort((a, b) => (a.observed_at < b.observed_at ? 1 : -1));
+  return { items, kinds: [...new Set(items.map((m) => m.kind))], memory_paused: false };
+}
+
+// The project as the app keeps it in localStorage (lib/projects.js), every
+// section filled; a signed-in capture stores this, or Project context draws
+// empty fields.
+export function project() {
+  return settings.projectProfile(story);
+}
+
+// Ids the story does not name but a screen opens: the design canvas's
+// document and post pages (design/tools/screens.mjs).
+export const SHOWCASE = Object.freeze({
+  artifactId: library.SHOWCASE_ARTIFACT_ID,
+  // Posted, with synced numbers and a review score (routes/content.mjs).
+  postedPostId: "post_1",
+});
+
+// What the app asks the backend for, answered from the story so every screen
+// draws Solo's week rather than an empty state. Each area's routes live in
+// routes/<area>.mjs with the backend handler each shape follows; the few
+// below are the ones the session screenshots needed first.
+export function routes() {
+  return {
+    ...content.routes(story),
+    ...library.routes(story),
+    ...onboarding.routes(story),
+    ...settings.routes(story),
+    ...toolbox.routes(story),
+    ...Object.fromEntries(PROPOSED.map((cs) => [`GET /api/execute/${cs.id}`, apiRow(cs)])),
+    "GET /api/providers/status": {
+      chatgpt_auth_enabled: true,
+      providers: [
+        { id: "openai", source: "subscription", reachable: true, stored: false },
+        { id: "anthropic", source: "user", reachable: true, stored: true },
+      ],
+    },
+    "GET /api/user/projects": [
+      { id: STORY.project.id, name: STORY.project.name, url: `https://${STORY.company.site}`, profile: { company: { name: STORY.company.name, industry: STORY.company.industry } } },
+    ],
+    // The inventory's vocabulary (lib/dataSources.js): "bound" is a source this
+    // project reads. "connected" is not a status, and read as none connected.
+    [`GET /api/user/projects/${STORY.project.id}/data-sources`]: [
+      { connector_id: "google_ads", connector_type: "google_ads", status: "bound", account_name: STORY.ads.accountName },
+      { connector_id: "ga4", connector_type: "ga4", status: "bound", account_name: "Solo web + app" },
+      { connector_id: "gsc", connector_type: "gsc", status: "bound", account_name: STORY.company.site },
+      { connector_id: "stripe", connector_type: "stripe", status: "bound", account_name: "Solo" },
+      { connector_id: "clarity", connector_type: "clarity", status: "bound", account_name: "Solo Android" },
+    ],
+    "GET /api/content/plans": [{ id: PLAN.id, name: PLAN.name, start_date: PLAN.start_date }],
+    // Both memory tabs, so check:layout measures them with rows on screen.
+    [`GET /api/user/projects/${STORY.project.id}/memory`]: memoryList(MEMORIES),
+    "GET /api/user/memory": memoryList([
+      { id: "pm-1", kind: "communication", status: "confirmed", title: "Give me the number first, then the why", body: "", source_type: "user", recorded_at: "2026-09-12T09:00:00Z", observed_at: "2026-09-12", source_refs: [] },
+      { id: "pm-2", kind: "tooling", status: "proposed", title: "Trusts GA4 over the Ads conversion count", body: "", source_type: "agent", recorded_at: "2026-09-10T09:00:00Z", observed_at: "2026-09-10", source_refs: [] },
+    ]),
+    // The Executions page: this week's proposal on top of what already went through.
+    "GET /api/execute": [CHANGE_SET, ...CHANGE_SET_HISTORY],
+    "GET /api/execute/ops": [
+      { op_type: "pause_campaign", destructive: true },
+      { op_type: "add_negative_keywords", destructive: false },
+      { op_type: "set_campaign_budget", destructive: false },
+      { op_type: "mark_key_event", destructive: false },
+    ],
+  };
+}

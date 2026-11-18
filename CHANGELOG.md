@@ -1,0 +1,662 @@
+# Changelog
+
+Notable changes to Duct. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+The version numbers here are the **desktop shell's** (`desktop/src-tauri/tauri.conf.json`),
+which is what the updater and the GitHub releases are cut against. The backend
+and app deploy continuously from `main` and are not versioned separately.
+
+So `[Unreleased]` means *not in a desktop release yet*, not *not shipped*: a
+backend or app entry can sit here while users have been running it in production
+for weeks. `site/changelog/` is the user-facing record and dates each entry by
+when it shipped, which is why the two can disagree about timing without either
+being wrong.
+
+`.github/scripts/release-notes.mjs` reads the section matching the version being
+released and puts it at the top of the GitHub release, so an entry written here
+is the entry users see. **Write the section in the pull request that bumps the
+version**, not after: `desktop-release.yml` runs
+`python3 scripts/check_changelog_sync.py --version X.Y.Z` before any platform
+builds and refuses a version with no section, because 0.5.0 and 0.7.0 were both
+published without one. The same script, with no arguments, holds
+`site/changelog/` to the newest section here and runs in `make check-site`.
+
+## [Unreleased]
+
+### Added
+
+- **A launch check for your coding agent.** `npx skills add authrain-cloud-abdullahformuli/duct`
+  installs the `launch-check` skill into Claude Code, Codex, Cursor or any
+  agent that reads skills. It reads up to ten live pages and the repository
+  behind them, checks whether the analytics tag ships and the one conversion
+  event is sent, scores the launch out of 100 and writes three ranked fixes to
+  `duct-launch-check.md`, applying a diff only on a yes. No account, no call to
+  Duct. The twelve contributor skills are marked internal, so the install
+  offers only this one (#536).
+- **The launch check as a Claude Code and Codex plugin.** `/plugin marketplace
+  add authrain-cloud-abdullahformuli/duct` in Claude Code, or `codex plugin marketplace add
+  authrain-cloud-abdullahformuli/duct` in Codex, installs the same skill from Duct's own catalogue,
+  ready for the Claude directory. The skill now runs a pinned `getduct@0.1.1`
+  instead of `@latest`, so what a directory reviewed is what runs.
+- **`npx getduct`, the launch check's engine and its score card.**
+  `npx getduct check yoursite.com` runs the 22 live checks of the launch
+  checklist with fixed thresholds in about ten seconds, with no account and no
+  dependencies, so the same site scores the same every time. `npx getduct
+  card` draws a 1200x630 card to post: the score, the three fixes, the date.
+  The skill now calls both, and does the live checks by hand where Node is
+  missing (#536).
+- **Duct speaks Simplified Chinese.** The interface, the site under `/zh-cn/`
+  and a Chinese README, machine-translated against the glossary, which now
+  pins every product term for `zh-CN` and renders "agent" as 智能体 rather than
+  代理, the word for a proxy. A native speaker's pass is #537.
+- **Duct asks for a GitHub star, rarely and only after it helped.** After a
+  third run that made something, once a run has ended and never on the first
+  day, a corner card offers "Star on GitHub" beside "Something missing? Tell
+  us". At most twice ever, 60 days apart, never again after a star; any other
+  notice takes the corner first. The account menu always has "Star Duct on
+  GitHub" (#539).
+
+### Changed
+
+- **The cookie bar and the privacy policy name Google Analytics.** Cloudflare's
+  Google tag gateway kept adding Google Tag Manager and GA4 at the edge after
+  they left this repository, on the site, in the web app and in the desktop
+  window, whatever a visitor chose. They stay, and both now say so. The bar's
+  "no ad targeting" line is gone, because these tags also reach Google's
+  advertising services.
+
+### Fixed
+
+- **GA4 recognises a returning visitor.** The site deleted `_ga` and `_gcl_au`
+  on every page load, so GA4 read nearly every visitor as new.
+- **The privacy page fits a phone in German.** Its one-word heading pushed the
+  page wider than the screen.
+
+## [0.7.3] — 2026-11-05
+
+The desktop app signs in again on macOS and Linux. Around it: one searchable Toolbox
+for every connector and MCP server, your coding agent signing in to Duct
+from the browser, and models from your own Ollama or any OpenAI-compatible
+server.
+
+### Fixed
+
+- **Desktop: sign-in on macOS and Linux.** 0.7.2 opened the sign-in security
+  check in the browser and reported "Security check failed to load", so the
+  downloaded app could not sign in. The shell's navigation guard was treating
+  the check's frame as a page to open outside; it now loads where it belongs.
+
+### Added
+
+- **Toolbox: one searchable catalogue.** Connections is now Toolbox: native
+  connectors and MCP servers in one list, a search that also asks the MCP
+  Registry, and a way in for any server by its address when nothing matches.
+  A connected server that needs attention says why on its tile, and a tenant
+  of a platform is never labelled as the vendor's own server.
+- **Connect your AI agent.** Claude Code, Codex, Cursor, VS Code or OpenCode
+  can use Duct's MCP server by signing in through the browser: one line to
+  paste, no secret in it, and a consent page that names the agent asking.
+- **Content Studio: a drafts queue and a plan for any period.** Waiting
+  drafts gather in one queue and approve onto the channel's best slot, the
+  Plan tab plans the month, one or two weeks, or thirty days ahead, and a
+  project's own writing samples and voice rules shape its text posts.
+- **Post through Zernio or PostBridge, whichever you connect.** Social
+  schedulers are connectors now, and none is on by default. Zernio adds whole
+  threads on X and Threads, a first comment on LinkedIn, Instagram and
+  Facebook, and numbers from LinkedIn and X. Accounts, Analytics and Discover
+  open on a page saying what they do and what unlocks them, not on an error.
+- **Local models on your own Ollama.** A self-hosted Duct pointed at an Ollama
+  server runs on any model pulled there that can call tools, with no key and
+  no bill: pick one for a tier like any other model. Duct asks Ollama for a
+  context long enough for its prompts, where Ollama's own default would cut
+  them short.
+- **Mail through any SMTP server.** A self-hosted Duct sends invitations and
+  audit reports through its own mail server or any provider's SMTP relay, and
+  Mailpit catches local mail so a flow can be read as it would arrive. Resend's
+  dedicated integration is gone; Resend accepts SMTP too.
+- **Bring your own provider.** Connect any host or server that speaks
+  OpenAI's API from Settings, from Together, Fireworks, Groq or DeepInfra to
+  vLLM, llama.cpp or LM Studio. Duct lists the server's models, you pick which
+  ones it may use, and it checks the first one really calls tools before
+  saving. Off your own network the address has to be public and https.
+
+### Changed
+
+- **Every screen on one page frame.** Home arranges what the agent wrote into
+  fixed slots, the top bar takes the page title over once it scrolls away,
+  and the account menu is five groups with a profile that fills itself in.
+- **New Google Ads keywords always wait for you.** A project set to assisted
+  or auto could add keywords without a click; a new keyword goes live enabled,
+  so it spends before anyone looks, and undo removes it but not the money.
+  Keywords now wait for approval like budgets, bids and pauses do. On assisted
+  and auto, negative keywords still apply on their own.
+
+### Removed
+
+- **Google Tag Manager and GA4, from this repository's site and web app code.**
+  Correction: this did not take them out of production, because Cloudflare's
+  Google tag gateway kept adding them at the edge, and they stay.
+
+## [0.7.2] — 2026-10-29
+
+Pages that arrive drawn, conversations that stay fast however long they get,
+and a desktop shell that fits a small laptop, zooms on a 4K screen and updates
+on Windows without asking for admin.
+
+
+### Added
+
+- **Desktop: zoom.** View has Zoom In, Zoom Out and Actual Size on the
+  browser's ladder, so 14 px text on a 4K screen at 100% scaling can grow.
+- **GitHub connector, through a GitHub App.** Commits, merged pull requests,
+  closed issues, releases and changed docs for the window asked, so Insights
+  can test "did the drop start with a change we shipped?". Each pull mints a
+  one-hour token narrowed to one repository and four read permissions; an
+  installation id is never read from a request. A self-hosted install falls
+  back to a fine-grained token on the same card.
+- **Content Studio makes video** with Veo 3.1 (Gemini API) and Seedance
+  (OpenRouter) on the user's key, Lite and Mini by default because a clip
+  costs dollars. Every render is kept as a take, billed as media usage,
+  capped at three a turn, and shown with its cost.
+- **X and LinkedIn text posts** in Content Studio, drafted on their own
+  prompt and edited in a feed-shaped editor (per-part limits, LinkedIn's
+  fold, threaded replies). One rules table per channel serves the writer,
+  both publish paths, the review and the app.
+- **Onboarding reads your documents beside your website.** Add up to five
+  files (PDF, Word, PowerPoint, Markdown or text) when Duct confirms your
+  site, and the project is drafted from both: personas, competitors and
+  pitch marked "From your files". One call on your own model; the file is
+  never kept, and a field you set yourself is never replaced.
+- **Set up a project from your own AI agent.** Create a token under Connect
+  your AI agent, paste one line into Claude Code, Codex or Cursor, and ask it
+  to set up the product. It reads your README and docs on your own
+  subscription and drafts the project, marked "From your files". It can read
+  and draft; it cannot approve changes, connect tools, or replace a field you
+  set. Every draft shows in Activity.
+
+### Changed
+
+- **Pages render on the server.** The gate that waits for the desktop shell
+  to name its backend holds hydration, not the HTML, so the front door and
+  onboarding arrive drawn instead of "Starting Duct…" while 300–600 KB of
+  script loads. A pre-paint session hint keeps a signed-in member from seeing
+  the front door on the way into the app.
+- **Long sessions stop slowing down with their length.** A settled reply no
+  longer re-renders on every streamed token, a brief beside the chat stops
+  re-parsing with it, a brief being written re-parses ten times a second, and
+  the artifact library fills its cards as they near the screen.
+- **Charts, code themes and slide capture load on first use**, behind a
+  placeholder of the same size: about a quarter less script on an Insights
+  thread and a sixth less on Content Studio.
+- **Windows installs per user.** Updates no longer raise an admin prompt.
+  The first update from a per-machine install retires it with one last
+  prompt and keeps the Start menu and desktop shortcuts.
+- The desktop window checks its connection only while it is visible.
+- **Claude Haiku 5.5 is Anthropic's Light rung**, replacing Haiku 4.5: a
+  tenth of the price up to a 100k-token prompt, a 1M window, and the same
+  effort dial as Opus 5.5. A saved pick of Haiku 4.5 moves with it.
+- **Default models move a generation:** Claude Opus 5.5 and Sonnet 5.5,
+  GPT-6.1 Sol, Grok 4.7, DeepSeek V4.1 Flash and V4 Pro 0813 on OpenRouter.
+  A retired id moves a saved pick to its successor, never up a price class.
+- **GA4 data quality reaches the agent.** Thresholding, sampling, the
+  "(other)" row and truncated dates become `data_quality` sentences ahead
+  of the rows, so a brief no longer quotes a partial report as the window.
+- **A change set names its connector** from the connections table, and the
+  destructive footer says the step always waits for a person and can be
+  rolled back.
+- Brand and product names stay in English in every language, enforced by
+  `fill.py`; a native review fixed about 230 Spanish and German strings.
+- **The working panel tells the time, not a story.** The "~3 min" and the
+  bar that filled over three minutes on a timer are gone from the audit and
+  content viewports and the audit's step ladder. The panel counts the run's
+  seconds on the same clock as the chat header, and the audit's synthesis
+  row says how many categories are done once it knows.
+
+### Fixed
+
+- **The cookie bar no longer crashes the page that asks.** It rendered outside
+  the translation provider, so every first-time visitor asked about cookies
+  (the EEA, the UK, Switzerland) got "This page couldn't load", and the root
+  error page crashed the same way.
+- The desktop window opens centred and on screen at 1366×768 and 1280×800;
+  Linux no longer shows a blank window on NVIDIA and paints its splash before
+  registering deep links; About sits under Help on Windows and Linux, and the
+  splash has no menu bar; the `.deb` no longer depends on an unused tray
+  library.
+- Phones to 4K: safe areas apply once, so full-screen views fit a notched
+  iPhone; the split view waits until both panes fit; Enter no longer sends in
+  the middle of Japanese, Chinese or Korean composition; replies keep a
+  reading width, long URLs wrap and tabs scroll on phones; grids grow at 2560
+  and 3840 px. The page learns its platform before first paint, so Linux drops
+  backdrop blur and the desktop window stops rubber-banding.
+- **Project selection stays in its tab.** Switching projects in another tab no longer retargets the work in the current tab.
+
+- The desktop app keeps painting while it reads the keychain, a reload no
+  longer pulls the window back in front of whatever you switched to, a
+  sign-in link that launched the app on Windows or Linux is followed, and
+  a self-host build's local backend ends with the app however the app ends.
+- **Where a drafted field came from follows the project to every device.**
+  "From your site" and "From your files" used to live in the browser that
+  drafted them; the server keeps them now and merges every draft itself, so
+  a second device sees the same chips and an older copy saving cannot undo
+  a newer draft or overwrite what you typed.
+- A scheduled PostBridge post follows edits and deletes made in Duct, links
+  on X move to the reply PostBridge keeps them in, and its validation
+  errors read as one sentence.
+- A ChatGPT plan's mid-stream failures are classified by payload code, so a
+  spent usage window says so and transient ones retry.
+- **The composer keeps a half-written message through a reload**, Esc in it
+  stops a running turn, and the context ring's tooltip says what the last
+  call and the session cost — a dash where the model has no price.
+- Failure messages, system notifications and the posture badge follow the
+  interface language; they were English in every language, and the badge
+  showed the raw `ask` / `assisted` / `auto` value instead of the dial's word.
+
+### Security
+
+- Signing in to a connected MCP server is held to the server you typed: if
+  its metadata names another address as the resource, or another issuer than
+  the one it was found at, the sign-in stops instead of minting a token in
+  that name.
+- The desktop window only ever shows Duct: a page that sends it elsewhere
+  opens in your browser instead, a sign-in or connector code returning
+  through a deep link always lands on Duct's own origin, and the page can
+  call nothing in the shell beyond its own commands.
+- The insight chat and audit web search spend the caller's model keys, and
+  PostBridge and Apify run on each user's saved key, not the operator's.
+- Routes that run before sign-in or for a guest are rate limited on the real
+  client address, with live runs capped per user.
+- Security headers on every site page, app response and API response.
+- The desktop app loads no tag container. Its keychain bridge trusts every
+  script on the page, and a container exists to run scripts configured
+  elsewhere; the Preferences switch now governs crash reports alone.
+- Every app page names where its scripts may come from: this origin, the
+  sign-in bot check and, in a browser, the tag container. A script from
+  anywhere else is refused, and so is `eval`.
+
+## [0.7.1] — 2026-09-28
+
+The app in five languages, briefs that quote numbers Duct computed rather than
+numbers the model added up, and an approval that applies once and only to what
+was approved.
+
+### Added
+
+- **The interface speaks Spanish, Brazilian Portuguese, German and Japanese.**
+  Every string goes through Lingui, with the message id derived from the
+  English, so a changed string invalidates its own translations. The language
+  is a cookie, then the browser's, then English; the profile keeps the choice so
+  another device follows it, and the switch sits in the account menu.
+- **Duct computes a pull's totals, rates and subtotals.** A replayed brief
+  reasoned correctly and added wrong: 2,504 sessions where its rows summed to
+  2,681. Every row report now arrives with totals, rates as a ratio of totals
+  or a weighted mean (never a mean of rates) and per-channel subtotals, and the
+  prompt says to quote them rather than add rows.
+- **Memory says how old a remembered state is.** A status, budget or rolling
+  metric reads "seen <date>", and past a shelf life (7 days for campaigns, 14
+  for pages, 30 for competitors) the agent re-reads it before stating it as
+  current, or says "as of". Stale assertions in the memory eval went from 5 of
+  5 to 0 of 5.
+- **The transcript shows what the agent did, read and was given.** Connector
+  pulls, web searches, page reads, sub-agents, memory and actions on your
+  behalf are rows where they happened, rebuilt on a reopened thread; reasoning
+  folds under "Thought for 6s", and a compaction or model switch is a rule
+  across the thread.
+- **Content Studio clones a post from a TikTok link**, plans from the
+  account's own history (content types ranked by completion, then saves, then
+  shares; posting times from its own posts), and reviews a carousel before it
+  goes out, with weights and penalties the agent can score against but not
+  move. Saved references keep their media after TikTok's links expire.
+- **An agent can draw a figure as SVG**, rendered as an image so it runs no
+  script, and the artifact library shows each document by its first screen.
+- **Desktop: a splash paints at once** instead of an empty window for as long
+  as the network takes, greets a first launch once, and reveals the app when it
+  has loaded, or after 30 seconds regardless.
+
+### Changed
+
+- **A brief defaults to HTML**, a styled page with its own charts and sortable
+  tables. A request in chat for the other format wins over the composer's
+  preference, and a resumed thread hears the current one. HTML briefs run
+  their scripts in an opaque origin with no reach into the app.
+- **Search Console is read whole and GA4 by channel.** The fetcher pages
+  through every row and keeps the zero-click impression tail, the last days of
+  a window are no longer zeroed, organic goals stop reading a report filtered
+  to paid traffic, and the in-depth SEO audit ranks findings by traffic at
+  stake.
+- **Briefs take fewer model turns.** Planning is off for insights, and the
+  verifier reuses the analyst's pulls instead of fetching them again.
+- **The composer footer says less.** The posture stays inline; the model tier
+  and its thinking level sit together on the right, and the context ring's
+  detail is its tooltip.
+- **Every wait is one shimmer** in the shape of what is coming, instead of
+  spinners, pulsing boxes and "Loading…".
+- **The site is product-led.** The home page opens on a 30-second film of a real
+  session, `/seo-audit` sells the report with a sample of the real thing, and
+  the tools, blog and for-\* pages speak the product's current voice. Every page
+  carries its own Open Graph card; `assets/og-image.png`, the one shared card,
+  is gone.
+- **Pages weigh what they should.** Every product shot is published at 768 and
+  1536 px beside the 2x capture and listed in `srcset`, a phone plays a 720 px
+  cut of the film, and media, art and icons carry a week of cache: the home page
+  on a phone went from 3.0 MB to about 1.1 MB.
+
+### Fixed
+
+- **An approval applies once, and only against what was approved.** Two
+  requests (a double click, a second tab, a click racing auto-apply) could both
+  run a change set; a conditional update now lets exactly one through. A change
+  whose target moved since preview, such as a budget someone raised in Google
+  Ads, is held back and says why.
+- **Review cards survive a reload**, read "You approved this" with when, and
+  the agent hears the decision on its next turn.
+- **Desktop conversations are remembered.** Background learning needs a key
+  the server holds and a desktop install holds none, so it never ran for
+  desktop users. Closing a chat now lends the app's keys to it, in memory only;
+  keys are still never stored on Duct's servers.
+- **Memory is learned without waiting for a close**, which a deploy, crash or
+  quit never sends: conversations quiet for 30 minutes are consolidated.
+- **The in-depth SEO audit keeps the data it reads.** Its pruning threshold was
+  counted in tokens and passed on the first call, so the Search Console and
+  GA4 results its summary quotes had been cleared. It also runs with prompt
+  caching, model fallback and its call limits now.
+- **A run a deploy interrupted is closed at boot** instead of showing
+  "Working…" forever.
+- **Desktop: a key the keychain will not hand over says so**, with how to allow
+  it, and is asked for once per launch rather than on every message.
+- **A message that never reached the agent goes back to the composer**, and
+  the browser's "Failed to fetch" and bare status codes no longer reach the
+  screen.
+- Markdown briefs are typeset (the typography plugin was never installed), a
+  reopened thread shows the briefs it wrote and the data it pulled, a resumed
+  thread's context gauge is restored, and the language menu opens on screen.
+- A ChatGPT plan no longer offers image generation it cannot pay for.
+- Content Studio's Discover search reaches its scraper again and survives
+  hashtags sent as objects.
+- A phone no longer scrolls sideways past the privacy cookie table or the
+  download page's file locations, footer links are a thumb's height apart, no
+  label sits under 11 px, and revealed sections show without JavaScript.
+
+### Security
+
+- **The desktop shell moves to Tauri 2.11.6**, which fixes a high-severity
+  IPC access-control flaw in Tauri's fetch command
+  ([GHSA-w28w-mhc8-qvjv](https://github.com/tauri-apps/tauri/security/advisories/GHSA-w28w-mhc8-qvjv))
+  present in every earlier Duct shell.
+- Discover's scrape endpoint rebuilds its input from the two scrapers it uses
+  instead of passing the browser's actor and input to Apify on Duct's key.
+
+## [0.7.0] — 2026-09-15
+
+A profile every agent reads, a front door that opens with the audit, and the
+design system the app had been approximating in hand-rolled CSS.
+
+### Added
+
+- **A profile on a page, in a row every agent can read.** Role, business, voice
+  and depth lived in one browser's `localStorage` and rode on each request, so
+  two devices disagreed and the scheduled brief — the run whose owner is
+  definitely not watching — could read none of it. It is a row per user now,
+  rendered once and read by the audit, insights and content agents; the audit
+  runner had been accepting preferences it never passed to the prompt.
+- **The time zone a week starts in**, so "last week" means the same thing to the
+  agent as to the person reading the brief.
+- **A signed-out page that is a front door**, continuous with `/start`: the
+  audit is what a stranger meets, not a login form.
+- **"Keep me signed in"** — a 30-day option on Google sign-in.
+- **Image generation is a choice, not a default.** OpenAI's GPT Image 2.5 pair,
+  Flare as the default, and drawing on an OpenRouter key instead of declining
+  every picture. xAI and OpenRouter are one click in the tier map.
+- **Tokens and state primitives** for the jobs the palette had been standing in
+  for, documented in `/preview`; the app moved onto them and a generated report
+  declares itself a light-scheme document.
+
+### Changed
+
+- **Copy across the app says one thing per surface.** Panel and option blurbs
+  cut to a single idea, second sentences deleted on ten surfaces, and the UI
+  stopped narrating what the reader is already looking at.
+- **Empty states activate** rather than reporting that nothing is there.
+- **Insights opens a run knowing what it can reach**, on the tier the job
+  deserves; the dials follow the conversation instead of staying on the desk,
+  and a connection asked for mid-conversation comes back to that conversation.
+- **Google Ads no longer needs a developer token.** Google sunset them on
+  2026-09-09; the bring-your-own path is gone and Ads is OAuth-only.
+
+### Fixed
+
+- A reload restores the thread instead of re-asking the question, and the
+  insights desk no longer blanks itself when the window comes back.
+- Memory is not primed again on a resumed thread.
+- GA4 pulls ask for key events rather than the alias Google deprecated, and
+  landing-page reports use the nested string filter — they returned nothing at
+  all before.
+- A dead request is reported as a failure instead of rendered as an empty list;
+  a 402 on a provider key routes through the shared error UI; a provider card
+  that is still loading no longer reports a verdict; a disabled button reads as
+  disabled.
+- Desktop: a ChatGPT sign-in can be cancelled and replaced, the browser gets its
+  callback response before the socket closes, local secrets are held where the
+  OS can protect them, and a notification row acts instead of only reporting.
+- Session ids come from the CSPRNG, and a session is bound to the backend that
+  minted it.
+
+## [0.5.0] — 2026-09-09
+
+The audit becomes the way in, and a run finally spends the key and the tier the
+user chose.
+
+### Added
+
+- **The audit is the onboarding.** `/start` asks for a URL and begins crawling
+  the moment it validates, instead of eleven questions before any evidence the
+  work is worth it. The project it drafts carries provenance per field ("From
+  your site" / "Duct's guess"), and an account is asked for when there is a
+  report worth keeping — sharing it is membership, so the link is a 404 for a
+  stranger.
+- **A guest account before the sign-in.** A real `users` row keyed on the
+  install id owns what the audit writes, so no auth boundary loosens and no
+  owner column becomes nullable; signing in links that row or merges it by
+  walking the schema for owner columns rather than a hand-kept list.
+- **The saved tier map reaches the run.** The model tiers page had been writing
+  to `localStorage` that no run ever read: a user could set Heavy to Opus, watch
+  a run choose Gemini, and have no way to tell which setting was lying. It is a
+  row per user now, resolved by `resolve_job_run` — including the scheduled
+  brief, which no browser storage could ever reach.
+- **Quota routes around itself.** A 429 the retry loop gave up on is remembered
+  for a few minutes, keyed by credential identity and provider, so the next run
+  resolves to a model that will answer instead of spending four more attempts
+  dying the same way.
+- **Runs spend the key the caller actually holds**, including a ChatGPT plan,
+  and `POST /providers/{id}/verify` makes one real call on the Light model to
+  tell an invalid key from an unbilled account from a model the account cannot
+  see.
+- **What a run cost, on the key that paid for it.** Token and dollar figures per
+  agent, per model and per provider — three breakdowns, because which agent is
+  expensive, which model is, and which provider is are three different
+  decisions. Duct computed these already and threw them away.
+- **Pictures draw on whichever image-capable key you brought**, rather than one
+  vendor's.
+- **Analytics ask first.** Consent Mode defaults are declared denied on the
+  page, region comes from Cloudflare's trace with every failure path failing
+  closed to "ask", and a decline stops the container loading at all. The desktop
+  shell never asks: it runs with storage permanently denied, so nothing is
+  stored to consent to.
+- `site/changelog/` — a public changelog with an RSS feed, written for someone
+  deciding whether to install rather than someone reading a diff. `CHANGELOG.md`
+  stays the engineering record; the two must not disagree about what shipped.
+- Platform cards on the download page — macOS, Windows, Linux, Debian/Ubuntu —
+  each on a version-independent URL. The visitor's platform is marked with a
+  badge, a heavier border and a shadow, never colour alone.
+
+### Changed
+
+- **A connector's numbers reach the agent whole.** Anything over the response
+  budget used to be cut mid-structure — on a 900-row search-terms pull that is
+  two thirds of the numbers gone, with the agent unable to tell which, writing
+  the brief confidently off a third of the data. Rows fold to typed CSV first:
+  every row survives, byte-identical, at 45-55% of the tokens.
+- The site says plainly that the app you download runs against Duct's servers,
+  rather than leaving a reader to infer it from the desktop bundle.
+- The desktop Help menu has something in it, and an About panel says what this
+  is; the account drawer answers "it broke" and "it should do X".
+
+### Fixed
+
+- **A failed key check no longer echoes the key** back in its error detail, and
+  quota is keyed to the credential's identity rather than its value, so a leaked
+  key confirms nothing about who is using it.
+- An audit no longer rewrites a project it was never about.
+- A tab running last week's build is offered a reload instead of failing against
+  an API it no longer matches.
+- **Server-side request forgery in the shared crawler.** `validate_public_url`
+  judged the URL a caller passed in and nothing after it, so a public URL
+  answering `302 -> http://169.254.169.254/` was fetched and its body handed to
+  a model — on the lead-magnet audit path, which runs behind Turnstile with no
+  account. Every redirect hop and every resolved address is checked now.
+- **Path traversal at the storage sink.** Five call sites joined a key onto the
+  uploads directory and opened the result. No live caller could traverse, but
+  that was a property of the callers and one refactor from being false, so
+  `_local_path` resolves and checks containment and all five go through it.
+- **The chat error frame streamed the provider's exception text to the
+  browser** — request URLs, model configuration, and the API key itself from a
+  provider that echoes the failing request back. The browser gets a short
+  reference that also appears in the log line, which is what a support
+  conversation needs.
+- **Quadratic backtracking in memory's relative-date pattern.** "last " plus
+  20k spaces took 18.2s of one worker, from one request; the same input now
+  takes 3ms.
+- A desktop shell that cannot complete sign-in says so, instead of silently
+  signing the user into the hosted web app and leaving nothing on screen to
+  explain it. A desktop PR now fails when a command is not actually registered,
+  which is what let that ship.
+- An expired or unrecognised session signs you out instead of rendering the
+  backend's 401 detail where a page's empty state belongs. Executions, Memory,
+  Artifacts and Activity each showed a bare "User not found"; every user-scoped
+  route was failing, and it only looked local because the rest swallowed it.
+- `404.html` rendered unstyled on every path below the site root. Cloudflare
+  Pages serves it at the URL that missed, so its relative `assets/duct.css`
+  resolved to `/blog/assets/duct.css`; every path in the file is root-absolute
+  now.
+
+## [0.4.1] — 2026-09-07
+
+Three release-pipeline defects that 0.4.0 made visible. A published release is
+immutable, so a corrected build needs a version.
+
+### Fixed
+
+- **Windows was never offered a self-update.** `latest.json` for 0.4.0 carried
+  darwin and linux targets and no `windows-x86_64`, so every Windows install
+  polled forever. Tauri signs the installer directly now, so the upload's
+  `*-setup.nsis.zip.sig` glob matched nothing — and `if-no-files-found: error`
+  stayed quiet, because it asks whether *any* pattern matched and the `.exe`
+  did. The signature uploads under either name and the job fails loudly when
+  neither exists.
+- **The site had no download URL it could hold on to.** Tauri puts the version
+  in every filename, so `releases/latest/download/<name>` had nothing stable to
+  redirect to and the page resolved the release through the GitHub API at
+  runtime — an API call subject to CORS, rate limits and JavaScript, to answer
+  a question that does not change between releases. Each installer is published
+  a second time under a version-independent name.
+- **The site served a build from before September while every workflow stayed
+  green.** Cloudflare Pages' git integration decided whether to build from
+  "Build watch paths", a dashboard-only setting that is not in this repository
+  and had stopped matching `site/**`; a build it skips reports as *skipped*,
+  which reads like "nothing to do". The site deploys from Actions now, gated on
+  the checks in the same file.
+
+## [0.4.0] — 2026-09-07
+
+First version cut after the desktop shell became self-contained.
+
+### Added
+
+- **Local sidecar.** The desktop bundle ships the FastAPI backend frozen by
+  PyInstaller and runs it on loopback, so the app works with no server and no
+  account. SQLite lives in the per-user data directory.
+- **Credential encryption on desktop.** The shell mints a Fernet key into the OS
+  keychain and passes it to the sidecar, so linking a data source can persist.
+  Before this, connecting Google Ads completed OAuth and then failed to save.
+- **Sign-in that survives a frozen bundle.** `JWT_SECRET` is generated once into
+  a `0600` file in the data directory and reused across restarts.
+- **Browser-based OAuth for desktop**, for both sign-in and connectors, over
+  `ai.getduct.desktop://` deep links carrying single-use codes rather than
+  credentials.
+- **Model tiers.** Heavy / Standard / Light, assigned per job in
+  `/settings/models`.
+- **Connectors:** Mixpanel, Microsoft Clarity, GrowthBook, Apple Search Ads,
+  Meta Ads, OpenAI Ads, Stripe, RevenueCat, Google Tag Manager.
+- **Staged execution.** Agents propose change sets against Google Ads and GA4;
+  a human previews, approves and can roll back. No approve or apply tool exists
+  in either harness.
+- **Agent memory.** Bi-temporal, provenance-linked project memory with a
+  timeline view.
+- `scripts/build_blog.py` — pre-renders blog posts to static HTML. Measured
+  against production, GPTBot received 49 characters of body text for a
+  6,000-word post, the title "Duct Insights", an empty description and the
+  canonical `/blog/post` shared by every post. Now 5,105 characters, a unique
+  canonical, and `Article` JSON-LD in the served bytes.
+- `site/blog/feed.xml` — the blog's first RSS feed.
+
+- `site/doctrine.html` — the seven positions this project is built on, each
+  linked to the file that enforces it. Written because the reasoning already
+  existed in `STYLE.md`, `agents/core/ports/__init__.py` and
+  `service/execution/policy.py`, where nobody evaluating the project reads it.
+- `.github/FUNDING.yml` — GitHub Sponsors. Not a revenue plan at this stage; a
+  public signal that the project is maintained.
+- A Community section in `README.md` pointing at Discussions rather than a chat
+  server. An empty Discord is a worse signal than no Discord, and a Discussions
+  answer is findable later.
+
+- Open-source project files: `LICENSE` (MIT), `CONTRIBUTING.md`, `SECURITY.md`,
+  `CODE_OF_CONDUCT.md`, issue forms, a pull-request template, `CODEOWNERS` and
+  grouped Dependabot configuration.
+- `make check` — one entry point running exactly what CI runs, per area.
+- `test_route_auth_boundaries.py` — every project-scoped route must resolve a
+  signed-in user, and every ungated `/api` route must be declared with a reason.
+- Social preview cards, generated from `scripts/social/template.html`. The site's
+  `og:image` had been referenced by 23 pages without the file ever existing.
+- `STYLE.md` — what good code looks like here, separate from the `AGENTS.md`
+  rules about what must not break. Every convention in it was measured against
+  the tree rather than asserted.
+- PR triage (`.github/workflows/pr-triage.yml`) — an agent summary of inbound
+  pull requests, posted as one sticky comment saying what a PR does and where to
+  look first. It never approves or blocks, and stays inert until the repository
+  has an `ANTHROPIC_API_KEY` secret.
+
+### Changed
+
+- One agent instruction file per directory: `AGENTS.md` is canonical and
+  `CLAUDE.md` is a symlink to it, replacing two files per area that had drifted.
+- READMEs rewritten. The root one named four connectors that do not exist and
+  described the app as a no-auth shell.
+
+### Fixed
+
+- A project with no `project_members` row disappeared from the owner's project
+  list; migration `a4d18e5c26bf` backfills owner membership.
+- A token that fails to resolve is rejected rather than treated as an anonymous
+  caller.
+- One source of truth for `site/` conventions. `.claude/rules/landing-pages.md`
+  and `.claude/skills/add-blog-post.md` both told agents to write a blog
+  canonical and sitemap entry as `/blog/post.html?slug=…`, while the site uses
+  the extensionless `/blog/post?slug=…` everywhere and CI rejects a canonical
+  containing `.html`. The skill is corrected, the rules file is now a pointer to
+  `site/AGENTS.md`, and the canonical form is stated outright there instead of
+  being implied by a table.
+- The app's typecheck actually runs. `npm run typecheck --if-present` had been
+  pointed at a script that did not exist, and `--if-present` exits 0, so both
+  `make check-app` and App CI reported a green typecheck without ever invoking
+  `tsc`. The script now exists and is invoked by name.
+- Two npm advisories (`browserslist` high, `postcss-selector-parser` low).
+- Three false-positive CRITICAL findings that had the security audit failing on
+  every pull request.
+
+[Unreleased]: https://github.com/authrain-cloud-abdullahformuli/duct/compare/desktop-v0.7.1...HEAD
+[0.7.1]: https://github.com/authrain-cloud-abdullahformuli/duct/releases/tag/desktop-v0.7.1
+[0.7.0]: https://github.com/authrain-cloud-abdullahformuli/duct/releases/tag/desktop-v0.7.0
+[0.5.0]: https://github.com/authrain-cloud-abdullahformuli/duct/releases/tag/desktop-v0.5.0
+[0.4.1]: https://github.com/authrain-cloud-abdullahformuli/duct/releases/tag/desktop-v0.4.1
+[0.4.0]: https://github.com/authrain-cloud-abdullahformuli/duct/releases/tag/desktop-v0.4.0

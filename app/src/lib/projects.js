@@ -1,0 +1,505 @@
+"use client";
+
+import { safeHostname } from "./favicon";
+import {
+  deleteProjectRemote,
+  fetchProjectsRemote,
+  hasAuthToken,
+  postProjectDraftRemote,
+  upsertProjectRemote,
+} from "./projectsApi";
+import { randomId as createId } from "./randomId";
+
+const PROJECTS_STORAGE_KEY = "duct_projects";
+const ACTIVE_PROJECT_ID_STORAGE_KEY = "duct_active_project_id";
+const LEGACY_PROFILE_STORAGE_KEY = "duct_business_profile";
+
+/**
+ * The name a project carries until it has a real one. Exported because it is
+ * not content: code that decides whether a field was filled in by a human has
+ * to be able to tell this placeholder from something someone typed.
+ */
+export const UNTITLED_PROJECT = "Untitled project";
+
+export const DEFAULT_PROJECT_PROFILE = {
+  company: {
+    name: "",
+    pitch: "",
+    industry: "",
+    business_model: "",
+    website_url: "",
+  },
+  targets: {
+    monthly_budget: "",
+    target_cpa: "",
+    target_roas: "",
+    primary_kpi: "",
+    north_star_metric: "",
+    north_star_goal_window: "",
+    north_star_constraints: "",
+    growth_stage_milestone: "",
+    growth_stage_context: "",
+  },
+  audience: {
+    primary_segment: "",
+    personas: [],
+  },
+  competition: {
+    compare_against: "",
+    competitors: [],
+    positioning_statement: "",
+  },
+  brand_channels: {
+    brand_voice: "",
+    growth_motions: [],
+    context_notes: "",
+    active_channels: [],
+    seasonality_notes: "",
+  },
+};
+
+const TOTAL_SECTIONS = 5;
+
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function toObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function clampArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function mergeProfile(base, incoming) {
+  return {
+    company: { ...base.company, ...toObject(incoming.company) },
+    targets: { ...base.targets, ...toObject(incoming.targets) },
+    audience: {
+      ...base.audience,
+      ...toObject(incoming.audience),
+      personas: clampArray(toObject(incoming.audience).personas ?? base.audience.personas),
+    },
+    competition: {
+      ...base.competition,
+      ...toObject(incoming.competition),
+      competitors: clampArray(toObject(incoming.competition).competitors ?? base.competition.competitors),
+    },
+    brand_channels: {
+      ...base.brand_channels,
+      ...toObject(incoming.brand_channels),
+      growth_motions: clampArray(
+        toObject(incoming.brand_channels).growth_motions ?? base.brand_channels.growth_motions
+      ),
+      active_channels: clampArray(
+        toObject(incoming.brand_channels).active_channels ?? base.brand_channels.active_channels
+      ),
+    },
+  };
+}
+
+function withProjectDefaults(projectInput) {
+  const project = toObject(projectInput);
+  const profile = mergeProfile(DEFAULT_PROJECT_PROFILE, project);
+  return {
+    ...profile,
+    id: isNonEmptyString(project.id) ? project.id : "",
+    name: isNonEmptyString(project.name) ? project.name : profile.company.name || UNTITLED_PROJECT,
+    createdAt: isNonEmptyString(project.createdAt) ? project.createdAt : new Date(0).toISOString(),
+    updatedAt: isNonEmptyString(project.updatedAt) ? project.updatedAt : new Date(0).toISOString(),
+    // Membership metadata from the backend. A project that has never synced is
+    // owned by whoever created it locally, so "owner" is the right default.
+    role: project.role === "collaborator" ? "collaborator" : "owner",
+    ownerEmail: isNonEmptyString(project.ownerEmail) ? project.ownerEmail : "",
+    // Where each drafted field came from: "crawl", "document", "inferred", or
+    // "user" once confirmed or typed. The project-context surface shows a chip
+    // from it, and both this device and the server merge by it, so a draft
+    // never overwrites what a person typed (lib/projectDraft.js).
+    provenance: toObject(project.provenance),
+  };
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+
+/**
+ * Newest first, id as the tie-break. Order has to be a pure function of the
+ * projects themselves: `projects[0]` is the fallback whenever the remembered
+ * selection can't be resolved, and a fallback that depends on write order
+ * (local prepends vs. whatever order the backend returned) reads to the user
+ * as the app forgetting which project they picked.
+ */
+function sortProjects(projects) {
+  return [...projects].sort((a, b) => {
+    const byCreated = (b.createdAt || "").localeCompare(a.createdAt || "");
+    return byCreated !== 0 ? byCreated : (a.id || "").localeCompare(b.id || "");
+  });
+}
+
+function readProjectsStore() {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(PROJECTS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return sortProjects(parsed.map((project) => withProjectDefaults(project)).filter((project) => project.id));
+  } catch {
+    return [];
+  }
+}
+
+function writeProjectsStore(projects) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projects));
+  } catch {
+    // ignore storage write errors
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Backend sync (hybrid: localStorage is the always-current cache, the backend
+// is the durable store). Writes to the backend are explicit — callers persist
+// at deliberate save points (the project-context "Save & Next" button, the
+// audit's project draft) — so
+// localStorage edits don't generate a request per keystroke.
+// ---------------------------------------------------------------------------
+
+/** Same-document project-store change — cross-tab writes arrive as "storage". */
+export const PROJECTS_CHANGED = "duct:project-changed";
+
+/** Notify same-document listeners (sidebar, projects page) to re-read the store. */
+function notifyProjectsChanged() {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new Event("storage"));
+  window.dispatchEvent(new Event(PROJECTS_CHANGED));
+}
+
+/**
+ * Explicitly persist a project to the backend (upsert by id). Best-effort and
+ * safe to fire-and-forget; no-ops when signed out. Returns the server copy or null.
+ */
+export function pushProjectToBackend(project) {
+  return upsertProjectRemote(project);
+}
+
+// The last draft sent for each project, so the next one waits for it.
+const draftsInFlight = new Map();
+
+/**
+ * Send a draft to be merged on the server. Best-effort like the upsert; the
+ * local copy already holds the merge. Drafts for one project go one after
+ * another, in the order they were made: at equal rank the later draft is
+ * meant to win, and two in flight at once could arrive the other way round.
+ */
+export function pushDraftToBackend(projectId, draft) {
+  const previous = draftsInFlight.get(projectId) || Promise.resolve();
+  const next = previous.then(() => postProjectDraftRemote(projectId, draft)).catch(() => null);
+  draftsInFlight.set(projectId, next);
+  return next;
+}
+
+export function getProjects() {
+  return readProjectsStore();
+}
+
+export function getProjectById(projectId) {
+  if (!isNonEmptyString(projectId)) return null;
+  const projects = readProjectsStore();
+  return projects.find((project) => project.id === projectId) || null;
+}
+
+export function saveProject(projectInput) {
+  const project = withProjectDefaults(projectInput);
+  const timestamp = nowIso();
+  const base = {
+    ...project,
+    updatedAt: timestamp,
+    createdAt: isNonEmptyString(project.createdAt) && project.createdAt !== new Date(0).toISOString()
+      ? project.createdAt
+      : timestamp,
+    name: isNonEmptyString(project.name) ? project.name : project.company.name || UNTITLED_PROJECT,
+  };
+
+  if (!base.id) {
+    base.id = createId();
+  }
+
+  const projects = readProjectsStore();
+  const idx = projects.findIndex((item) => item.id === base.id);
+  const next = idx >= 0 ? [...projects.slice(0, idx), base, ...projects.slice(idx + 1)] : [base, ...projects];
+  writeProjectsStore(next);
+  return base;
+}
+
+export function deleteProject(id) {
+  if (!isNonEmptyString(id)) return;
+  const projects = readProjectsStore();
+  const next = projects.filter((project) => project.id !== id);
+  // Read the remembered pick before the store changes under it, so deleting a
+  // project the user wasn't on leaves their selection alone.
+  const wasActive = readStoredActiveProjectId() === id;
+  writeProjectsStore(next);
+  deleteProjectRemote(id);
+  if (wasActive) {
+    setActiveProjectId(next[0]?.id || "");
+  }
+}
+
+export function createProject(partial = {}) {
+  const timestamp = nowIso();
+  const partialObj = toObject(partial);
+  const merged = mergeProfile(DEFAULT_PROJECT_PROFILE, partialObj);
+  const project = saveProject({
+    ...merged,
+    id: createId(),
+    name: partialObj.name || merged.company.name || UNTITLED_PROJECT,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  return project;
+}
+
+// ---------------------------------------------------------------------------
+// Active project
+//
+// Each tab keeps its own selection in sessionStorage. localStorage remembers
+// the last selection only to seed a new tab. Reads go through resolveActiveProjectId so
+// that the stored id and what the UI shows can never drift apart: a reader that
+// silently falls back to "the first project" without writing that choice back
+// leaves the switcher showing one project while getActiveProjectId() hands the
+// rest of the app an empty string.
+// ---------------------------------------------------------------------------
+
+// Keep a tab-local fallback when browser storage is unavailable. An empty pick
+// is also cached: it must not be reseeded by another tab's later selection.
+const activeProjectByWindow = new WeakMap();
+
+function readStoredActiveProjectId() {
+  if (typeof window === "undefined") return "";
+  if (activeProjectByWindow.has(window)) return activeProjectByWindow.get(window);
+  let stored = null;
+  try {
+    stored = window.sessionStorage.getItem(ACTIVE_PROJECT_ID_STORAGE_KEY);
+  } catch { /* storage may be unavailable */ }
+  if (stored === null) {
+    try {
+      stored = window.localStorage.getItem(ACTIVE_PROJECT_ID_STORAGE_KEY);
+    } catch { /* storage may be unavailable */ }
+  }
+  const selected = stored || "";
+  activeProjectByWindow.set(window, selected);
+  try {
+    window.sessionStorage.setItem(ACTIVE_PROJECT_ID_STORAGE_KEY, selected);
+  } catch { /* the in-memory selection still isolates this tab */ }
+  return selected;
+}
+
+function writeStoredActiveProjectId(id) {
+  if (typeof window === "undefined") return;
+  activeProjectByWindow.set(window, id);
+  try {
+    window.sessionStorage.setItem(ACTIVE_PROJECT_ID_STORAGE_KEY, id);
+  } catch { /* the in-memory selection still isolates this tab */ }
+  try {
+    if (!id) {
+      window.localStorage.removeItem(ACTIVE_PROJECT_ID_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(ACTIVE_PROJECT_ID_STORAGE_KEY, id);
+  } catch {
+    // ignore storage write errors
+  }
+}
+
+/**
+ * The remembered selection, resolved against `projects` and repaired in place.
+ *
+ * Returns the stored id when it still names a real project. Otherwise falls
+ * back to the first project and persists that fallback, so every later read
+ * agrees. Repairs deliberately do NOT notify — they are not a user action, and
+ * a listener that re-reads on notify would bounce straight back in here.
+ *
+ * An empty list is treated as "nothing to resolve against yet", not as "the
+ * selection is invalid": the store is empty on first paint of a fresh device,
+ * before hydrateProjectsFromBackend has run, and forgetting the pick there is
+ * exactly the reset this is meant to prevent.
+ */
+export function resolveActiveProjectId(projects = readProjectsStore()) {
+  if (typeof window === "undefined") return "";
+  if (!projects.length) return "";
+  const stored = readStoredActiveProjectId();
+  if (stored && projects.some((project) => project.id === stored)) return stored;
+  const fallback = projects[0]?.id || "";
+  if (fallback !== stored) writeStoredActiveProjectId(fallback);
+  return fallback;
+}
+
+export function getActiveProjectId() {
+  return resolveActiveProjectId();
+}
+
+/** Remember `id` as the active project. No-op (and no event) when unchanged. */
+export function setActiveProjectId(id) {
+  if (typeof window === "undefined") return;
+  const next = isNonEmptyString(id) ? id : "";
+  if (next === readStoredActiveProjectId()) return;
+  writeStoredActiveProjectId(next);
+  notifyProjectsChanged();
+}
+
+/**
+ * The comparable form of a site address: lowercase host, no leading `www.`.
+ *
+ * Host and not registrable domain, deliberately. `blog.acme.com` and
+ * `acme.com` are two legitimate audit targets with different findings, and
+ * folding them together would silently write one site's report into the
+ * other's project. Returns "" for anything unparseable, and "" never matches.
+ */
+export function siteKey(url) {
+  const host = safeHostname(url).toLowerCase();
+  return host.startsWith("www.") ? host.slice(4) : host;
+}
+
+/**
+ * Every project whose website is `url`, newest first.
+ *
+ * Returns a list rather than a best guess: none means there is nothing to
+ * update, one is the answer, and more than one is a question only the user
+ * can settle. A caller that silently took the first would be the bug this
+ * function exists to remove — `/start` used to merge a crawl into whatever
+ * project happened to be active, which overwrote real work.
+ */
+export function projectsForSite(url) {
+  const key = siteKey(url);
+  if (!key) return [];
+  return readProjectsStore().filter(
+    (project) => siteKey(project?.company?.website_url) === key,
+  );
+}
+
+export function getActiveProject() {
+  const projects = readProjectsStore();
+  if (!projects.length) return null;
+  const activeId = resolveActiveProjectId(projects);
+  return projects.find((project) => project.id === activeId) || projects[0] || null;
+}
+
+function sectionCompletion(profile) {
+  const companyDone =
+    isNonEmptyString(profile.company.name) &&
+    isNonEmptyString(profile.company.industry) &&
+    isNonEmptyString(profile.company.business_model);
+
+  const targetsDone =
+    isNonEmptyString(profile.targets.north_star_metric) &&
+    isNonEmptyString(profile.targets.north_star_goal_window) &&
+    isNonEmptyString(profile.targets.growth_stage_milestone);
+
+  const audienceDone =
+    isNonEmptyString(profile.audience.primary_segment) &&
+    profile.audience.personas.some(
+      (persona) =>
+        persona &&
+        (isNonEmptyString(persona.name) || isNonEmptyString(persona.description) || isNonEmptyString(persona.priority))
+    );
+
+  const competitionDone = isNonEmptyString(profile.competition.compare_against);
+
+  const brandChannelsDone =
+    isNonEmptyString(profile.brand_channels.brand_voice) ||
+    profile.brand_channels.growth_motions.length > 0 ||
+    isNonEmptyString(profile.brand_channels.context_notes);
+
+  return [companyDone, targetsDone, audienceDone, competitionDone, brandChannelsDone];
+}
+
+export function getProjectCompletion(projectInput) {
+  const profile = mergeProfile(DEFAULT_PROJECT_PROFILE, toObject(projectInput));
+  const sections = sectionCompletion(profile);
+  const completedSections = sections.filter(Boolean).length;
+  const percent = Math.round((completedSections / TOTAL_SECTIONS) * 100);
+  return { percent, completedSections, totalSections: TOTAL_SECTIONS };
+}
+
+export function migrateFromLegacyProfile() {
+  if (typeof window === "undefined") return null;
+
+  const existing = readProjectsStore();
+  if (existing.length > 0) {
+    resolveActiveProjectId(existing);
+    return existing[0] || null;
+  }
+
+  let legacy = null;
+  try {
+    const raw = window.localStorage.getItem(LEGACY_PROFILE_STORAGE_KEY);
+    if (raw) legacy = JSON.parse(raw);
+  } catch {
+    legacy = null;
+  }
+  if (!legacy) return null;
+
+  const merged = mergeProfile(DEFAULT_PROJECT_PROFILE, toObject(legacy));
+  const created = createProject({
+    ...merged,
+    name: merged.company.name || "Project 1",
+  });
+  if (created?.id) setActiveProjectId(created.id);
+  return created || null;
+}
+
+/**
+ * Load projects from the backend and reconcile with the local cache.
+ *
+ * - Server rows win when the same id exists in both, unless the local copy is
+ *   strictly newer (by updatedAt) — then the local copy is pushed back up.
+ * - Local-only projects (created before sync, or while signed out) are kept and
+ *   uploaded so nothing is lost.
+ * Safe no-op when signed out / no token. Notifies listeners on completion.
+ */
+export async function hydrateProjectsFromBackend() {
+  if (typeof window === "undefined" || !hasAuthToken()) return;
+
+  const remote = await fetchProjectsRemote();
+  const local = readProjectsStore();
+
+  const byId = new Map();
+  for (const p of remote) byId.set(p.id, withProjectDefaults(p));
+
+  const toPushUp = [];
+  for (const lp of local) {
+    const rp = byId.get(lp.id);
+    if (!rp) {
+      // Local-only project — keep it and upload.
+      byId.set(lp.id, lp);
+      toPushUp.push(lp);
+    } else if ((lp.updatedAt || "") > (rp.updatedAt || "")) {
+      // Local edits are newer — prefer them and re-upload. Membership is the
+      // server's call, though, so role/owner always come from the remote copy.
+      byId.set(lp.id, { ...lp, role: rp.role, ownerEmail: rp.ownerEmail });
+      toPushUp.push(lp);
+    } else if (Object.keys(lp.provenance || {}).length && !Object.keys(rp.provenance || {}).length) {
+      // A project drafted here before the server kept provenance: the server
+      // wins the values but has no labels yet, and taking its empty map would
+      // strip the chips. The next save sends these labels up.
+      byId.set(lp.id, { ...rp, provenance: lp.provenance });
+    }
+  }
+
+  const merged = sortProjects(Array.from(byId.values()));
+  writeProjectsStore(merged);
+
+  // Keep the remembered project. It is only re-pointed when the project it
+  // names is genuinely gone (deleted on another device), never just because
+  // the server handed the list back in a different order.
+  resolveActiveProjectId(merged);
+
+  for (const p of toPushUp) upsertProjectRemote(p);
+
+  notifyProjectsChanged();
+}

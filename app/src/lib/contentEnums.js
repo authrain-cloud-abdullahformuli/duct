@@ -1,0 +1,171 @@
+/**
+ * Mirrors of backend enums in agents/models.py.
+ * Keep in sync — these drive checkbox/radio groups in publish modals and
+ * plan day editors.
+ *
+ * Model selection is NOT mirrored here: the backend owns it end-to-end (the
+ * image-gen tool defaults to DEFAULT_IMAGE_MODEL server-side and validates any
+ * model string against the ImageModel enum), so the frontend never sends a
+ * model id.
+ */
+
+import { msg } from "@lingui/core/macro";
+
+export const Platform = Object.freeze({
+  TIKTOK:          "tiktok",
+  INSTAGRAM:       "instagram",
+  YOUTUBE:         "youtube",
+  LINKEDIN:        "linkedin",
+  TWITTER:         "twitter",
+  FACEBOOK:        "facebook",
+  THREADS:         "threads",
+  BLUESKY:         "bluesky",
+  PINTEREST:       "pinterest",
+  GOOGLE_BUSINESS: "google_business",
+  // The brand's own site: an article, published by hand or through the
+  // site's own tooling (backend agents/content/channels.py).
+  BLOG:            "blog",
+  WORDPRESS:       "wordpress",
+});
+
+export const PLATFORM_LABELS = Object.freeze({
+  [Platform.TIKTOK]:          "TikTok",
+  [Platform.INSTAGRAM]:       "Instagram",
+  [Platform.YOUTUBE]:         "YouTube",
+  [Platform.LINKEDIN]:        "LinkedIn",
+  [Platform.TWITTER]:         "Twitter / X",
+  [Platform.FACEBOOK]:        "Facebook",
+  [Platform.THREADS]:         "Threads",
+  [Platform.BLUESKY]:         "Bluesky",
+  [Platform.PINTEREST]:       "Pinterest",
+  [Platform.GOOGLE_BUSINESS]: "Google Business",
+  [Platform.BLOG]:            "Blog",
+  [Platform.WORDPRESS]:       "WordPress",
+});
+
+// Mirrors ContentStatus in backend/agents/content/schema.py.
+export const PostStatus = Object.freeze({
+  PENDING:   "pending",   // agent-drafted, not yet saved by the user
+  DRAFT:     "draft",     // saved/kept
+  SCHEDULED: "scheduled",
+  POSTED:    "posted",
+  FAILED:    "failed",    // its scheduler didn't publish it at its time; post.publish_error says why
+  DISCARDED: "discarded",
+});
+
+// What a PLAN_GENERATED payload says about the plan it carries. A plan the
+// agent submits is a proposal until the person accepts it on the viewport;
+// an event with no status predates proposals and is a saved plan.
+export const PlanStatus = Object.freeze({
+  PROPOSED: "proposed",
+  ACCEPTED: "accepted",
+  REJECTED: "rejected",
+});
+
+// Message descriptors, not strings: this table is module-level, so it is
+// rendered with `i18n._(POST_STATUS_LABELS[status])` in the component that
+// shows it. PLATFORM_LABELS above stays plain — those are brand names.
+export const POST_STATUS_LABELS = Object.freeze({
+  [PostStatus.PENDING]:   msg`Pending`,
+  [PostStatus.DRAFT]:     msg`Draft`,
+  [PostStatus.SCHEDULED]: msg`Scheduled`,
+  [PostStatus.POSTED]:    msg`Posted`,
+  [PostStatus.FAILED]:    msg`Failed`,
+  [PostStatus.DISCARDED]: msg`Discarded`,
+});
+
+// Mirrors POST_TYPES in backend/agents/content/schema.py (Day.post_type).
+export const PostType = Object.freeze({
+  SLIDESHOW: "slideshow",
+  VIDEO:     "video",
+  IMAGE:     "image",
+  TEXT:      "text",   // words first: X, LinkedIn
+});
+
+// Descriptors, rendered with `i18n._(POST_TYPE_LABELS[type])`.
+export const POST_TYPE_LABELS = Object.freeze({
+  [PostType.SLIDESHOW]: msg`Slideshow`,
+  [PostType.VIDEO]:     msg`Video`,
+  [PostType.IMAGE]:     msg`Image`,
+  [PostType.TEXT]:      msg`Text`,
+});
+
+// The channels a draft can be written for, and which of them are words
+// first. Mirrors PLAYBOOKS / TEXT_PLAYBOOKS in
+// backend/agents/content/channels.py, and
+// backend/tests/test_content_text_channels.py holds the two equal. Only the
+// list is mirrored: a channel's limits arrive on each post as `post.channel`,
+// so no character count lives here.
+export const DRAFT_CHANNELS = Object.freeze([
+  { id: Platform.TIKTOK,   textFirst: false },
+  { id: Platform.LINKEDIN, textFirst: true },
+  { id: Platform.TWITTER,  textFirst: true },
+]);
+
+// An article channel is written as text whatever playbook stands in for it.
+const LONG_FORM = new Set([Platform.BLOG, Platform.WORDPRESS]);
+
+export function isTextChannel(id) {
+  return LONG_FORM.has(id) || DRAFT_CHANNELS.some((c) => c.id === id && c.textFirst);
+}
+
+// The kinds of media a channel can be asked to take (backend platform_guides.MEDIA_KINDS).
+export const MediaKind = Object.freeze({
+  VIDEO: "video", SLIDESHOW: "slideshow", IMAGE: "image", TEXT: "text", ARTICLE: "article",
+});
+export const MEDIA_KIND_LABELS = Object.freeze({
+  [MediaKind.VIDEO]: msg`Video`,
+  [MediaKind.SLIDESHOW]: msg`Slideshow`,
+  [MediaKind.IMAGE]: msg`Image`,
+  [MediaKind.TEXT]: msg`Text post`,
+  [MediaKind.ARTICLE]: msg`Article`,
+});
+
+// Mirrors CloneApproach in backend/agents/content/schema.py: how closely a
+// cloned post copies its reference, derived there from FIT × PROOF.
+export const CloneApproach = Object.freeze({
+  CLOSE:          "close",
+  ADAPT:          "adapt",
+  STRUCTURE_ONLY: "structure_only",
+});
+
+export const CLONE_APPROACH_LABELS = Object.freeze({
+  [CloneApproach.CLOSE]:          msg`Copied closely`,
+  [CloneApproach.ADAPT]:          msg`Adapted`,
+  [CloneApproach.STRUCTURE_ONLY]: msg`Structure only`,
+});
+
+// Mirrors SkipReason in backend/routes/content.py: a no to a draft, which
+// the content agent's next run reads back as a feedback memory. Few, and
+// each says something different about what to write next time.
+export const SkipReason = Object.freeze({
+  NOT_TRUE:        "not_true",
+  TOO_REVEALING:   "too_revealing",
+  NOT_INTERESTING: "not_interesting",
+  ALREADY_SAID:    "already_said",
+  WRONG_VOICE:     "wrong_voice",
+});
+
+export const SKIP_REASON_LABELS = Object.freeze({
+  [SkipReason.NOT_TRUE]:        msg`Not true`,
+  [SkipReason.TOO_REVEALING]:   msg`Gives too much away`,
+  [SkipReason.NOT_INTERESTING]: msg`Not interesting`,
+  [SkipReason.ALREADY_SAID]:    msg`Already said`,
+  [SkipReason.WRONG_VOICE]:     msg`Not my voice`,
+});
+
+// Mirrors SlotReason in backend/agents/content/best_time.py: why the
+// drafts queue suggests the time it does.
+export const SlotReason = Object.freeze({
+  HISTORY: "history",
+  DEFAULT: "default",
+});
+
+export const AspectRatio = Object.freeze({
+  SQUARE_1_1:     "1:1",
+  PORTRAIT_9_16:  "9:16",
+  LANDSCAPE_16_9: "16:9",
+  PORTRAIT_3_4:   "3:4",
+  LANDSCAPE_4_3:  "4:3",
+  PORTRAIT_4_5:   "4:5",
+});

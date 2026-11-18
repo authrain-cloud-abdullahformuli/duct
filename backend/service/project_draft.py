@@ -1,0 +1,382 @@
+"""Where each project field came from, and what may overwrite what.
+
+A project is filled from sources that deserve different trust: the person,
+their site, the files they added, a model's guess. Every drafted field carries
+a label naming its source (``projects.provenance``), and the rules here decide,
+field by field, whether an incoming value lands.
+
+They used to live only in the browser (``app/src/lib/projectDraft.js``, which
+still runs them for an instant answer offline), while the server stored values
+without labels and a save replaced the whole project. That was safe while the
+app was the only writer. A writer on the server side (the MCP server, a GitHub
+re-sync) needs the labels and the rules here, or the next save from a device
+holding an older copy undoes what it wrote.
+
+Two kinds of write reach a project, and they get different rules:
+
+* **A draft** (``merge_draft``) is a machine speaking: the crawl, the person's
+  documents, a model's inference, later an outside agent. It lands only where
+  three rules allow:
+
+  1. a value the person set (``user``) is never overwritten;
+  2. a filled value gives way only to an equal or higher source (``RANK``):
+     the site beats the person's files, because a deck goes stale and a
+     homepage is current, and both beat a guess;
+  3. a filled value with no label is the person's. Every project made before
+     drafts existed is in that state, and typing was the only way a field got
+     filled then.
+
+* **An edit** (``edit_fields``) is the person speaking through an agent: they
+  asked it, in so many words, to change a field. It lands like the person's own
+  typing, labelled ``user``, and keeps what it replaced so the edit can be
+  undone (``revert_fields``). Only the MCP server's ``update_project`` makes
+  one; reading files is never an edit.
+
+* **A save** (``reconcile_save``) is the person speaking, through a client that
+  sends the whole project. A field the person changed wins. A value the client
+  only carried along, its copy of an earlier draft, may fill a blank or beat a
+  lower source, but never replace an equal one and never blank a field: an
+  equal one is most likely the newer draft that client has not seen yet.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from utils.strings import slugify
+
+PROVENANCE_USER = "user"
+PROVENANCE_CRAWL = "crawl"
+PROVENANCE_DOCUMENT = "document"
+PROVENANCE_INFERRED = "inferred"
+
+# What a draft may claim to be. "user" is not among them: a writer that is not
+# the person cannot mark its value as the person's and so put it beyond the
+# reach of every later draft.
+DRAFT_SOURCES = frozenset({PROVENANCE_CRAWL, PROVENANCE_DOCUMENT, PROVENANCE_INFERRED})
+
+# Rule 2's order. An unknown label ranks with "inferred": a source this build
+# has never heard of gets the least trust, never the most.
+RANK = {
+    PROVENANCE_USER: 3,
+    PROVENANCE_CRAWL: 2,
+    PROVENANCE_DOCUMENT: 1,
+    PROVENANCE_INFERRED: 0,
+}
+
+# The name a project carries until it has a real one (the app's
+# UNTITLED_PROJECT). Nobody chose it, so it is not content.
+UNTITLED_PROJECT = "Untitled project"
+
+# A draft fills the primary persona the project page edits, and one more.
+MAX_DRAFT_PERSONAS = 2
+
+
+@dataclass(frozen=True)
+class DraftField:
+    """Where one draftable field lives on ``Project``: a column, or a key inside
+    one of its JSON sections. ``kind`` is the type a draft must send.
+
+    ``shape`` turns what a writer sends into what is stored, given what is
+    stored now, so every writer lands one shape. ``saved`` says whether the
+    app's whole-project save carries the field; the browser runs these rules
+    only for the fields it saves (``app/src/lib/projectDraft.js``)."""
+
+    column: str
+    key: str | None = None
+    kind: type = str
+    shape: Callable[[Any, Any], Any] | None = None
+    saved: bool = True
+
+
+# Where drafted pillars used to land, inside brand_channels, before the one
+# list: still sent by a device that drafted then, and dropped on save.
+LEGACY_PILLARS_KEY = "content_pillars"
+
+# A pillar a draft names gets an id the planner can file posts under. The
+# Brand tab makes the same one (BrandContextForm.jsx, pillarSlug).
+PILLAR_ID_SEP = "_"
+
+
+def pillar_rows(value: Any, current: Any = None) -> list[dict[str, str]]:
+    """Pillars as the planner and the Brand tab store them, ``{id, name,
+    description}``, from the names a draft sends or the rows the Brand tab
+    sends. A name already there keeps its row: a name alone says less than
+    the person wrote, and a re-sync of the same names must change nothing.
+    A row is taken as sent, so a description cleared on purpose stays clear."""
+    known = {
+        str(row.get("name") or "").strip().lower(): row
+        for row in current or []
+        if isinstance(row, Mapping)
+    }
+    rows: list[dict[str, str]] = []
+    for item in value or []:
+        sent_row = isinstance(item, Mapping)
+        name = str((item.get("name") if sent_row else item) or "").strip()
+        if not name or name.lower() in {r["name"].lower() for r in rows}:
+            continue
+        row = item if sent_row else known.get(name.lower(), {})
+        shaped = {
+            "id": str(row.get("id") or slugify(name, sep=PILLAR_ID_SEP)),
+            "name": name,
+            "description": str(row.get("description") or "").strip(),
+        }
+        if row.get("research_hint"):
+            shaped["research_hint"] = str(row["research_hint"])
+        rows.append(shaped)
+    return rows
+
+
+# The fields a draft may write, named as the audit's PROJECT_DRAFT event names
+# them. The app also drafts ``favicon``, which it keeps on the device and never
+# sends, so a draft naming it is ignored here like any unknown field.
+FIELDS: dict[str, DraftField] = {
+    "name": DraftField("name"),
+    "company_name": DraftField("company_name"),
+    "pitch": DraftField("pitch"),
+    "website_url": DraftField("url"),
+    "industry": DraftField("industry"),
+    "business_model": DraftField("business_model"),
+    "personas": DraftField("audience", "personas", list),
+    "compare_against": DraftField("competition", "compare_against"),
+    "competitors": DraftField("competition", "competitors", list),
+    "brand_voice": DraftField("brand_channels", "brand_voice"),
+    "active_channels": DraftField("brand_channels", "active_channels", list),
+    # The one pillar list: the planner reads it and the Brand tab edits it.
+    # Drafts used to land in brand_channels.content_pillars, which nothing
+    # read, so pillars written through the MCP never reached a plan (folded
+    # into this column by migration 7f3b9c1d2e4a).
+    "content_pillars": DraftField("content_pillars", "items", list, shape=pillar_rows, saved=False),
+}
+
+# A whole-project save writes these and no others.
+SAVED_FIELDS = tuple(name for name, spec in FIELDS.items() if spec.saved)
+
+
+def rank_of(label: str | None) -> int:
+    return RANK.get(label or "", RANK[PROVENANCE_INFERRED])
+
+
+def get_value(project: Any, name: str) -> Any:
+    spec = FIELDS[name]
+    raw = getattr(project, spec.column)
+    if spec.key is None:
+        return raw
+    # A seeded project may hold its pillars as a bare list, the shape the
+    # planner also accepts (runner._load_brand_context).
+    return raw.get(spec.key) if isinstance(raw, Mapping) else raw if isinstance(raw, list) else None
+
+
+def incoming(project: Any, name: str, value: Any) -> Any:
+    """``value`` in the shape the field stores, given what it holds now."""
+    spec = FIELDS[name]
+    return spec.shape(value, get_value(project, name)) if spec.shape else value
+
+
+def set_value(project: Any, name: str, value: Any) -> None:
+    spec = FIELDS[name]
+    if spec.key is None:
+        setattr(project, spec.column, value)
+        return
+    # A new dict rather than an edit in place: SQLAlchemy sees a change to a
+    # JSON column only when the attribute is reassigned.
+    raw = getattr(project, spec.column)
+    setattr(project, spec.column, {**(raw if isinstance(raw, Mapping) else {}), spec.key: value})
+
+
+def _blank_row(row: Any) -> bool:
+    # Personas and competitors are rows keyed by name. The settings page seeds
+    # one empty row ({"name": "", "priority": "primary"}) so the form has
+    # something to type into; that row is not content.
+    if isinstance(row, Mapping):
+        return not str(row.get("name") or "").strip()
+    if isinstance(row, str):
+        return not row.strip()
+    return row is None
+
+
+def is_blank(name: str, value: Any) -> bool:
+    """Whether a field counts as not filled in yet."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip() or (name == "name" and value == UNTITLED_PROJECT)
+    if isinstance(value, list | tuple):
+        return all(_blank_row(row) for row in value)
+    return False
+
+
+def _same(name: str, a: Any, b: Any) -> bool:
+    return a == b or (is_blank(name, a) and is_blank(name, b))
+
+
+def _gives_way(name: str, value: Any, label: str | None, incoming: str, *, equal_wins: bool) -> bool:
+    """Whether a field as it stands yields to a value from ``incoming``."""
+    if label == PROVENANCE_USER:
+        return False
+    if is_blank(name, value):
+        return True
+    if label is None:
+        return False
+    if rank_of(incoming) == rank_of(label):
+        return equal_wins
+    return rank_of(incoming) > rank_of(label)
+
+
+def clean_labels(raw: Mapping[str, Any] | None) -> dict[str, str] | None:
+    """A client's labels, keeping only fields and sources this build knows.
+
+    ``None`` stays ``None``: it means a client from before the server kept
+    labels, which ``reconcile_save`` treats differently from an empty map.
+    """
+    if raw is None:
+        return None
+    return {
+        name: label for name, label in raw.items()
+        if name in FIELDS and isinstance(label, str) and label in RANK
+    }
+
+
+def persona_rows(people: Iterable[tuple[str, str]]) -> list[dict[str, str]]:
+    """``(name, description)`` pairs in the project's persona shape, first one
+    primary. Every writer that drafts personas (the documents, the classifier,
+    the research pass, an outside agent) lands them in the same select-backed
+    field, so they are shaped here once."""
+    named = [(n.strip(), (d or "").strip()) for n, d in people if n and n.strip()]
+    return [
+        {"name": n, "description": d, "priority": "primary" if i == 0 else "secondary"}
+        for i, (n, d) in enumerate(named[:MAX_DRAFT_PERSONAS])
+    ]
+
+
+def merge_draft(project: Any, fields: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    """Land a draft's fields under the three rules. Returns the fields that
+    changed. ``fields`` is the PROJECT_DRAFT shape: ``{name: {value, provenance}}``.
+    """
+    labels = dict(project.provenance or {})
+    landed: list[str] = []
+    for name, field in fields.items():
+        if name not in FIELDS:
+            continue
+        source, value = field.get("provenance"), field.get("value")
+        if source not in DRAFT_SOURCES:
+            raise ValueError(f"a draft cannot claim provenance {source!r}")
+        if is_blank(name, value):
+            continue
+        value = incoming(project, name, value)
+        current, label = get_value(project, name), labels.get(name)
+        if label == source and _same(name, current, value):
+            # Already there, from the same source: a re-sync that changes
+            # nothing reports nothing and leaves updated_at alone.
+            continue
+        if not _gives_way(name, current, label, source, equal_wins=True):
+            continue
+        set_value(project, name, value)
+        labels[name] = source
+        landed.append(name)
+    project.provenance = labels
+    return landed
+
+
+def edit_fields(project: Any, values: Mapping[str, Any]) -> tuple[list[str], dict[str, Any], dict[str, str | None]]:
+    """Set fields as the person, whatever their label. Returns the fields that
+    changed, with the values and labels they replaced, which is all an undo
+    needs. A field already holding the value, as the person's, is not a change.
+    """
+    labels = dict(project.provenance or {})
+    changed: list[str] = []
+    before: dict[str, Any] = {}
+    before_labels: dict[str, str | None] = {}
+    for name, value in values.items():
+        if name not in FIELDS:
+            continue
+        value = incoming(project, name, value)
+        current, label = get_value(project, name), labels.get(name)
+        if _same(name, current, value) and (label == PROVENANCE_USER or is_blank(name, value)):
+            continue
+        before[name], before_labels[name] = current, label
+        set_value(project, name, value)
+        labels[name] = PROVENANCE_USER
+        changed.append(name)
+    project.provenance = labels
+    return changed, before, before_labels
+
+
+def revert_fields(
+    project: Any,
+    after: Mapping[str, Any],
+    before: Mapping[str, Any],
+    before_labels: Mapping[str, str | None],
+) -> tuple[list[str], list[str]]:
+    """Put back what an edit replaced, field by field. A field changed again
+    since the edit (it no longer holds ``after``) is left alone: undoing one
+    edit must never wipe out a later one. Returns (restored, skipped)."""
+    labels = dict(project.provenance or {})
+    restored: list[str] = []
+    skipped: list[str] = []
+    for name, value in after.items():
+        if name not in FIELDS or name not in before:
+            continue
+        if not _same(name, get_value(project, name), value):
+            skipped.append(name)
+            continue
+        set_value(project, name, before[name])
+        if before_labels.get(name) is None:
+            labels.pop(name, None)
+        else:
+            labels[name] = before_labels[name]
+        restored.append(name)
+    project.provenance = labels
+    return restored, skipped
+
+
+def snapshot(project: Any | None) -> dict[str, Any]:
+    """Every draftable field's value, taken before a save overwrites them.
+    ``None`` for a project that does not exist yet."""
+    return {name: None if project is None else get_value(project, name) for name in FIELDS}
+
+
+def reconcile_save(
+    project: Any,
+    before: Mapping[str, Any],
+    before_labels: Mapping[str, str],
+    sent_labels: Mapping[str, str] | None,
+) -> None:
+    """Settle a whole-project save field by field, after it has been written.
+
+    ``before`` and ``before_labels`` are the project as it stood; the save has
+    already replaced every column, and this puts back each draftable field the
+    save only carried along without the right to change it.
+    """
+    labels = dict(before_labels)
+    # A field the save does not carry is not the save's to settle: a label
+    # an old device still holds for it must not relabel the stored value.
+    for name in SAVED_FIELDS:
+        old, new = before[name], get_value(project, name)
+        mine = labels.get(name)
+        theirs = None if sent_labels is None else sent_labels.get(name)
+        if _same(name, old, new):
+            if theirs == PROVENANCE_USER and not is_blank(name, new):
+                labels[name] = PROVENANCE_USER  # a chip confirmed, value unchanged
+            elif mine is None and theirs in DRAFT_SOURCES and not is_blank(name, new):
+                # Drafted on a device before the server kept labels: the
+                # browser knows where the value came from and the server does not.
+                labels[name] = theirs
+            continue
+        if sent_labels is None:
+            # A client that sends no labels predates them. Its save is last
+            # write wins, as every save was, and what it wrote is the person's.
+            labels.pop(name, None)
+            continue
+        if theirs == PROVENANCE_USER or (theirs is None and not is_blank(name, new)):
+            # Changed, and either marked as typed or carrying no draft label:
+            # a value the client never got from a draft is one the person typed.
+            labels[name] = PROVENANCE_USER
+            continue
+        if not is_blank(name, new) and _gives_way(name, old, mine, theirs, equal_wins=False):
+            labels[name] = theirs
+            continue
+        set_value(project, name, old)
+    project.provenance = labels

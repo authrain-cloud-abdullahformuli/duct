@@ -1,0 +1,1017 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+--orange: #FF5C00;
+--orange-h: #e05000;
+--navy: #0D0F1A;
+--navy-2: #2a2d3e;
+--navy-3: #6b6f82;
+--white: #ffffff;
+--off: #f7f7f6;
+--border: #ebebea;
+--serif: Georgia, "Times New Roman", Times, serif;
+--sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+--pill: 100px;
+--r: 12px;
+--r-lg: 20px;
+}
+
+html { scroll-behavior: smooth; }
+
+/* Skip to content (shared; used on marketing + blog pages) */
+.skip-link {
+  position: absolute; top: -100%; left: 16px; z-index: 300;
+  padding: 10px 20px; background: var(--navy); color: #fff;
+  font-size: 14px; font-weight: 500; border-radius: var(--r);
+  text-decoration: none; transition: top .15s;
+}
+.skip-link:focus { top: 16px; }
+
+body {
+font-family: var(--sans);
+background: var(--white);
+color: var(--navy);
+-webkit-font-smoothing: antialiased;
+overflow-x: hidden;
+}
+
+/* ── SHARED ── */
+/* Icons: one Lucide sprite (assets/icons.svg, built by scripts/build_site_icons.py).
+   1em so an icon takes the size its container gave the emoji it replaced. */
+.ic { width: 1em; height: 1em; display: inline-block; vertical-align: -.125em; flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.tag {
+display: inline-flex; align-items: center; gap: 6px;
+font-size: 11px; font-weight: 600; letter-spacing: .1em;
+text-transform: uppercase; color: var(--orange); margin-bottom: 20px;
+}
+.tag::before { content: ''; width: 20px; height: 2.5px; background: var(--orange); border-radius: 2px; display: block; }
+
+h2 { font-family: var(--serif); font-size: clamp(32px, 4vw, 50px); line-height: 1.1; letter-spacing: -.5px; color: var(--navy); }
+h2 em { font-style: italic; color: var(--orange); }
+p.sub { font-size: 16px; font-weight: 300; color: var(--navy-3); line-height: 1.75; }
+
+.btn {
+display: inline-flex; align-items: center; gap: 8px;
+padding: 12px 26px; border-radius: var(--pill);
+font-family: var(--sans); font-size: 14px; font-weight: 500;
+white-space: nowrap;
+cursor: pointer; text-decoration: none; border: none; transition: all .2s;
+}
+.btn-orange { background: var(--orange); color: #fff; }
+.btn-orange:hover { background: var(--orange-h); transform: translateY(-2px); box-shadow: 0 8px 24px rgba(255,92,0,.28); }
+.btn-dark { background: var(--navy); color: #fff; }
+.btn-dark:hover { background: var(--navy-2); transform: translateY(-2px); }
+.btn-ghost { background: transparent; color: var(--navy); border: 1.5px solid var(--border); }
+.btn-ghost:hover { border-color: var(--navy); }
+.btn-lg { padding: 15px 34px; font-size: 15px; }
+
+/* ── NAV ── */
+/* Scoped by id: the blog posts carry a second <nav> (previous/next article)
+   and an element selector pinned that one over the header too. */
+#nav {
+position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+height: 62px; padding: 0 52px;
+display: flex; align-items: center; justify-content: space-between;
+background: rgba(255,255,255,.92);
+backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+border-bottom: 1px solid var(--border); transition: box-shadow .3s;
+}
+.logo {
+font-family: var(--serif); font-size: 22px; color: var(--navy);
+text-decoration: none; letter-spacing: -.3px;
+display: flex; align-items: center; gap: 5px;
+}
+.logo-mark { width: 9px; height: 9px; border-radius: 50%; background: var(--orange); animation: pop 2.5s ease-in-out infinite; }
+@keyframes pop { 0%,100% { transform: scale(1); } 50% { transform: scale(1.5); } }
+.nav-links { display: flex; align-items: center; gap: 32px; }
+.nav-link { font-size: 14px; color: var(--navy-3); text-decoration: none; transition: color .2s; }
+.nav-link:hover { color: var(--navy); }
+.nav-link[aria-current="page"] { color: var(--navy); font-weight: 500; }
+.nav-link.nav-link--active-section { color: var(--navy); font-weight: 500; }
+/* GitHub mark: icon-only in the desktop bar, but the label must stay in the DOM.
+   duct.js clones .nav-links into the mobile drawer using textContent and skips
+   any anchor whose text is empty — an icon-only link would silently disappear
+   below 860px. Visually hidden, not display:none, for the same reason. */
+.nav-gh { display: inline-flex; align-items: center; opacity: .55; transition: opacity .2s; }
+.nav-gh:hover { opacity: 1; }
+.nav-gh img { width: 18px; height: 18px; display: block; }
+.nav-gh-label {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+.nav-dropdown { position: relative; }
+.nav-dropdown > .nav-link::after { content: ' ↓'; font-size: 10px; opacity: .5; }
+.dropdown-menu {
+display: none; position: absolute; top: 100%; left: 0;
+padding-top: 10px; background: transparent;
+min-width: 260px;
+}
+.dropdown-menu-inner {
+background: var(--white); border: 1px solid var(--border);
+border-radius: var(--r-lg); padding: 8px;
+box-shadow: 0 20px 60px rgba(0,0,0,.1);
+}
+.nav-dropdown:hover .dropdown-menu { display: block; }
+.dm-item {
+display: flex; align-items: flex-start; gap: 12px;
+padding: 10px 12px; border-radius: var(--r);
+text-decoration: none; color: var(--navy-3);
+font-size: 13px; transition: background .15s, color .15s;
+}
+.dm-item:hover { background: var(--off); color: var(--navy); }
+.dm-item[aria-current="page"] { background: var(--off); color: var(--navy); }
+.dm-item[aria-current="page"] .dm-text span { color: var(--navy-2); }
+.dm-item.disabled { opacity: .4; pointer-events: none; }
+.dm-icon { font-size: 17px; flex-shrink: 0; margin-top: 2px; color: var(--orange); display: inline-flex; }
+.dm-text strong { display: block; font-size: 13px; font-weight: 500; color: var(--navy); margin-bottom: 1px; }
+.dm-text span { font-size: 11px; color: var(--navy-3); }
+.dm-sep { height: 1px; background: var(--border); margin: 6px 4px; }
+.tag-soon {
+font-size: 11px; font-weight: 600; padding: 2px 7px;
+border-radius: 4px; background: #fff7e6; color: #c9a84c;
+border: 1px solid rgba(201,168,76,.3);
+margin-left: auto; flex-shrink: 0; align-self: center;
+}
+.nav-toggle {
+display: none; align-items: center; justify-content: center;
+width: 42px; height: 42px; border-radius: 999px;
+border: 1px solid var(--border); background: var(--white);
+color: var(--navy); cursor: pointer; transition: border-color .2s, background .2s;
+}
+.nav-toggle:hover { border-color: var(--navy); background: var(--off); }
+.nav-toggle svg { width: 18px; height: 18px; }
+/* The mobile bar's right cluster: GitHub mark, Download, menu. Built by
+   duct.js beside the drawer; hidden wherever .nav-links is shown, so the
+   desktop bar never carries two of anything. */
+.nav-actions { display: none; align-items: center; gap: 8px; }
+.nav-actions-gh {
+  width: 42px; height: 42px; border-radius: 999px; justify-content: center;
+  opacity: .8;
+}
+.nav-actions-download { padding: 9px 14px; font-size: 13px; white-space: nowrap; }
+.nav-mobile-backdrop {
+position: fixed; inset: 0; background: rgba(13,15,26,.34);
+opacity: 0; pointer-events: none; transition: opacity .22s ease;
+z-index: 109;
+}
+.nav-mobile-drawer {
+position: fixed; top: 0; right: 0; bottom: 0; width: min(360px, 86vw);
+padding: 88px 24px 24px; background: rgba(255,255,255,.98);
+backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+border-left: 1px solid var(--border); box-shadow: -16px 0 40px rgba(0,0,0,.08);
+transform: translateX(100%); transition: transform .22s ease;
+z-index: 110; overflow-y: auto;
+}
+.nav-mobile-drawer.is-open { transform: translateX(0); }
+.nav-mobile-backdrop.is-open { opacity: 1; pointer-events: auto; }
+.nav-mobile-header {
+display: flex; align-items: center; justify-content: space-between;
+gap: 16px; margin-bottom: 28px;
+}
+.nav-mobile-title { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--navy-3); }
+.nav-mobile-close {
+display: inline-flex; align-items: center; justify-content: center;
+width: 40px; height: 40px; border-radius: 999px;
+border: 1px solid var(--border); background: var(--white);
+color: var(--navy); cursor: pointer;
+}
+.nav-mobile-links { display: flex; flex-direction: column; gap: 10px; }
+.nav-mobile-link {
+display: block; padding: 14px 2px; border-radius: 0;
+border: none; border-bottom: 1px solid rgba(13,15,26,.08); background: transparent;
+text-decoration: none; font-size: 15px; color: var(--navy); line-height: 1.4;
+}
+.nav-mobile-link:hover { color: var(--orange); }
+.nav-mobile-link.nav-mobile-link--current { font-weight: 600; color: var(--navy); }
+.nav-mobile-link-group-label {
+font-size: 11px; font-weight: 600; letter-spacing: .08em;
+text-transform: uppercase; color: var(--navy-3); margin: 10px 2px 4px;
+}
+.nav-mobile-link.btn,
+.nav-mobile-link.nav-mobile-link--cta {
+display: flex; align-items: center; justify-content: center;
+width: 100%; padding: 16px 18px; border-radius: 999px;
+border: none; margin-top: 16px; font-size: 16px; font-weight: 600;
+color: #fff; background: var(--orange);
+box-shadow: 0 16px 36px rgba(255,92,0,.24);
+}
+.nav-mobile-link.btn:hover,
+.nav-mobile-link.nav-mobile-link--cta:hover {
+color: #fff; background: var(--orange-h); border-color: transparent;
+transform: translateY(-1px); box-shadow: 0 18px 42px rgba(255,92,0,.3);
+}
+
+/* ── HERO ── */
+.hero {
+display: flex; align-items: center; justify-content: center; flex-direction: column;
+text-align: center; padding: 120px 52px 64px;
+}
+.hero-pill {
+display: inline-flex; align-items: center; gap: 8px;
+padding: 5px 14px; border-radius: var(--pill);
+border: 1.5px solid var(--orange);
+font-size: 12px; font-weight: 500; color: var(--orange);
+white-space: nowrap; max-width: 100%;
+margin-bottom: 40px; animation: fadeUp .5s ease both;
+}
+.hero-pill-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--orange); }
+h1 {
+font-family: var(--serif);
+font-size: clamp(44px, 6.4vw, 76px);
+line-height: 1.04; letter-spacing: -2px; color: var(--navy);
+max-width: 980px; margin-bottom: 24px;
+animation: fadeUp .5s .08s ease both;
+}
+h1 em { font-style: italic; color: var(--orange); }
+.hero-sub {
+font-size: 18px; font-weight: 300; color: var(--navy-3);
+max-width: 500px; line-height: 1.72; margin: 0 auto 36px;
+animation: fadeUp .5s .16s ease both;
+}
+.hero-form {
+display: flex; align-items: center; justify-content: center;
+gap: 10px; flex-wrap: wrap;
+animation: fadeUp .5s .24s ease both;
+}
+.hero-footnote { font-size: 12px; color: var(--navy-3); margin-top: 16px; animation: fadeUp .5s .32s ease both; }
+
+/* ── PRODUCT SHOT ── a README screenshot, the for-* pages' one heavy element. The shots
+   already carry their own frame and shadow (scripts/shots/shoot.mjs), so no chrome here;
+   each page caps the width at the shot's 1x size so a 2x capture is never upscaled. */
+.shot { padding: 0 52px 72px; }
+.shot-frame { margin: 0 auto; max-width: 1160px; }
+.shot-frame img { display: block; width: 100%; height: auto; border-radius: var(--r-lg); }
+.shot-frame figcaption { margin-top: 14px; font-size: 13px; color: var(--navy-3); text-align: center; line-height: 1.6; }
+
+/* ── THE CHANNEL ── the aqueduct as a divider: two lines of channel, arches under
+   it, water moving through. Masks, so colour follows the section; the fade on
+   the container keeps the ends from ending. */
+.channel { position: relative; height: 64px; max-width: 1160px; margin: 0 auto; pointer-events: none; overflow: hidden; -webkit-mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent); mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent); }
+.channel::before, .channel::after { content: ''; position: absolute; top: 0; bottom: 0; left: 0; right: 0; -webkit-mask-repeat: repeat-x; mask-repeat: repeat-x; -webkit-mask-size: 80px 64px; mask-size: 80px 64px; -webkit-mask-position: 0 0; mask-position: 0 0; }
+.channel::before { background: var(--navy); opacity: .22; -webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 80 64'><g fill='none' stroke='black' stroke-width='2'><path d='M0 5h80M0 13h80'/><path d='M12 64V44a28 28 0 0 1 56 0V64'/></g></svg>"); mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 80 64'><g fill='none' stroke='black' stroke-width='2'><path d='M0 5h80M0 13h80'/><path d='M12 64V44a28 28 0 0 1 56 0V64'/></g></svg>"); }
+.channel::after { left: -80px; background: var(--orange); -webkit-mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 80 64'><path d='M0 9h80' fill='none' stroke='black' stroke-width='2' stroke-dasharray='12 12'/></svg>"); mask-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 80 64'><path d='M0 9h80' fill='none' stroke='black' stroke-width='2' stroke-dasharray='12 12'/></svg>"); animation: flow 2.4s linear infinite; }
+.channel.on-dark::before { background: #fff; opacity: .28; }
+/* The water starts one tile to the left and travels one tile to the right, so
+   without `overflow: hidden` on the channel its box ran 80px past the page:
+   invisible under the fade, but enough to make a phone's viewport 59px too
+   wide, pan the page sideways, and put the consent banner's copy over its
+   own buttons. Body's overflow-x guard does not stop that on mobile Chromium.
+   Translate, never animate mask-position: moving the mask repaints the layer every frame, and ten headless browsers doing that in parallel turned a two-minute test run into a thirty-minute one. A transform composites. The water starts one tile to the left so a tile's travel loops seamlessly. */
+@keyframes flow { to { transform: translateX(80px); } }
+@media (prefers-reduced-motion: reduce) { .channel::after { animation: none; } }
+
+/* ── MOSAIC ── the app's Roman threshold panels (app/public/art/mosaic, copied to
+   assets/art). Decorative, never smaller than 240px, always beside real text. */
+.mosaic { display: block; width: 280px; height: 280px; max-width: 100%; border-radius: var(--r); }
+
+/* ── JOB CARDS ── a product shot over When / Today / With Duct; the home page and
+   the for-* pages share them. */
+.jobs { padding: 100px 52px; }
+.jobs-inner { max-width: 1160px; margin: 0 auto; }
+.job-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 52px; }
+.job { border: 1.5px solid var(--border); border-radius: var(--r-lg); background: var(--white); overflow: hidden; display: flex; flex-direction: column; }
+.job-shot { aspect-ratio: 3 / 2; background: var(--off); border-bottom: 1px solid var(--border); overflow: hidden; }
+.job-shot img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top left; }
+.job-body { padding: 24px 24px 28px; display: flex; flex-direction: column; gap: 14px; }
+.job h3 { font-family: var(--serif); font-size: 22px; color: var(--navy); letter-spacing: -.2px; line-height: 1.2; }
+.job p { font-size: 14px; color: var(--navy-3); line-height: 1.7; }
+.job dl { display: grid; grid-template-columns: 72px 1fr; gap: 8px 12px; margin: 0; }
+.job dt { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--navy-3); padding-top: 4px; }
+.job dd { font-size: 14px; color: var(--navy-3); line-height: 1.65; margin: 0; }
+.job dd.with { color: var(--navy); }
+@media (max-width: 860px) {
+  .jobs { padding: 64px 24px; }
+  .job-grid { grid-template-columns: 1fr; }
+}
+
+/* ── STRIP ── */
+.strip { padding: 36px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); overflow: hidden; }
+.strip-label { text-align: center; font-size: 11px; font-weight: 500; letter-spacing: .1em; text-transform: uppercase; color: var(--navy-3); margin-bottom: 22px; }
+.marquee { display: flex; gap: 56px; width: max-content; animation: scroll 26s linear infinite; }
+.marquee:hover { animation-play-state: paused; }
+.marquee span { font-family: var(--serif); font-size: 14px; color: var(--navy); opacity: .25; white-space: nowrap; }
+@keyframes scroll { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+
+/* ── PROBLEM ── */
+.problem { padding: 100px 52px; max-width: 1160px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 80px; align-items: center; }
+.pain-list { list-style: none; margin-top: 32px; display: flex; flex-direction: column; gap: 12px; }
+.pain-item {
+display: flex; align-items: flex-start; gap: 14px;
+padding: 16px 20px; border-radius: var(--r);
+border: 1px solid var(--border); background: var(--off);
+font-size: 14px; color: var(--navy-3); line-height: 1.65;
+transition: border-color .2s, transform .2s;
+}
+.pain-item:hover { border-color: var(--orange); transform: translateX(4px); color: var(--navy-2); }
+.pi-icon { font-size: 18px; flex-shrink: 0; margin-top: 2px; color: var(--orange); display: inline-flex; }
+
+.diag { border: 1px solid var(--border); border-radius: var(--r-lg); overflow: hidden; }
+.diag-header { padding: 14px 20px; background: var(--navy); display: flex; align-items: center; gap: 8px; }
+.diag-dot { width: 10px; height: 10px; border-radius: 50%; }
+.diag-body { padding: 20px; display: flex; flex-direction: column; gap: 10px; background: var(--off); }
+.diag-tool {
+display: flex; align-items: center; gap: 12px;
+padding: 11px 14px; background: var(--white);
+border: 1px solid var(--border); border-radius: var(--r); font-size: 13px;
+}
+.diag-tool.dim { opacity: .35; }
+.diag-chip { width: 28px; height: 28px; border-radius: 7px; display: flex; align-items: center; justify-content: center; font-size: 14px; flex-shrink: 0; }
+.diag-info { flex: 1; }
+.diag-info b { display: block; font-weight: 500; font-size: 12px; color: var(--navy); }
+.diag-info s { font-size: 11px; color: var(--navy-3); font-style: normal; }
+.diag-divider { display: flex; align-items: center; gap: 8px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--navy-3); }
+.diag-divider::before, .diag-divider::after { content: ''; flex: 1; height: 1px; border-top: 1px dashed var(--border); }
+.diag-result { padding: 14px 16px; background: var(--orange); border-radius: var(--r); font-size: 13px; color: #fff; line-height: 1.6; }
+.diag-result strong { font-weight: 600; display: block; margin-bottom: 3px; }
+
+/* ── HOW ── */
+.how { padding: 96px 52px; background: var(--navy); }
+.how-inner { max-width: 1160px; margin: 0 auto; }
+.how .tag { color: var(--orange); }
+.how .tag::before { background: var(--orange); }
+.how h2 { color: #fff; margin-bottom: 56px; }
+.how h2 em { color: var(--orange); }
+.steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; }
+.step { padding: 36px 32px; border-right: 1px solid rgba(255,255,255,.08); transition: background .25s; }
+.step:last-child { border-right: none; }
+.step:hover { background: rgba(255,255,255,.03); }
+.step-num { font-family: var(--serif); font-size: 11px; color: var(--orange); letter-spacing: .08em; margin-bottom: 24px; display: block; }
+.step-icon { font-size: 30px; margin-bottom: 18px; display: block; color: var(--orange); }
+.step:last-child .step-icon { filter: none; color: #fff; font-size: 30px; }
+.step-title { font-family: var(--serif); font-size: 22px; color: #fff; margin-bottom: 12px; letter-spacing: -.2px; }
+.step-body { font-size: 14px; font-weight: 300; color: rgba(255,255,255,.5); line-height: 1.72; }
+
+/* ── FEATURES ── */
+.features { padding: 100px 52px; max-width: 1160px; margin: 0 auto; }
+.feat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; border: 1px solid var(--border); border-radius: var(--r-lg); overflow: hidden; margin-top: 52px; background: var(--border); }
+.feat { padding: 36px; background: var(--white); transition: background .2s; cursor: default; }
+.feat:hover { background: var(--off); }
+.feat-label { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--orange); margin-bottom: 14px; display: block; }
+.feat-title { font-family: var(--serif); font-size: 22px; color: var(--navy); margin-bottom: 10px; letter-spacing: -.2px; }
+.feat-body { font-size: 14px; font-weight: 300; color: var(--navy-3); line-height: 1.72; }
+
+/* ── AUDIENCE ── */
+.audience { padding: 96px 52px; background: var(--off); border-top: 1px solid var(--border); }
+.aud-inner { max-width: 1160px; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 72px; align-items: start; }
+.aud-cards { display: flex; flex-direction: column; gap: 12px; }
+.aud-card { background: var(--white); border: 1.5px solid var(--border); border-radius: var(--r-lg); padding: 16px 20px; display: flex; align-items: center; gap: 14px; transition: border-color .2s; }
+.aud-card.hi { border-color: var(--orange); }
+.aud-card:hover { border-color: var(--orange); }
+.aud-av { width: 36px; height: 36px; border-radius: 50%; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 17px; color: var(--navy); }
+.aud-name { font-size: 14px; font-weight: 500; color: var(--navy); display: block; }
+.aud-role { font-size: 12px; color: var(--navy-3); }
+.aud-badge { margin-left: auto; flex-shrink: 0; padding: 4px 10px; border-radius: var(--pill); font-size: 11px; font-weight: 500; color: var(--orange); border: 1px solid var(--orange); }
+.aud-badge.off { color: var(--navy-3); border-color: var(--border); }
+
+/* ── STATS ── */
+.stats { background: var(--orange); padding: 64px 52px; }
+.stats-inner { max-width: 1160px; margin: 0 auto; display: grid; grid-template-columns: repeat(4, 1fr); gap: 32px; text-align: center; }
+.stat-n { font-family: var(--serif); font-size: 54px; font-weight: 400; color: #fff; display: block; letter-spacing: -1.5px; line-height: 1; margin-bottom: 8px; }
+.stat-l { font-size: 13px; font-weight: 300; color: rgba(255,255,255,.7); }
+
+/* ── CTA ── */
+.cta { padding: 120px 52px; text-align: center; border-top: 1px solid var(--border); }
+.cta-inner { max-width: 560px; margin: 0 auto; }
+.cta h2 { font-size: clamp(38px, 6vw, 62px); margin-bottom: 18px; }
+.cta .sub { max-width: 400px; margin: 0 auto 44px; }
+/* One download button now, not an input plus a button — so it has to centre itself. */
+.cta-form { display: flex; gap: 10px; max-width: 420px; margin: 0 auto; justify-content: center; }
+.cta-note { font-size: 12px; color: var(--navy-3); margin-top: 16px; }
+
+/* ── FOOTER ── */
+footer:not(.footer-expanded) { padding: 44px 52px; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 20px; }
+.footer-copy { font-size: 12px; color: var(--navy-3); }
+.footer-email { font-size: 13px; color: var(--navy-3); text-decoration: none; transition: color .2s; }
+.footer-email:hover { color: var(--navy); }
+
+/* Expanded footer (home, legal pages) */
+.footer-expanded { padding: 64px 52px 32px; border-top: 1px solid var(--border); }
+.footer-top { max-width: 1160px; margin: 0 auto; display: flex; align-items: flex-start; justify-content: space-between; gap: 48px; flex-wrap: wrap; padding-bottom: 40px; border-bottom: 1px solid var(--border); }
+.footer-brand p { font-size: 13px; font-weight: 300; color: var(--navy-3); margin-top: 10px; max-width: 220px; line-height: 1.65; }
+.footer-cols { display: flex; gap: 52px; flex-wrap: wrap; }
+.footer-col h4 { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--navy-3); margin-bottom: 14px; }
+/* Padding, not margin, between the links: the same rhythm, but a thumb has
+   the whole 25px row to hit instead of a 16px line. */
+.footer-col a { display: block; font-size: 13px; font-weight: 300; color: var(--navy-3); text-decoration: none; padding: 4px 0 5px; transition: color .2s; }
+.footer-col a:hover { color: var(--navy); }
+.footer-bottom-row { max-width: 1160px; margin: 28px auto 0; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.footer-bottom-row span { font-size: 12px; color: var(--navy-3); }
+.footer-lang, .footer-legal { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; }
+.footer-lang a, .footer-legal a { color: var(--navy-3); text-decoration: none; }
+.footer-lang a:hover, .footer-legal a:hover, .footer-lang a[aria-current="true"] { color: var(--navy); }
+
+/* ── LANGUAGE SWITCH ──
+   A globe and a two-letter code in the bar, opening the same card as the Free
+   Tools menu. It replaced a native <select> on 2026-09-29: the bordered pill
+   read as the loudest thing in the bar after Download, and its list was the
+   browser's own, in the browser's font. The menu is a disclosure of plain
+   links, not an ARIA menu, so it needs no arrow-key model, and every link is a
+   real address that works with scripts off. Hover opens it on a mouse; a tap,
+   Enter or Space opens it anywhere. A language's own name is never translated
+   (see build_site_i18n.py), so someone who landed in the wrong language can
+   still find theirs. */
+.nav-lang { position: relative; display: flex; align-items: center; }
+.nav-lang-btn {
+  display: inline-flex; align-items: center; gap: 5px; font: inherit; font-size: 12px; font-weight: 600;
+  letter-spacing: .04em; color: var(--navy-3); background: transparent; border: 0; border-radius: var(--pill);
+  padding: 6px 8px; cursor: pointer; transition: color .2s, background .2s;
+}
+.nav-lang-btn .ic { width: 15px; height: 15px; }
+.nav-lang-btn .nav-lang-caret { width: 12px; height: 12px; opacity: .6; transition: transform .2s ease-out; }
+.nav-lang-btn:hover, .nav-lang.is-open .nav-lang-btn { color: var(--navy); background: var(--off); }
+.nav-lang-btn:focus-visible { outline: 2px solid var(--orange); outline-offset: 2px; }
+.nav-lang.is-open .nav-lang-caret { transform: rotate(180deg); }
+.nav-lang-menu { display: none; position: absolute; top: 100%; right: 0; padding-top: 10px; min-width: 210px; z-index: 20; }
+.nav-lang.is-open .nav-lang-menu { display: block; }
+@media (hover: hover) { .nav-lang:hover .nav-lang-menu { display: block; } }
+.nav-lang-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 9px 12px;
+  border-radius: var(--r); text-decoration: none; font-size: 13px; color: var(--navy-2); transition: background .15s, color .15s;
+}
+/* The code is an attribute, drawn here, so the link's text stays the language's own name: one
+   untranslated string, not a name and a code the translator sees as a phrase. */
+.nav-lang-item::after { content: attr(data-code); font-size: 11px; font-weight: 600; letter-spacing: .06em; color: var(--navy-3); }
+.nav-lang-item:hover, .nav-lang-item[aria-current="true"] { background: var(--off); color: var(--navy); }
+.nav-lang-item[aria-current="true"]::after { color: var(--navy); }
+.nav-lang-item:focus-visible { outline: 2px solid var(--orange); outline-offset: -2px; }
+/* The phone drawer lists the languages as a row of pills: nothing to open */
+.nav-mobile-lang { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 6px; }
+.nav-mobile-lang .nav-lang-item { border: 1px solid var(--border); border-radius: var(--pill); padding: 6px 12px; }
+.nav-mobile-lang .nav-lang-item[aria-current="true"] { border-color: var(--navy); }
+.nav-mobile-lang .nav-lang-item::after { content: none; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+
+/* ── ANIMATIONS ── */
+@keyframes fadeUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+.reveal { opacity: 0; transform: translateY(24px); transition: opacity .55s ease, transform .55s ease; }
+.reveal.in { opacity: 1; transform: translateY(0); }
+/* Without scripting nothing adds .in, and every revealed section stayed at
+   opacity 0: a blank page for a no-JS visitor and for any crawler that does
+   not run scripts. */
+@media (scripting: none) { .reveal { opacity: 1; transform: none; } }
+
+/* ── RESPONSIVE ── */
+@media (max-width: 860px) {
+#nav { padding: 0 16px 0 20px; }
+.nav-links { display: none; }
+.nav-actions { display: inline-flex; }
+.nav-toggle { display: inline-flex; }
+.hero { padding: 100px 24px 60px; }
+.hero-form { flex-direction: column; align-items: stretch; max-width: 320px; margin: 0 auto; }
+.shot { padding: 0 24px 56px; }
+.problem { grid-template-columns: 1fr; gap: 48px; padding: 64px 24px; }
+.steps { grid-template-columns: 1fr; }
+.step { border-right: none; border-bottom: 1px solid rgba(255,255,255,.08); }
+.feat-grid { grid-template-columns: 1fr; background: none; border: none; gap: 16px; }
+.feat { border: 1px solid var(--border); border-radius: var(--r-lg); }
+.aud-inner { grid-template-columns: 1fr; gap: 40px; }
+.stats-inner { grid-template-columns: repeat(2, 1fr); }
+.how, .features, .audience, .cta { padding-left: 24px; padding-right: 24px; }
+.cta-form { flex-direction: column; }
+footer:not(.footer-expanded) { flex-direction: column; align-items: flex-start; padding: 32px 24px; }
+.footer-expanded { padding: 40px 24px 24px; }
+.footer-cols { gap: 32px; }
+}
+
+/* ── BLOG ── */
+
+.blog-hero { padding: 120px 52px 56px; text-align: center; border-bottom: 1px solid var(--border); }
+/* The global h1 caps its width; without auto side margins a centred hero's
+   headline sat flush left while its subtitle stayed centred. */
+.blog-hero h1 { font-family: var(--serif); font-size: clamp(36px, 5vw, 56px); color: var(--navy); margin: 0 auto 12px; line-height: 1.1; }
+.blog-hero p { font-size: 16px; font-weight: 300; color: var(--navy-3); max-width: 480px; margin: 0 auto; }
+
+.blog-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 24px; max-width: 1040px; margin: 0 auto; padding: 64px 52px 96px; }
+
+.blog-card { display: block; text-decoration: none; color: inherit; border: 1px solid var(--border); border-radius: var(--r-lg); overflow: hidden; background: var(--white); transition: background .15s, border-color .15s, transform .2s; }
+.blog-card:hover { background: var(--off); border-color: var(--orange); transform: translateY(-3px); }
+/* The cover is the post's Open Graph card, so the box keeps that card's ratio. */
+.blog-card-img { width: 100%; height: auto; aspect-ratio: 1200/630; object-fit: cover; display: block; background: var(--off); border-bottom: 1px solid var(--border); }
+.blog-card-body { padding: 24px 28px 28px; }
+.blog-card-title { font-family: var(--serif); font-size: 21px; color: var(--navy); margin: 10px 0 10px; line-height: 1.25; }
+.blog-card-excerpt { font-size: 14px; font-weight: 300; color: var(--navy-3); line-height: 1.65; margin-bottom: 18px; }
+.blog-card-meta { font-size: 12px; color: var(--navy-3); display: flex; gap: 16px; }
+
+.article-header { max-width: 700px; margin: 0 auto; padding: 80px 24px 0; }
+.article-header .tag { margin-bottom: 20px; }
+.article-header h1 { font-family: var(--serif); font-size: clamp(28px, 4vw, 44px); line-height: 1.15; color: var(--navy); margin-bottom: 20px; }
+.article-meta { font-size: 13px; color: var(--navy-3); display: flex; gap: 20px; margin-bottom: 36px; }
+/* How the post was made, under the byline: the disclosure Google's generative-AI guidance asks for, read by people, so it is text and not a badge. */
+.article-made { font-size: 13px; color: var(--navy-3); margin: -24px 0 36px; max-width: 700px; line-height: 1.6; }
+.article-hero-img { max-width: 860px; margin: 0 auto; padding: 0 24px 0; display: block; }
+.article-hero-img img { width: 100%; border-radius: var(--r-lg); display: block; }
+
+.prose { max-width: 700px; margin: 0 auto; padding: 48px 24px 96px; }
+.prose h2 { font-family: var(--serif); font-size: clamp(22px, 3vw, 28px); color: var(--navy); margin: 52px 0 16px; line-height: 1.2; }
+.prose h3 { font-family: var(--serif); font-size: 19px; color: var(--navy); margin: 36px 0 12px; }
+.prose p { font-size: 16px; font-weight: 300; line-height: 1.8; color: var(--navy-3); margin: 0 0 22px; }
+.prose ul, .prose ol { padding-left: 24px; margin: 0 0 22px; }
+.prose li { font-size: 16px; font-weight: 300; line-height: 1.75; color: var(--navy-3); margin-bottom: 8px; }
+.prose strong { font-weight: 600; color: var(--navy); }
+.prose em { font-style: italic; }
+.prose a { color: var(--orange); text-decoration: none; border-bottom: 1px solid rgba(255,92,0,.3); transition: border-color .15s; }
+.prose a:hover { border-bottom-color: var(--orange); }
+.prose img { width: 100%; border-radius: var(--r-lg); margin: 32px 0; display: block; }
+.prose blockquote { border-left: 3px solid var(--orange); padding: 4px 0 4px 24px; margin: 36px 0; }
+.prose blockquote p { font-style: italic; color: var(--navy); margin: 0; }
+.prose hr { border: none; border-top: 1px solid var(--border); margin: 52px 0; }
+.prose pre { background: var(--navy); color: #e5e7eb; border-radius: var(--r); padding: 20px 24px; overflow-x: auto; margin: 28px 0; font-size: 13px; line-height: 1.6; }
+.prose code { font-family: ui-monospace, monospace; font-size: 13px; background: var(--off); border: 1px solid var(--border); padding: 2px 6px; border-radius: 4px; }
+.prose pre code { background: none; border: none; padding: 0; color: inherit; }
+
+.blog-cta { border-top: 1px solid var(--border); padding: 80px 24px; text-align: center; }
+.blog-cta h2 { font-family: var(--serif); font-size: clamp(28px, 4vw, 40px); color: var(--navy); margin-bottom: 12px; }
+.blog-cta p { font-size: 15px; font-weight: 300; color: var(--navy-3); margin-bottom: 28px; }
+.blog-cta .cta-form { max-width: 460px; margin: 0 auto; }
+.blog-cta .tag { margin-bottom: 14px; }
+.blog-cta .cta-note { margin: 16px 0 0; }
+
+/* FAQ */
+/* ── RELATED TOOLS (shared tool-page band; links filled by duct.js) ── */
+.related-tools-banner {
+  padding: 0 24px;
+  max-width: 1160px;
+  margin: 0 auto 64px;
+}
+.related-tools-banner-inner {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 36px 36px 40px;
+  background: var(--white);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: 0 14px 48px rgba(13, 15, 26, 0.07);
+}
+.related-tools-banner-inner .tag { margin-bottom: 12px; }
+.related-tools-banner-inner h2 {
+  font-family: var(--serif);
+  font-size: clamp(26px, 4vw, 32px);
+  line-height: 1.15;
+  color: var(--navy);
+  margin-bottom: 12px;
+  letter-spacing: -0.3px;
+}
+.related-tools-banner-inner h2 em { color: var(--orange); font-style: italic; }
+.related-tools-banner-desc {
+  font-size: 15px;
+  font-weight: 300;
+  color: var(--navy-3);
+  line-height: 1.75;
+  margin: 0 0 20px;
+  max-width: 52ch;
+}
+
+/* ── TOOL BRIDGE ── on a tools/* page, the product beside the tool's one answer:
+   the headline says what the calculator cannot tell you, the shot shows the
+   agent telling it. Shared here because twelve pages carry it; the shot is a
+   .shot-frame so it opens in the lightbox like every other product image. */
+.duct-bridge { max-width: 1160px; margin: 0 auto 64px; padding: 0 24px; }
+.duct-bridge-inner { display: grid; grid-template-columns: 5fr 7fr; gap: 40px; align-items: center; padding: 36px 40px; background: var(--off); border: 1px solid var(--border); border-radius: var(--r-lg); }
+.duct-bridge-headline { font-family: var(--serif); font-size: clamp(22px, 2.6vw, 30px); color: var(--navy); line-height: 1.25; letter-spacing: -.2px; margin: 0 0 14px; }
+.duct-bridge-body { font-size: 15.5px; color: var(--navy-3); line-height: 1.7; margin: 0 0 18px; }
+.duct-bridge-link { font-size: 14px; font-weight: 600; color: var(--orange); text-decoration: none; }
+.duct-bridge-link:hover { text-decoration: underline; }
+.duct-bridge-actions { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; margin: 0; }
+.duct-bridge-shot { margin: 0; min-width: 0; }
+.duct-bridge-shot img { box-shadow: 0 12px 40px rgba(13, 15, 26, .14); }
+.duct-bridge-shot figcaption { text-align: left; margin-top: 10px; }
+@media (max-width: 860px) { .duct-bridge-inner { grid-template-columns: 1fr; gap: 24px; padding: 24px; } }
+
+/* Inline validation — tool calculators (see assets/tool-validation.js) */
+.tool-card > .tool-form-error {
+  display: none;
+  margin: -8px 40px 28px;
+  padding: 12px 16px;
+  border-radius: var(--r);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  background: #fef2f2;
+  font-size: 14px;
+  font-weight: 500;
+  color: #991b1b;
+  line-height: 1.45;
+}
+.tool-card > .tool-form-error.show {
+  display: block;
+}
+/* The worked example a calculator opens on (assets/tool-validation.js) */
+.tool-example-note {
+  margin: 0 0 16px;
+  padding: 8px 12px;
+  border-radius: var(--r);
+  background: var(--off);
+  border: 1px dashed var(--border);
+  font-size: 13px;
+  color: var(--navy-3);
+}
+.field input.field-invalid,
+.field textarea.field-invalid {
+  border-color: #ef4444;
+}
+/* ── LIGHTBOX (click-to-enlarge product shots; duct.js adds the markup) ── */
+.zoomable { cursor: zoom-in; }
+.lightbox { position: fixed; inset: 0; z-index: 300; background: rgba(13,15,26,.88); opacity: 0; transition: opacity .2s; }
+.lightbox.is-open { opacity: 1; }
+/* The enlarged shot fits the screen first: a whole screenshot nobody has to
+   scroll to see. Zooming is the second step, and only then does it scroll. */
+.lightbox-scroll { position: absolute; inset: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; padding: 64px 24px 72px; cursor: zoom-out; }
+.lightbox-scroll img { max-width: 100%; max-height: 100%; width: auto; height: auto; border-radius: 12px; box-shadow: 0 30px 80px rgba(0,0,0,.5); cursor: default; }
+.lightbox.can-zoom .lightbox-scroll img { cursor: zoom-in; }
+/* Flex centring clips whatever overflows to the left, so the zoomed view goes
+   back to a scrolling block. */
+.lightbox.is-zoomed .lightbox-scroll { display: block; overflow: auto; -webkit-overflow-scrolling: touch; text-align: center; }
+.lightbox.is-zoomed .lightbox-scroll img { max-width: none; max-height: none; vertical-align: top; cursor: zoom-out; }
+.lightbox-close { position: fixed; top: 12px; right: 12px; width: 44px; height: 44px; border-radius: 50%; border: 1px solid rgba(255,255,255,.22); background: rgba(13,15,26,.72); color: #fff; font-size: 30px; line-height: 40px; padding: 0; cursor: pointer; }
+.lightbox-close:hover, .lightbox-close:focus-visible { background: rgba(13,15,26,.92); outline: none; }
+.lightbox-zoom { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); display: none; align-items: center; gap: 8px; height: 40px; padding: 0 18px; border: 1px solid rgba(255,255,255,.22); border-radius: 999px; background: rgba(13,15,26,.72); color: #fff; font-family: inherit; font-size: 13px; font-weight: 600; letter-spacing: .01em; cursor: pointer; }
+.lightbox.can-zoom .lightbox-zoom { display: inline-flex; }
+.lightbox-zoom:hover, .lightbox-zoom:focus-visible { background: rgba(13,15,26,.92); outline: none; }
+.lightbox-zoom .ic { width: 15px; height: 15px; }
+@media (max-width: 860px) {
+  .lightbox-scroll { padding: 60px 12px 68px; }
+  .lightbox.is-zoomed .lightbox-scroll { text-align: left; }
+}
+
+@media (max-width: 600px) {
+  .hero-pill { font-size: 11px; padding: 5px 12px; gap: 7px; }
+  .tool-card > .tool-form-error {
+    margin: -8px 24px 22px;
+  }
+}
+/* #related-tools: ID bumps specificity so pills win without per-page .insight-link rules (matches tools/saas-metrics-calculator.html) */
+#related-tools .insight-links {
+  margin-top: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+#related-tools .insight-link {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--orange);
+  text-decoration: none;
+  border: 1px solid rgba(37, 99, 235, 0.25);
+  padding: 6px 12px;
+  border-radius: var(--pill);
+  background: var(--white);
+  transition: background 0.15s;
+  display: inline-flex;
+  align-items: center;
+}
+#related-tools .insight-link:hover {
+  background: #dbeafe;
+}
+@media (max-width: 640px) {
+  .related-tools-banner-inner { padding: 28px 22px 32px; }
+}
+
+.faq { padding: 96px 52px; background: var(--off); }
+.faq-inner { max-width: 760px; margin: 0 auto; }
+.faq-inner h2 { margin-bottom: 48px; }
+.faq-list { border-top: 1px solid var(--border); }
+.faq-item { border-bottom: 1px solid var(--border); }
+.faq-q { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; cursor: pointer; font-size: 17px; font-weight: 500; line-height: 1.4; color: var(--navy); list-style: none; gap: 16px; }
+.faq-q::-webkit-details-marker { display: none; }
+.faq-q::after { content: '+'; font-size: 22px; font-weight: 300; color: var(--navy-3); flex-shrink: 0; transition: transform .25s ease; }
+details[open] > .faq-q::after { transform: rotate(45deg); }
+.faq-a { padding: 0 32px 24px 0; font-size: 15px; font-weight: 300; line-height: 1.75; color: var(--navy-3); }
+
+@media (max-width: 860px) {
+  .blog-hero { padding: 96px 24px 40px; }
+  .blog-grid { grid-template-columns: 1fr; padding: 40px 24px 64px; }
+  .article-header { padding: 72px 24px 0; }
+  .article-hero-img { padding: 0 24px; }
+  .blog-cta { padding: 60px 24px; }
+  .faq { padding: 64px 24px; }
+  .faq-q { font-size: 16px; }
+}
+
+/* Shown only until duct-partials.js swaps in the real footer — or permanently if
+   that fetch fails or JS is off. Google's OAuth review fetches without JS and
+   requires a privacy policy link on the homepage, so this cannot be JS-only. */
+.legal-fallback { text-align: center; padding: 40px 24px; font-size: 13px; }
+.legal-fallback a { color: inherit; opacity: .7; text-decoration: underline; text-underline-offset: 2px; margin: 0 8px; }
+.legal-fallback a:hover { opacity: 1; }
+
+/* ── CHANGELOG ── */
+/* Shared by /changelog/ and every /changelog/<year> archive page, so these live
+   here rather than inline: a year archive is a copy of the index and must not
+   carry its own fork of the layout. */
+
+.cl-hero { padding: 120px 52px 40px; text-align: center; }
+.cl-hero h1 { font-family: var(--serif); font-size: clamp(36px, 5vw, 56px); color: var(--navy); line-height: 1.1; letter-spacing: -1px; max-width: 760px; margin: 0 auto 12px; }
+.cl-hero h1 em { font-style: italic; color: var(--orange); }
+.cl-hero p { font-size: 16px; font-weight: 300; color: var(--navy-3); max-width: 560px; margin: 0 auto; line-height: 1.7; }
+
+/* Year strip: the archive switcher. It is a div with role="navigation", not a
+   <nav>: the bare `nav` rule in this stylesheet is the fixed site header, and a
+   second <nav> here parks itself on top of the real one. It stays on the page
+   with a single year so the layout does not shift the January a second appears. */
+.cl-years { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; padding: 0 52px; }
+.cl-year { font-size: 13px; font-weight: 500; color: var(--navy-3); text-decoration: none; padding: 7px 16px; border: 1px solid var(--border); border-radius: var(--pill); background: var(--white); transition: border-color .15s, color .15s, background .15s; }
+.cl-year:hover { border-color: var(--navy); color: var(--navy); }
+.cl-year[aria-current="page"] { background: var(--navy); border-color: var(--navy); color: #fff; }
+.cl-year-feed { color: var(--orange); }
+.cl-year-feed:hover { border-color: var(--orange); color: var(--orange); }
+
+.cl-source { max-width: 620px; margin: 20px auto 0; text-align: center; font-size: 13px; font-weight: 300; color: var(--navy-3); line-height: 1.7; }
+.cl-source a { color: var(--orange); text-decoration: none; border-bottom: 1px solid rgba(255, 92, 0, .3); }
+.cl-source a:hover { border-bottom-color: var(--orange); }
+
+.cl-wrap { max-width: 940px; margin: 32px auto 0; padding: 0 52px 96px; border-top: 1px solid var(--border); }
+
+.cl-release { display: grid; grid-template-columns: 190px 1fr; gap: 48px; padding: 56px 0; border-bottom: 1px solid var(--border); }
+.cl-release:last-child { border-bottom: none; }
+
+.cl-rail { position: sticky; top: 92px; align-self: start; }
+.cl-date { display: block; font-size: 14px; font-weight: 500; color: var(--navy); margin-bottom: 8px; }
+.cl-version { display: inline-flex; align-items: center; font-family: ui-monospace, monospace; font-size: 12px; font-weight: 500; color: var(--orange); background: rgba(255, 92, 0, .07); border: 1px solid rgba(255, 92, 0, .22); border-radius: var(--pill); padding: 3px 10px; text-decoration: none; }
+a.cl-version:hover { background: rgba(255, 92, 0, .14); }
+.cl-permalink { display: inline-block; margin-top: 12px; font-size: 12px; color: var(--navy-3); text-decoration: none; opacity: 0; transition: opacity .15s, color .15s; }
+.cl-release:hover .cl-permalink, .cl-permalink:focus { opacity: 1; }
+.cl-permalink:hover { color: var(--orange); }
+
+.cl-title { font-family: var(--serif); font-size: clamp(24px, 3vw, 30px); line-height: 1.2; color: var(--navy); margin-bottom: 14px; letter-spacing: -.3px; }
+.cl-lede { font-size: 16px; font-weight: 300; line-height: 1.75; color: var(--navy-3); margin-bottom: 8px; max-width: 60ch; }
+.cl-lede strong { font-weight: 600; color: var(--navy); }
+
+.cl-group { margin-top: 30px; }
+.cl-group-label { font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--navy-3); margin-bottom: 12px; }
+.cl-list { list-style: none; padding: 0; margin: 0; }
+.cl-list li { position: relative; padding-left: 20px; font-size: 15px; font-weight: 300; line-height: 1.7; color: var(--navy-3); margin-bottom: 10px; max-width: 62ch; }
+.cl-list li::before { content: ''; position: absolute; left: 2px; top: 11px; width: 5px; height: 5px; border-radius: 50%; background: var(--orange); opacity: .55; }
+.cl-list li strong { font-weight: 600; color: var(--navy); }
+.cl-list li a { color: var(--orange); text-decoration: none; border-bottom: 1px solid rgba(255, 92, 0, .3); }
+.cl-list li a:hover { border-bottom-color: var(--orange); }
+
+/* Scroll-margin so a #permalink lands below the fixed nav. */
+.cl-release[id] { scroll-margin-top: 84px; }
+
+@media (max-width: 860px) {
+  .cl-hero { padding: 96px 24px 32px; }
+  .cl-years { padding: 0 24px; }
+  .cl-source { padding: 0 24px; margin-top: 16px; }
+  .cl-wrap { padding: 0 24px 64px; }
+  .cl-release { grid-template-columns: 1fr; gap: 18px; padding: 40px 0; }
+  .cl-rail { position: static; display: flex; align-items: center; gap: 12px; }
+  .cl-date { margin-bottom: 0; }
+  .cl-permalink { display: none; }
+}
+
+/* ── INTEGRATIONS ── */
+/* Shared by /integrations/ and every connector page. All of them are generated
+   from one template (scripts/build_integrations.py), so the layout lives here
+   once rather than as a copy inline in each page, like the changelog's. */
+
+/* The hub: a count read from the code, then one card per connector */
+.ig-hub-hero { padding-bottom: 32px; }
+.ig-hub-hero h1 { font-size: clamp(40px, 5.6vw, 68px); }
+.ig-hub-hero .hero-sub { max-width: 560px; }
+.ig-logos { display: flex; flex-wrap: wrap; justify-content: center; gap: 18px 24px; max-width: 720px; margin: 0 auto 36px; animation: fadeUp .5s .24s ease both; }
+.ig-logos img { display: block; width: 30px; height: 30px; }
+.ig-stats { list-style: none; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); width: 100%; max-width: 880px; margin: 0 auto; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--white); animation: fadeUp .5s .32s ease both; }
+.ig-stats li { padding: 20px 16px; text-align: center; border-right: 1px solid var(--border); }
+.ig-stats li:last-child { border-right: 0; }
+.ig-stats b { display: block; font-family: var(--serif); font-size: 40px; font-weight: 400; line-height: 1; color: var(--navy); font-variant-numeric: lining-nums; }
+.ig-stats li:last-child b { color: var(--orange); }
+.ig-stats span { display: block; margin-top: 8px; font-size: 13px; line-height: 1.4; color: var(--navy-3); }
+
+.ig-hub { max-width: 1160px; margin: 0 auto; padding: 16px 52px 96px; }
+.ig-group { margin-top: 56px; }
+.ig-group-h { font-size: clamp(24px, 2.6vw, 30px); margin-bottom: 18px; }
+.ig-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.ig-card { position: relative; display: flex; flex-direction: column; gap: 8px; padding: 22px 22px 20px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--white); color: var(--navy); text-decoration: none; scroll-margin-top: 90px; transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease; }
+.ig-card img { display: block; width: 36px; height: 36px; margin-bottom: 6px; }
+.ig-card-body { flex: 1; display: flex; flex-direction: column; gap: 8px; }
+.ig-card-name { font-size: 17px; font-weight: 600; }
+.ig-card-line { flex: 1; font-size: 14px; line-height: 1.6; color: var(--navy-3); }
+.ig-card-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.ig-chip { font-size: 11.5px; font-weight: 500; line-height: 1.5; padding: 2px 9px; border-radius: var(--pill); border: 1px solid var(--border); background: var(--off); color: var(--navy-2); }
+.ig-chip.is-write { border-color: #ffd6bf; background: #fff1e8; color: #9a3a00; }
+.ig-chip.is-soon { border-color: #f3dfb0; background: #fff7e6; color: #7a5200; }
+.ig-card-go { position: absolute; top: 24px; right: 22px; font-size: 18px; color: var(--navy-3); transition: transform .2s ease, color .2s ease; }
+.ig-card.is-link:hover { transform: translateY(-3px); border-color: var(--navy); box-shadow: 0 16px 40px rgba(13,15,26,.08); }
+.ig-card.is-link:hover .ig-card-go { transform: translateX(3px); color: var(--navy); }
+.ig-card.is-soon { background: var(--off); }
+.ig-card.is-soon img { filter: grayscale(1); opacity: .55; }
+.ig-card:target { outline: 2px solid var(--orange); outline-offset: 3px; }
+/* The featured card is the hub's one heavier element: full width, navy, the
+   connector's reason to exist in a serif line. Its logo sits on a white tile
+   because a black brand mark disappears on navy. */
+.ig-card.is-featured { grid-column: 1 / -1; flex-direction: row; align-items: center; gap: 24px; padding: 28px 64px 28px 28px; border-color: var(--navy); background: var(--navy); color: #fff; }
+.ig-card.is-featured img { flex: none; width: 72px; height: 72px; margin: 0; padding: 14px; border-radius: 18px; background: #fff; }
+.ig-card-feature { max-width: 640px; font-family: var(--serif); font-size: 21px; line-height: 1.4; color: rgba(255,255,255,.86); }
+.ig-card.is-featured .ig-chip { border-color: rgba(255,255,255,.18); background: rgba(255,255,255,.08); color: #fff; }
+.ig-card.is-featured .ig-card-go { top: 50%; right: 28px; margin-top: -11px; color: #fff; }
+.ig-card.is-featured.is-link:hover { border-color: var(--orange); }
+.ig-card.is-featured.is-link:hover .ig-card-go { color: var(--orange); }
+.ig-ask { margin-top: 64px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 32px 36px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--off); }
+.ig-ask h2 { font-size: clamp(26px, 3vw, 34px); margin-bottom: 8px; }
+.ig-ask p { max-width: 520px; font-size: 15px; line-height: 1.65; color: var(--navy-3); }
+
+/* A connector page: the claim on the left, the join it makes on the right */
+.ig-hero { max-width: 1264px; margin: 0 auto; padding: 116px 52px 64px; display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, .95fr); gap: 56px; align-items: center; }
+.ig-hero h1 { font-size: clamp(38px, 4.4vw, 56px); margin-bottom: 20px; }
+.ig-hero .hero-sub { max-width: 520px; margin: 0 0 28px; }
+.ig-crumbs { display: flex; align-items: center; gap: 8px; margin-bottom: 22px; font-size: 13px; color: var(--navy-3); animation: fadeUp .5s ease both; }
+.ig-crumbs a { color: var(--navy-3); text-decoration: none; }
+.ig-crumbs a:hover { color: var(--navy); }
+.ig-crumbs [aria-current] { color: var(--navy); font-weight: 500; }
+.ig-lockup { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; animation: fadeUp .5s .04s ease both; }
+.ig-lockup img { display: block; width: 40px; height: 40px; }
+.ig-plus { font-size: 20px; font-weight: 300; color: var(--navy-3); }
+.ig-lockup .logo { font-size: 26px; }
+.ig-cta { display: flex; flex-wrap: wrap; gap: 10px; animation: fadeUp .5s .24s ease both; }
+.ig-facts { list-style: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; max-width: 540px; margin-top: 30px; animation: fadeUp .5s .32s ease both; }
+.ig-facts li { display: flex; align-items: center; gap: 9px; font-size: 13.5px; line-height: 1.4; color: var(--navy-2); }
+.ig-facts .ic { width: 16px; height: 16px; color: var(--orange); }
+.ig-alias { margin-top: 14px; font-size: 12.5px; color: var(--navy-3); animation: fadeUp .5s .32s ease both; }
+
+.ig-mock { margin: 0; }
+.ig-mock-panel { position: relative; display: flex; flex-direction: column; gap: 14px; padding: 36px 30px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--off); box-shadow: 0 24px 64px rgba(13,15,26,.08); font-size: 13px; color: var(--navy); }
+.ig-mock-panel .ic { width: 15px; height: 15px; }
+.ig-sources { display: flex; justify-content: center; gap: 36px; }
+.ig-sources img { display: block; width: 34px; height: 34px; }
+.ig-flow { display: block; margin: -6px auto; overflow: visible; }
+.ig-flow path { fill: none; stroke-width: 2; stroke-linecap: round; }
+.ig-flow-bed path { stroke: var(--navy); opacity: .18; }
+.ig-flow-water path { stroke: var(--orange); stroke-dasharray: 4 6; }
+/* Navy, not the homepage mock's orange: white text on the brand orange is 3:1,
+   under the 4.5:1 body text needs, and this card carries a sentence. */
+.ig-answer { display: flex; align-items: flex-start; gap: 10px; padding: 14px 16px; border-radius: var(--r); background: var(--navy); color: #fff; font-size: 14.5px; font-weight: 500; line-height: 1.55; }
+.ig-answer .ic { margin-top: 3px; color: var(--orange); }
+.ig-change { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--r); background: var(--white); }
+.ig-change img { display: block; flex: none; }
+.ig-change b { display: block; font-weight: 500; }
+.ig-change s { display: block; font-size: 11.5px; color: var(--navy-3); text-decoration: none; }
+.ig-actions { display: flex; gap: 8px; }
+.ig-btn { flex: 1; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--pill); background: var(--white); color: var(--navy); font-size: 12px; font-weight: 600; text-align: center; }
+.ig-btn-apply { position: relative; border-color: var(--navy); background: var(--navy); color: #fff; }
+.ig-apply-done { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 5px; opacity: 0; }
+.ig-cursor { position: absolute; left: 56%; top: 46%; width: 22px; height: 22px; opacity: 0; pointer-events: none; fill: #fff; stroke: var(--navy); stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 2px 3px rgba(13,15,26,.3)); }
+.ig-mock figcaption { margin-top: 12px; font-size: 12.5px; color: var(--navy-3); text-align: center; }
+
+.ig-sec { padding: 88px 52px; }
+.ig-inner { max-width: 1160px; margin: 0 auto; }
+.ig-sec h2 { max-width: 760px; margin-bottom: 32px; font-size: clamp(30px, 3.4vw, 44px); }
+
+/* Questions: the first one is the page's argument, so it runs the full width */
+.ig-qs { list-style: none; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.ig-q { display: flex; flex-direction: column; justify-content: space-between; gap: 22px; padding: 26px 26px 22px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--white); }
+.ig-q p { font-family: var(--serif); font-size: 20px; line-height: 1.35; color: var(--navy); }
+.ig-q:first-child { grid-column: 1 / -1; background: var(--off); }
+.ig-q:first-child p { max-width: 760px; font-size: clamp(22px, 2.4vw, 28px); }
+.ig-q-joins { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12.5px; color: var(--navy-3); }
+.ig-q-joins img { display: block; width: 18px; height: 18px; }
+.ig-q-joins span { margin-left: 4px; }
+
+.ig-access { background: var(--off); }
+.ig-cols { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+.ig-col { padding: 28px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--white); }
+.ig-col h3 { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; font-size: 17px; font-weight: 600; color: var(--navy); }
+.ig-col h3 .ic { color: var(--orange); }
+.ig-reads, .ig-ops { list-style: none; }
+.ig-reads li { padding: 14px 0; border-top: 1px solid var(--border); }
+.ig-reads b { display: block; margin-bottom: 8px; font-size: 14.5px; font-weight: 600; }
+.ig-fields { display: flex; flex-wrap: wrap; gap: 6px; }
+.ig-fields span { padding: 2px 9px; border: 1px solid var(--border); border-radius: var(--pill); background: var(--off); font-size: 12px; line-height: 1.5; color: var(--navy-2); }
+.ig-ops li { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px 10px; padding: 12px 0; border-top: 1px solid var(--border); font-size: 14.5px; line-height: 1.45; }
+.ig-ops li > .ic { margin-top: 2px; color: #1a7f37; }
+.ig-ops li.is-destructive > .ic { color: #8a5a00; }
+.ig-op { flex: 1; min-width: 170px; }
+.ig-badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.ig-badge { padding: 2px 8px; border-radius: var(--pill); background: #e6f4ea; color: #1a7f37; font-size: 11px; font-weight: 600; line-height: 1.6; }
+.ig-badge.is-warn { background: #fff4dd; color: #8a5a00; }
+.ig-badge.is-auto { background: #eaf1ff; color: #1d4ed8; }
+.ig-note { margin-top: 16px; font-size: 13px; line-height: 1.65; color: var(--navy-3); }
+.ig-note a { color: var(--navy); text-decoration: underline; text-decoration-color: var(--orange); text-underline-offset: 3px; }
+.ig-readonly-big { margin: 4px 0 14px; font-family: var(--serif); font-size: 46px; line-height: 1; color: var(--navy); }
+.ig-readonly p:not(.ig-readonly-big) { font-size: 15px; line-height: 1.7; color: var(--navy-3); }
+
+/* What it knows: the knowledge pack is the page's one dark band */
+.ig-knows { background: var(--navy); }
+.ig-knows h2 { color: #fff; }
+.ig-k { list-style: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; overflow: hidden; border: 1px solid rgba(255,255,255,.1); border-radius: var(--r-lg); background: rgba(255,255,255,.1); }
+.ig-k li { padding: 30px 30px 32px; background: var(--navy); }
+.ig-k-num { display: block; margin-bottom: 14px; font-size: 12px; font-weight: 600; letter-spacing: .1em; color: var(--orange); }
+.ig-k h3 { margin-bottom: 10px; font-family: var(--serif); font-size: 23px; font-weight: 400; line-height: 1.25; color: #fff; }
+.ig-k p { max-width: 460px; font-size: 15px; line-height: 1.7; color: rgba(255,255,255,.74); }
+.ig-k-src { margin-top: 28px; }
+.ig-k-src a { display: inline-flex; align-items: center; gap: 6px; padding-bottom: 2px; border-bottom: 2px solid var(--orange); color: #fff; font-size: 15px; font-weight: 500; text-decoration: none; }
+
+.ig-pairs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.ig-pair { display: flex; flex-direction: column; gap: 18px; padding: 26px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--white); color: var(--navy); text-decoration: none; transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease; }
+.ig-pair:hover { transform: translateY(-3px); border-color: var(--navy); box-shadow: 0 16px 40px rgba(13,15,26,.08); }
+.ig-pair-logos { display: flex; align-items: center; gap: 10px; }
+.ig-pair-logos img { display: block; width: 28px; height: 28px; }
+.ig-pair-pipe { flex: 0 0 56px; height: 2px; background: repeating-linear-gradient(90deg, var(--orange) 0 6px, transparent 6px 12px); }
+.ig-pair-q { flex: 1; font-family: var(--serif); font-size: 19px; line-height: 1.35; }
+.ig-pair-go { display: flex; align-items: center; gap: 6px; font-size: 13.5px; font-weight: 600; }
+.ig-pair-go .ic { transition: transform .2s ease; }
+.ig-pair:hover .ig-pair-go .ic { transform: translateX(3px); }
+
+/* White, because the FAQ under it is off-white and the pairs above are white:
+   its top padding is dropped so the two white sections read as one run. */
+.ig-setup { padding-top: 8px; }
+.ig-steps { list-style: none; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.ig-steps li { display: flex; align-items: flex-start; gap: 14px; padding: 22px; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--off); }
+.ig-step-n { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; background: var(--navy); color: #fff; font-size: 13px; font-weight: 600; }
+.ig-steps p { font-size: 15px; line-height: 1.65; color: var(--navy-2); }
+.ig-trust { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
+.ig-trust p { display: flex; gap: 12px; padding: 18px 20px; font-size: 14px; line-height: 1.65; color: var(--navy-3); }
+.ig-trust .ic { flex: none; width: 18px; height: 18px; margin-top: 2px; color: var(--navy); }
+
+/* The mock plays once when it reveals (DESIGN.md, Motion: mock choreography):
+   the sources drop in, the channels draw and fill, the answer lands, and on a
+   page whose connector can change things, a cursor presses Apply. Keyframes
+   fill backwards off .in, so reduced motion and no scripts get the last frame. */
+@keyframes ig-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes ig-drop { from { opacity: 0; transform: translateY(-10px) scale(.85); } to { opacity: 1; transform: none; } }
+@keyframes ig-pop { 0% { opacity: 0; transform: scale(.5); } 60% { opacity: 1; transform: scale(1.2); } 100% { transform: scale(1); } }
+@keyframes ig-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+@keyframes ig-water { to { stroke-dashoffset: -20; } }
+@keyframes ig-pipe { to { background-position: 12px 0; } }
+@keyframes ig-show { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ig-hide { to { opacity: 0; } }
+@keyframes ig-dim { to { opacity: .45; } }
+@keyframes ig-cursor { from { opacity: 0; transform: translate(40px, 34px); } 30% { opacity: 1; } to { opacity: 1; transform: none; } }
+@keyframes ig-press { 50% { transform: scale(.94); } }
+@media (prefers-reduced-motion: no-preference) {
+  .ig-mock.in .ig-sources img { animation: ig-drop .35s ease-out both; }
+  .ig-mock.in .ig-sources img:nth-child(1) { animation-delay: .25s; }
+  .ig-mock.in .ig-sources img:nth-child(2) { animation-delay: .37s; }
+  .ig-mock.in .ig-sources img:nth-child(3) { animation-delay: .49s; }
+  .ig-flow-bed path { stroke-dasharray: 1; }
+  .ig-mock.in .ig-flow-bed path { animation: ig-draw .5s ease-out .65s both; }
+  .ig-mock.in .ig-flow-water { animation: ig-show .3s ease-out 1.1s both; }
+  .ig-mock.in .ig-flow-water path { animation: ig-water 1.2s linear 1.1s infinite; }
+  .ig-mock.in .ig-answer { animation: ig-in .35s ease-out 1.2s both; }
+  .ig-mock.in .ig-answer .ic { animation: ig-pop .4s ease-out 1.45s both; }
+  .ig-mock.in .ig-change { animation: ig-in .35s ease-out 1.7s both; }
+  .ig-mock.in .ig-actions { animation: ig-in .35s ease-out 1.85s both; }
+  .ig-mock.in .ig-cursor { animation: ig-cursor .6s ease-out 2.3s both, ig-hide .3s ease-out 3.6s forwards; }
+  .ig-mock.in .ig-btn-apply { animation: ig-press .25s ease-out 2.95s; }
+  .ig-mock.in .ig-apply-idle { animation: ig-hide .2s ease-out 3.05s forwards; }
+  .ig-mock.in .ig-apply-done { animation: ig-show .25s ease-out 3.05s both; }
+  .ig-mock.in .ig-btn-reject { animation: ig-dim .3s ease-out 3.05s forwards; }
+  .ig-pair-pipe { animation: ig-pipe 1.2s linear infinite; }
+}
+
+@media (max-width: 1000px) {
+  .ig-hero { grid-template-columns: 1fr; gap: 44px; }
+  .ig-hero .ig-mock { max-width: 560px; }
+  .ig-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ig-pairs { grid-template-columns: 1fr; }
+}
+@media (max-width: 860px) {
+  .ig-hero { padding: 96px 24px 48px; }
+  .ig-sec { padding: 64px 24px; }
+  .ig-hub { padding: 8px 24px 64px; }
+  .ig-group { margin-top: 44px; }
+  .ig-qs, .ig-cols, .ig-k, .ig-steps, .ig-trust, .ig-facts { grid-template-columns: 1fr; }
+  .ig-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ig-stats li:nth-child(2) { border-right: 0; }
+  .ig-stats li:nth-child(-n+2) { border-bottom: 1px solid var(--border); }
+  .ig-ask { flex-direction: column; align-items: flex-start; padding: 26px 24px; }
+  .ig-col, .ig-k li { padding: 24px 22px; }
+  .ig-card.is-featured { flex-direction: column; align-items: flex-start; padding: 24px 22px; }
+  .ig-card.is-featured .ig-card-go { top: 32px; margin-top: 0; right: 22px; }
+  .ig-card-feature { font-size: 18px; }
+}
+@media (max-width: 560px) {
+  .ig-grid { grid-template-columns: 1fr; }
+  .ig-mock-panel { padding: 28px 18px; }
+}
+
+/* ── COOKIE CONSENT ──
+   A bar, not a blocking overlay: the page is readable while the question is
+   open, and Decline sits at the same size and the same click distance as
+   Accept, which is the part the AEPD actually checks. */
+.consent-bar {
+  position: fixed; left: 16px; right: 16px; bottom: 16px; z-index: 200;
+  max-width: 880px; margin: 0 auto;
+  display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+  padding: 20px 24px;
+  background: var(--white); border: 1px solid var(--border);
+  border-radius: var(--r-lg); box-shadow: 0 18px 48px rgba(13,15,26,.18);
+  animation: consent-rise .28s ease-out;
+}
+@keyframes consent-rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .consent-bar { animation: none; } }
+
+.consent-copy { flex: 1 1 380px; min-width: 0; }
+.consent-copy h2 {
+  font-family: var(--sans); font-size: 15px; font-weight: 600;
+  line-height: 1.3; letter-spacing: 0; color: var(--navy); margin-bottom: 6px;
+}
+.consent-copy h2:focus { outline: none; }
+.consent-copy p { font-size: 13.5px; font-weight: 300; line-height: 1.65; color: var(--navy-3); }
+.consent-copy a { color: var(--navy); text-decoration: underline; text-underline-offset: 2px; }
+
+.consent-actions { flex: 0 0 auto; display: flex; gap: 10px; }
+.consent-actions .btn { padding: 11px 24px; font-size: 14px; }
+
+@media (max-width: 640px) {
+  .consent-bar { gap: 16px; padding: 18px; }
+  .consent-actions { width: 100%; }
+  .consent-actions .btn { flex: 1 1 0; justify-content: center; }
+}

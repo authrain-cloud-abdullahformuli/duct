@@ -1,0 +1,826 @@
+"use client";
+
+// Bring-your-own model provider key — same tile, same dialog shape the data
+// sources use, so one card vocabulary covers "what Duct can reach" wherever
+// that question is asked.
+//
+// `status` is the server's answer from `/api/providers/status` and is the half
+// this component cannot know: a provider with no key here may still be
+// reachable through Duct's own key or, for Anthropic, an operator subscription
+// on this machine. Reporting "No key set" in that case would be true about
+// local storage and false about the product.
+//
+// Two places a key can live, and the difference is not cosmetic:
+//
+//   * this browser session — sent as a header, gone on refresh, and invisible
+//     to anything that runs without a browser attached.
+//   * remembered on Duct — encrypted at rest, and the only one that can fund a
+//     scheduled brief or a memory-consolidation pass.
+//
+// So the choice is offered rather than made silently: remembering means the
+// key is on our servers, which the old copy explicitly promised it never was.
+// On desktop the question is never asked. Keys stay in the OS keychain and are
+// never saved on Duct: that is what the desktop app offers, and work that needs
+// a key while the app is closed waits until it is open again
+// (`lib/memoryCatchUp.js`). The keychain can refuse a read, though, and that
+// is its own state below, not "No key set".
+
+import { useEffect, useState } from "react";
+import { Eye, EyeOff } from "lucide-react";
+import { Trans, useLingui } from "@lingui/react/macro";
+import { msg } from "@lingui/core/macro";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button, buttonVariants } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  STORAGE_CLOUD,
+  STORAGE_KEYCHAIN,
+  STORAGE_LOCAL,
+  STORAGE_NONE,
+  STORAGE_SESSION,
+  serverStorage,
+} from "../../lib/credentialStorage";
+import { isLocalBackendActive } from "../../lib/localBackend";
+import { clearProviderKey, readProviderKey, setProviderKey } from "../../lib/providerKeys";
+import { forgetProviderKey, rememberProviderKey } from "../../lib/providerKeysRemote";
+import { Checkbox } from "@/components/ui/checkbox";
+import { DESKTOP_DOWNLOAD_URL, isDesktopShell, isMac } from "../../lib/shell";
+import {
+  chatgptAuthAvailable,
+  chatgptLogin,
+  chatgptLoginCancel,
+  chatgptLogout,
+  chatgptStatus,
+  isChatgptCancelled,
+  planLabel,
+} from "../../lib/chatgpt";
+import { SOURCE_DETAIL, SOURCE_LABELS, SOURCE_TONE } from "../../lib/modelTiers";
+import ConnectorDialog from "./ConnectorDialog";
+import ConnectorDot from "./ConnectorDot";
+import ConnectorTile from "./ConnectorTile";
+import StorageBadge from "./StorageBadge";
+
+/**
+ * `SOURCE_TONE`'s vocabulary → `ConnectorTile`'s.
+ *
+ * Two scales that were never going to be the same words: one grades a
+ * credential ("is this yours"), the other grades a connection ("is this
+ * working"). They used to be bridged by an inline ternary that named `cloud`
+ * as its one special case, which is how `env` went on reading green for the
+ * release after the backend split the two apart — a new source had to be
+ * remembered in a conditional rather than declared in a table.
+ *
+ * `info` is the pair that matters: Duct's key, or this machine's. Blue, not
+ * amber — the run will succeed, it is simply not funded by anything the reader
+ * did on this page.
+ */
+const TILE_TONE = { ok: "on", info: "info", warn: "off" };
+
+/**
+ * @param planEnabled  The backend's kill switch for "Continue with ChatGPT"
+ *   (`chatgpt_auth_enabled` on `/providers/status`). Off hides the plan
+ *   everywhere on this card — the tag, the section, the button — because the
+ *   Codex endpoint is undocumented and "advertised but broken" is the one
+ *   state worse than absent. Only OpenAI reads it; the others have no plan.
+ * @param loading  The page has not heard back about this provider yet.
+ *   Separate from the card's own two async reads below, because all three
+ *   default to "nothing here" and "nothing here" renders as a verdict.
+ * @param readKey  Where the saved key is read from. The default is the real
+ *   store; `/preview` passes a stub, because a keychain that refuses cannot be
+ *   arranged in a browser.
+ */
+/**
+ * How the confirm names what it is about to drop, completing "Duct forgets the
+ * key …".
+ *
+ * Not a reuse of `STORAGE_LABELS`: those name a resting place ("In your
+ * keychain") and read as a fragment mid-sentence. `STORAGE_NONE` is reachable
+ * here — a key the server rejects offers Remove while this card holds nothing
+ * of its own — so it gets a phrase rather than a blank.
+ */
+/**
+ * The pill beside the provider's name on the tile.
+ *
+ * The benefit, not the mechanism. "Works with ChatGPT" describes a
+ * compatibility; what actually decides whether someone picks this provider is
+ * that a plan they already pay for replaces an API key they would otherwise
+ * have to go and buy. The tile's description names ChatGPT one line below, so
+ * the tag does not have to spend its width on it.
+ */
+const PLAN_TAG = msg`No API key needed`;
+
+const REMOVAL_SCOPE = {
+  [STORAGE_KEYCHAIN]: msg`held in this machine’s keychain`,
+  [STORAGE_SESSION]: msg`held for this browser session`,
+  [STORAGE_CLOUD]: msg`saved to your Duct account`,
+  [STORAGE_LOCAL]: msg`saved on this device`,
+  [STORAGE_NONE]: msg`stored for this provider`,
+};
+
+export default function ProviderCard({
+  provider,
+  logo,
+  status,
+  planEnabled = true,
+  loading = false,
+  readKey = readProviderKey,
+}) {
+  const { t, i18n } = useLingui();
+  const [open, setOpen] = useState(false);
+  const [value, setValue] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [revealed, setRevealed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const desktop = isDesktopShell();
+  // `status.stored` is authoritative — the key itself never comes back, so a
+  // saved key is knowable only by presence.
+  const [remembered, setRemembered] = useState(Boolean(status?.stored));
+  const [remember, setRemember] = useState(true);
+
+  // The user's ChatGPT plan, for the one provider that has one. It lived on a
+  // separate "ChatGPT plan" tile, and this dialog's setup steps sent people
+  // off to find it — a second card for the same company, which is exactly
+  // the OpenAI-vs-ChatGPT confusion the tile exists to remove. The sign-in
+  // itself stays in the shell (`lib/chatgpt.js`): this only asks and shows.
+  const planOffered = Boolean(provider.hasPlan && planEnabled);
+  const [plan, setPlan] = useState({ available: false, status: { connected: false } });
+  // *Why* the plan is busy, not just that it is. One boolean made the
+  // Reconnect button read "Waiting for your browser…" while a disconnect was
+  // in flight — a sentence about a browser that was never opened.
+  const [planBusy, setPlanBusy] = useState("");
+  const signingIn = planBusy === "login";
+  const [planError, setPlanError] = useState("");
+  // Both destructive actions ask first, the way every other connection in the
+  // app does. Dropping a key is not undoable from here — whether it can be
+  // recovered at all depends on whether the user still has it somewhere else,
+  // which is exactly the case DESIGN.md reserves the confirm for.
+  // The card asks two more questions of its own, and until both answer it
+  // knows nothing — yet every default here reads as a settled "no": no key,
+  // no plan, so "Not set". That is the flash the user sees on every open.
+  const [keyLoaded, setKeyLoaded] = useState(false);
+  const [planLoaded, setPlanLoaded] = useState(false);
+  // Why the keychain would not hand the saved key over, when it would not.
+  // Only the desktop keychain refuses; a browser's storage either has the key
+  // or does not. Bumping `readAttempt` asks again, which on macOS is the moment
+  // the password prompt, and its Always Allow button, appears.
+  const [readError, setReadError] = useState("");
+  const [readAttempt, setReadAttempt] = useState(0);
+  const unreadable = Boolean(readError);
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
+  const [confirmingDisconnect, setConfirmingDisconnect] = useState(false);
+  const planConnected = planOffered && plan.available && Boolean(plan.status?.connected);
+  // The keychain refused to answer. Not the same as "no sign-in", and it must
+  // not be shown as one: the fix is different and the user has already done
+  // the thing the card would otherwise be asking them to do.
+  const planUnreadable = planOffered && plan.available && Boolean(plan.status?.error);
+
+  useEffect(() => {
+    if (!planOffered) {
+      // Nothing to ask, so nothing to wait for. Note this flips back to false
+      // when `planEnabled` arrives and turns the plan on — the card really is
+      // undetermined again at that moment.
+      setPlanLoaded(true);
+      return undefined;
+    }
+    let alive = true;
+    setPlanLoaded(false);
+    chatgptAuthAvailable().then(async (available) => {
+      if (!alive) return;
+      const current = available ? await chatgptStatus() : { connected: false };
+      if (alive) {
+        setPlan({ available, status: current });
+        setPlanLoaded(true);
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, [planOffered]);
+
+  useEffect(() => {
+    setRemembered(Boolean(status?.stored));
+  }, [status?.stored]);
+
+  useEffect(() => {
+    let alive = true;
+    setKeyLoaded(false);
+    readKey(provider.id)
+      .then(({ key, error: reason }) => {
+        if (!alive) return;
+        setValue(key || "");
+        setSaved(Boolean(key));
+        setReadError(reason || "");
+      })
+      .finally(() => {
+        if (alive) setKeyLoaded(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [provider.id, readKey, readAttempt]);
+
+  const trimmed = value.trim();
+  const looksValid = !provider.prefix || trimmed.startsWith(provider.prefix);
+
+  // Precedence matches the backend's: a supplied key wins over the server's,
+  // which wins over a subscription. Anything else is genuinely unreachable.
+  //
+  // The labels come from `modelTiers` rather than a copy kept here. There was
+  // a copy, and it silently rotted the moment the backend split "server" into
+  // `env` and `cloud`: every tile fell through to "No key set" while the tier
+  // rows two tabs away correctly said "From env".
+  // Something in this provider's slot that it could never accept. The server
+  // is the authority here and `saved` must not override it: `saved` only means
+  // "this browser is holding a string for this provider", which is exactly
+  // what is wrong. Gating the warning on `!saved` — as this first did — hid it
+  // in the one case it exists for, and let `source` below report the junk as
+  // "Your key", green, while the backend was refusing to spend it.
+  const mismatched = Boolean(status?.key_mismatch);
+
+  // Same order the backend spends them in (`resolve_provider_key`): the
+  // request header first — a pasted key, else the plan's access token that
+  // `providerKeyHeaders` puts in the same slot — then a stored key, then the
+  // server's. A stored key does not outrank the plan, because it never gets
+  // the chance to: the header is already there.
+  const source = mismatched
+    ? "none"
+    : saved
+      ? "user"
+      : planConnected
+        ? "subscription"
+        : remembered
+          ? "stored"
+          : status?.source || "none";
+
+  // Where it physically sits, which `source` above does not say. Desktop wins
+  // outright: the shell writes to the OS keychain and never offers the
+  // remember-on-Duct choice, so a key held there is held there.
+  // Two answers, because the field and the tile ask different questions. The
+  // notes under the key field describe *the key* — where the next save lands,
+  // or where the saved one is — and must not mention the plan, which is not a
+  // key and is not in that field. The tile and header describe the credential
+  // that will actually be spent, which on a plan sign-in is the keychain
+  // bundle. Using one value for both painted "Held by your keychain" under an
+  // empty field the moment the plan connected.
+  const keyStorage = desktop || unreadable
+    ? saved || unreadable
+      ? STORAGE_KEYCHAIN
+      : STORAGE_NONE
+    : remembered
+      ? serverStorage({ localSidecar: isLocalBackendActive() })
+      : saved
+        ? STORAGE_SESSION
+        : STORAGE_NONE;
+  const storage = keyStorage === STORAGE_NONE && planConnected ? STORAGE_KEYCHAIN : keyStorage;
+  const storageSentence = i18n._(REMOVAL_SCOPE[keyStorage] || REMOVAL_SCOPE[STORAGE_NONE]);
+  // Any one of the three outstanding, and this card has no verdict to report.
+  const settling = loading || !keyLoaded || !planLoaded;
+  const providerName = provider.label;
+  const keyPrefix = provider.prefix;
+  const planAccount = plan.status.email || t`your ChatGPT account`;
+  const planReadError = plan.status.error || "";
+  const tile = settling
+    ? {
+        tone: "loading",
+        label: t`Checking…`,
+        detail: t`Looking up where ${providerName}'s key comes from.`,
+      }
+    : mismatched
+    ? {
+        tone: "off",
+        label: t`Not a key we can use`,
+        detail: t`What's stored for ${providerName} isn't a key it accepts, so runs skip it. Choose Remove key, then paste a new one.`,
+      }
+    : unreadable
+    ? {
+        tone: "off",
+        label: t`Can't read your key`,
+        detail: t`This computer's keychain didn't let Duct read the ${providerName} key saved in it.`,
+      }
+    : {
+        tone: TILE_TONE[SOURCE_TONE[source]] || "on",
+        label: i18n._(SOURCE_LABELS[source] || SOURCE_LABELS.none),
+        detail: i18n._(SOURCE_DETAIL[source] || SOURCE_DETAIL.none),
+      };
+
+  // The desktop keychain can genuinely refuse a write — most often on Linux,
+  // where the Secret Service daemon that backs it may not be running at all.
+  // Reporting that matters more than usual here: the value is a secret the user
+  // pasted, and a silent failure looks exactly like success until the next
+  // agent run fails for no visible reason.
+  async function save() {
+    setBusy(true);
+    setError("");
+    try {
+      if (!desktop && remember) {
+        // Remembered keys are deliberately NOT also kept in sessionStorage.
+        // Two copies of a secret means two places to revoke it, and the header
+        // would only ever restate what the server already holds.
+        await rememberProviderKey(provider.statusId, trimmed);
+        await clearProviderKey(provider.id);
+        setRemembered(true);
+        setValue("");
+        setSaved(false);
+        setRevealed(false);
+      } else {
+        await setProviderKey(provider.id, trimmed);
+        setSaved(Boolean(trimmed));
+        setReadError("");
+      }
+    } catch (err) {
+      setError(String(err?.message || err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    setBusy(true);
+    setError("");
+    try {
+      // Clear both homes regardless of which one this card thinks is in use —
+      // "Remove" has to mean the key is gone, not gone from wherever the UI
+      // last looked.
+      await clearProviderKey(provider.id);
+      if (remembered) await forgetProviderKey(provider.statusId);
+      setValue("");
+      setSaved(false);
+      setRemembered(false);
+      setRevealed(false);
+      setReadError("");
+    } catch (err) {
+      setError(String(err?.message || err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function signInPlan() {
+    setPlanBusy("login");
+    setPlanError("");
+    try {
+      const next = await chatgptLogin();
+      setPlan((current) => ({ ...current, status: next || { connected: false } }));
+    } catch (err) {
+      // Cancelled is the user's own doing — the button below, or a second
+      // click that replaced a tab they had closed. Nothing to explain.
+      if (!isChatgptCancelled(err)) setPlanError(String(err?.message || err));
+    } finally {
+      setPlanBusy("");
+    }
+  }
+
+  // The button resets when the shell answers the pending login with
+  // "cancelled"; a shell too old to know the command leaves it to its timeout.
+  function cancelPlan() {
+    chatgptLoginCancel();
+  }
+
+  async function signOutPlan() {
+    setPlanBusy("logout");
+    setPlanError("");
+    try {
+      await chatgptLogout();
+      setPlan((current) => ({ ...current, status: { connected: false } }));
+    } catch (err) {
+      setPlanError(String(err?.message || err));
+    } finally {
+      setPlanBusy("");
+    }
+  }
+
+  return (
+    <>
+      <ConnectorTile
+        logo={logo}
+        title={provider.label}
+        tag={planOffered ? i18n._(PLAN_TAG) : undefined}
+        description={provider.description}
+        tone={tile.tone}
+        status={tile.label}
+        storage={settling ? undefined : storage}
+        onClick={() => setOpen(true)}
+      />
+
+      <ConnectorDialog
+        open={open}
+        onOpenChange={setOpen}
+        logo={logo}
+        title={provider.label}
+        description={provider.description}
+        // Where the key stands, said once, beside the title — the same place
+        // every other connector says it. It used to be a `status-pill` down in
+        // the action row, which is both a second answer to a question the
+        // header already answers and the pill DESIGN.md lists to retire.
+        status={
+          <span className="conn-state">
+            <span className="conn-state-glyph" title={tile.detail}>
+              <ConnectorDot tone={tile.tone} label={tile.label} />
+            </span>
+            <StorageBadge storage={settling ? undefined : storage} />
+          </span>
+        }
+        footer={
+          <>
+            {/* "Remove key", not "Remove": this dialog can hold two
+                credentials at once, and a bare verb in the footer does not say
+                which of them it drops. */}
+            {(saved || remembered || mismatched || unreadable) && (
+              <Button
+                type="button"
+                variant="destructive"
+                size="sm"
+                onClick={() => setConfirmingRemove(true)}
+                disabled={busy}
+              >
+                <Trans>Remove key</Trans>
+              </Button>
+            )}
+            <Button type="button" size="sm" onClick={save} disabled={busy || !trimmed || !looksValid}>
+              <Trans>Save</Trans>
+            </Button>
+          </>
+        }
+      >
+        <div className="conn-dialog-section">
+          <div className="conn-field">
+            <Label htmlFor={`provider-${provider.id}`}>
+              <Trans>API key</Trans>
+            </Label>
+            {/* The toggle sits inside the field rather than beside it. As a
+                sibling button it was a second control competing with Save for
+                the row, and it pushed the input narrower than the secret it
+                holds — an eye inside the box is the convention every password
+                field on the web already uses. */}
+            <div className="conn-key-input">
+              <Input
+                id={`provider-${provider.id}`}
+                type={revealed ? "text" : "password"}
+                value={value}
+                placeholder={settling ? "\u2026" : provider.placeholder}
+                disabled={settling}
+                onChange={(event) => setValue(event.target.value)}
+                autoComplete="off"
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                className="conn-reveal"
+                onClick={() => setRevealed((shown) => !shown)}
+                disabled={!value}
+                aria-label={revealed ? t`Hide key` : t`Show key`}
+                aria-pressed={revealed}
+                aria-controls={`provider-${provider.id}`}
+              >
+                {revealed ? <EyeOff size={15} aria-hidden="true" /> : <Eye size={15} aria-hidden="true" />}
+              </button>
+            </div>
+            {/* Everything about the key that is not the key. Its own stack, at
+                its own rhythm: at the field's 5px gap these ran together into
+                one grey paragraph, and the checkbox — the only control among
+                them — read as another line of small print. */}
+            <div className="conn-field-notes">
+              {settling ? (
+                <p className="conn-hint">
+                  <Trans>Checking…</Trans>
+                </p>
+              ) : trimmed && !looksValid ? (
+                <p className="conn-hint">
+                  <Trans>Keys usually start with “{keyPrefix}”.</Trans>
+                </p>
+              ) : keyStorage !== STORAGE_NONE ? (
+                <StorageBadge storage={keyStorage} detail />
+              ) : (
+                // Nothing saved yet, so this describes where the next save lands
+                // rather than where anything currently is.
+                <p className="conn-hint">
+                  {desktop ? (
+                    // What the keychain costs, said before the save rather than
+                    // discovered later: the key only reaches Duct with a request
+                    // from this app, so work that would run while it is closed
+                    // (filing what a chat taught Duct, for one) waits for it.
+                    <Trans>
+                      Will be stored in your OS keychain on this machine. Duct can use it only
+                      while the app is open, so anything that runs while it’s closed waits until
+                      you’re back.
+                    </Trans>
+                  ) : remember ? (
+                    <Trans>
+                      Will be encrypted and stored on Duct, so scheduled runs use your key too.
+                    </Trans>
+                  ) : (
+                    <Trans>
+                      Will be kept in this browser session only — cleared when you close the tab,
+                      and unavailable to scheduled runs.
+                    </Trans>
+                  )}
+                </p>
+              )}
+              {mismatched && (
+                <p className="conn-hint conn-hint--alert" role="alert">
+                  {tile.detail}
+                </p>
+              )}
+              {!settling && unreadable && (
+                // Said here, at the moment it matters, rather than as a warning
+                // before the first save: a signed release reads its own keys
+                // with no prompt, so most people never see the dialog this
+                // explains. When they do, Always Allow is the button that makes
+                // it the last time, and Try again is what brings it back.
+                <>
+                  <p className="conn-hint conn-hint--alert" role="alert">
+                    {isMac() ? (
+                      <Trans>
+                        Your Mac didn’t let Duct read this key. Choose Try again, and when your Mac
+                        asks for your password, pick <b>Always Allow</b> so it won’t ask again. Or
+                        paste the key again and save.
+                      </Trans>
+                    ) : (
+                      // The shell's sentence names the fix on Linux, where the
+                      // usual cause is no keyring daemon running at all.
+                      <Trans>This computer’s keychain didn’t let Duct read this key: {readError}</Trans>
+                    )}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    className="justify-self-start"
+                    onClick={() => setReadAttempt((n) => n + 1)}
+                    disabled={busy}
+                  >
+                    <Trans>Try again</Trans>
+                  </Button>
+                </>
+              )}
+              {remembered && (
+                <p className="conn-hint">
+                  <Trans>
+                    A saved key is already in use. Paste a new one to replace it, or
+                    choose Remove key to forget it.
+                  </Trans>
+                </p>
+              )}
+              {!desktop && (
+                <label className="conn-check">
+                  <Checkbox
+                    checked={remember}
+                    onCheckedChange={(next) => setRemember(next === true)}
+                    disabled={busy}
+                  />
+                  <span>
+                    <Trans>Remember this key on Duct</Trans>
+                  </span>
+                </label>
+              )}
+              <p className="conn-hint">
+                <a className="app-link" href={provider.consoleUrl} target="_blank" rel="noreferrer">
+                  <Trans>Get a key from {providerName} →</Trans>
+                </a>
+              </p>
+            </div>
+          </div>
+
+          {error && (
+            <p role="alert" className="conn-hint conn-hint--alert">
+              {error}
+            </p>
+          )}
+
+        </div>
+
+        {/* The other way to pay for this provider. Under the key field, not
+            above it: someone who already has a key should not have to read
+            past a plan they may not want. */}
+        {planOffered && (
+          <div className="conn-dialog-section">
+            {/* "Or" offers a choice. Once the choice is made it is just the
+                name of what is connected. */}
+            <h3 className="conn-dialog-heading">
+              {planConnected ? <Trans>Your ChatGPT plan</Trans> : <Trans>Or use your ChatGPT plan</Trans>}
+            </h3>
+            {/* Only before signing in. Afterwards this was three lines
+                arguing for something the user had already chosen, directly
+                above the row that says they chose it. */}
+            {!settling && !planConnected && !planUnreadable && (
+              <p className="conn-hint">
+                <Trans>
+                  Runs GPT models on a plan you already pay for. Signing in opens your
+                  browser; Duct never sees your password or your chats.
+                </Trans>
+              </p>
+            )}
+
+            {settling ? (
+              <p className="conn-hint">
+                <Trans>Checking…</Trans>
+              </p>
+            ) : plan.available ? (
+              planConnected ? (
+                <div className="conn-account-row">
+                  <span className="conn-account-text">
+                    <Trans>
+                      Signed in as <b>{planAccount}</b>
+                    </Trans>
+                    {plan.status.plan_type ? ` · ${planLabel(plan.status.plan_type)}` : ""}
+                  </span>
+                  {/* Disconnect + Reconnect, in that order and those variants,
+                      because that is what every OAuth connection in this app
+                      offers (`OAuthConnectorCard`). This said "Sign out",
+                      which is a third word for the same idea and reads like
+                      signing out of Duct itself. Reconnect is how you switch
+                      ChatGPT accounts, and how you recover from a token the
+                      user revoked at OpenAI. */}
+                  <span className="conn-account-actions">
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => setConfirmingDisconnect(true)}
+                      disabled={Boolean(planBusy)}
+                    >
+                      <Trans>Disconnect</Trans>
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      onClick={signInPlan}
+                      disabled={Boolean(planBusy)}
+                    >
+                      {signingIn ? <Trans>Waiting for your browser…</Trans> : <Trans>Reconnect</Trans>}
+                    </Button>
+                    {signingIn && (
+                      <Button type="button" variant="ghost" size="sm" onClick={cancelPlan}>
+                        <Trans>Cancel</Trans>
+                      </Button>
+                    )}
+                  </span>
+                </div>
+              ) : (
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button type="button" size="sm" onClick={signInPlan} disabled={Boolean(planBusy)}>
+                    {signingIn ? (
+                      <Trans>Waiting for your browser…</Trans>
+                    ) : planUnreadable ? (
+                      <Trans>Sign in again</Trans>
+                    ) : (
+                      <Trans>Continue with ChatGPT</Trans>
+                    )}
+                  </Button>
+                  {/* A closed tab tells the shell nothing, so this is the only
+                      way back short of the five-minute timeout. */}
+                  {signingIn && (
+                    <Button type="button" variant="ghost" size="sm" onClick={cancelPlan}>
+                      <Trans>Cancel</Trans>
+                    </Button>
+                  )}
+                </div>
+              )
+            ) : (
+              // Not this surface: the OAuth redirect lands on a loopback port,
+              // and only a program on the user's machine can be listening.
+              <ol className="conn-steps">
+                <li>
+                  {desktop ? (
+                    <Trans>Update the desktop app — this version can’t run the sign-in.</Trans>
+                  ) : (
+                    <Trans>
+                      Install the desktop app. Signing in hands the result back to a program on
+                      your computer, which a web page cannot receive.
+                    </Trans>
+                  )}
+                </li>
+                <li>
+                  {/* No "&rarr; Providers" step any more: the page's own name
+                      carries the word, and repeating it read as two hops. */}
+                  <Trans>
+                    Open <b>Settings → Models & providers → OpenAI</b> and choose{" "}
+                    <b>Continue with ChatGPT</b>.
+                  </Trans>
+                </li>
+              </ol>
+            )}
+
+            {!settling && planUnreadable && (
+              <p className="conn-hint conn-hint--alert" role="alert">
+                <Trans>Your ChatGPT sign-in is saved, but this build cannot read it: {planReadError}</Trans>
+              </p>
+            )}
+            {planError && (
+              <p className="conn-hint conn-hint--alert" role="alert">
+                {planError}
+              </p>
+            )}
+            <p className="conn-hint">
+              {saved || remembered ? (
+                <Trans>
+                  Your key is used before the plan. Scheduled runs happen with no app open, so
+                  they always need a key.
+                </Trans>
+              ) : (
+                <Trans>Scheduled runs happen with no app open, so they always need a key.</Trans>
+              )}
+            </p>
+            {!desktop && (
+              <p className="conn-hint">
+                <a className="app-link" href={DESKTOP_DOWNLOAD_URL} target="_blank" rel="noreferrer">
+                  <Trans>Get the desktop app →</Trans>
+                </a>
+              </p>
+            )}
+          </div>
+        )}
+      </ConnectorDialog>
+
+      {/* Canon: the title quotes the object, the body states scope and
+          irreversibility, and the action is verb + noun. */}
+      <AlertDialog open={confirmingRemove} onOpenChange={setConfirmingRemove}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              <Trans>Remove your {providerName} key?</Trans>
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {planConnected ? (
+                <Trans>
+                  Duct forgets the key {storageSentence}. Runs that need {providerName} fall back
+                  to your ChatGPT plan. Duct cannot show you this key again, so make sure you have
+                  it somewhere else if you still need it.
+                </Trans>
+              ) : (
+                <Trans>
+                  Duct forgets the key {storageSentence}. Runs that need {providerName} stop
+                  working until you paste a new one. Duct cannot show you this key again, so make
+                  sure you have it somewhere else if you still need it.
+                </Trans>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel type="button">
+              <Trans>Keep it</Trans>
+            </AlertDialogCancel>
+            <AlertDialogAction
+              type="button"
+              className={buttonVariants({ variant: "destructive" })}
+              onClick={() => {
+                setConfirmingRemove(false);
+                remove();
+              }}
+            >
+              <Trans>Remove key</Trans>
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={confirmingDisconnect} onOpenChange={setConfirmingDisconnect}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              <Trans>Disconnect your ChatGPT plan?</Trans>
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              <Trans>
+                Duct forgets the sign-in held in this machine’s keychain, and
+                stops running {providerName} models on your plan. Your ChatGPT
+                account is untouched — reconnecting takes one sign-in. To
+                revoke Duct’s access at OpenAI as well, do that in your ChatGPT
+                settings.
+              </Trans>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel type="button">
+              <Trans>Stay connected</Trans>
+            </AlertDialogCancel>
+            <AlertDialogAction
+              type="button"
+              className={buttonVariants({ variant: "destructive" })}
+              onClick={() => {
+                setConfirmingDisconnect(false);
+                signOutPlan();
+              }}
+            >
+              <Trans>Disconnect</Trans>
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}

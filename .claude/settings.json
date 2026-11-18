@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(alembic upgrade:*)",
+      "Bash(alembic downgrade:*)",
+      "Bash(alembic current:*)",
+      "Bash(alembic heads:*)",
+      "Bash(alembic history:*)",
+      "Bash(alembic show:*)",
+      "Bash(alembic stamp:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/scripts/sync_main.sh\"",
+            "timeout": 45,
+            "statusMessage": "Syncing main with origin"
+          }
+        ]
+      }
+    ]
+  }
+}

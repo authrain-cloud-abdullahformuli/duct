@@ -1,0 +1,195 @@
+"use client";
+
+// User-scoped project persistence against the backend (/api/user/projects).
+//
+// These endpoints are authenticated with the Bearer JWT minted by Google
+// Sign-In (stored in localStorage under "duct_auth_token"). We also forward
+// the shared X-API-Key for consistency with the rest of the app's calls.
+//
+// localStorage is the offline cache / source for the synchronous API in
+// lib/projects.js; these functions write through to / read from the server in
+// the background. Every call is a no-op (returns null/[]) when no valid token
+// is present, so signed-out or token-less sessions degrade to local-only.
+
+import { msg } from "@lingui/core/macro";
+import { BASE } from "./api";
+import {
+  authedFetch,
+  authedHeaders as authHeaders,
+  endSessionIfUnauthorized,
+  hasAuthToken,
+} from "./authFetch";
+
+// Re-exported: lib/projects.js gates its remote sync on this.
+export { hasAuthToken };
+
+// Execution autonomy levels — mirror of backend models/execution.py. The
+// ladder governs three things together: how freely an agent asks clarifying
+// questions, whether it proposes change sets, and whether an eligible one
+// applies without a click.
+//
+// The property worth stating in the UI, because it is what makes `auto`
+// shippable: raising the level never widens WHAT may apply. Destructive
+// operations wait for a human at every level, and the auto-apply allowlist is
+// identical at "assisted" and "auto".
+export const AUTONOMY_ASK = "ask";
+export const AUTONOMY_ASSISTED = "assisted";
+export const AUTONOMY_AUTO = "auto";
+
+export const AUTONOMY_OPTIONS = [
+  {
+    value: AUTONOMY_ASK,
+    label: msg`Ask`,
+    blurb: msg`Agents propose; nothing runs until you approve it here.`,
+  },
+  {
+    value: AUTONOMY_ASSISTED,
+    label: msg`Assisted`,
+    blurb: msg`Reversible changes on the allowlist apply on their own; the rest waits here.`,
+  },
+  {
+    value: AUTONOMY_AUTO,
+    label: msg`Auto`,
+    blurb: msg`Same allowlist as Assisted, fewer questions; assumptions go in the brief.`,
+  },
+];
+
+// --- Shape mapping -------------------------------------------------------
+// Local project (nested) <-> backend project (flat company fields).
+
+function toApi(local) {
+  const company = local.company || {};
+  return {
+    name: local.name || company.name || "Untitled project",
+    company_name: company.name || "",
+    pitch: company.pitch || "",
+    industry: company.industry || "",
+    business_model: company.business_model || "",
+    website_url: company.website_url || "",
+    targets: local.targets || {},
+    audience: local.audience || {},
+    competition: local.competition || {},
+    brand_channels: local.brand_channels || {},
+    // Where each drafted field came from. The server settles a save by it:
+    // a field marked "user" is the person's edit and wins, a drafted one this
+    // copy only carried along cannot undo a newer draft the server holds.
+    provenance: local.provenance || {},
+  };
+}
+
+function fromApi(remote) {
+  return {
+    id: remote.id,
+    name: remote.name || "",
+    createdAt: remote.created_at || "",
+    updatedAt: remote.updated_at || "",
+    // Server-assigned: "owner" or "collaborator". Drives the shared-project
+    // labelling and hides owner-only controls. Local-only projects default to
+    // "owner" in lib/projects.js.
+    role: remote.role || "owner",
+    ownerEmail: remote.owner_email || "",
+    company: {
+      name: remote.company_name || "",
+      pitch: remote.pitch || "",
+      industry: remote.industry || "",
+      business_model: remote.business_model || "",
+      website_url: remote.website_url || "",
+    },
+    targets: remote.targets || {},
+    audience: remote.audience || {},
+    competition: remote.competition || {},
+    brand_channels: remote.brand_channels || {},
+    provenance: remote.provenance || {},
+    // Execution autonomy: "ask" (default) | "assisted" | "auto". Server-owned
+    // safety setting — changed only through setProjectAutonomy, never via the
+    // upsert. The server normalizes the legacy "manual" spelling to "ask" on
+    // the way out, so nothing here has to know about it.
+    autonomyLevel: remote.autonomy_level || AUTONOMY_ASK,
+  };
+}
+
+// --- CRUD ----------------------------------------------------------------
+
+/** GET all projects for the current user. Returns local-shaped projects (or [] when unauthed/failed). */
+export async function fetchProjectsRemote() {
+  if (!hasAuthToken()) return [];
+  try {
+    const res = await fetch(`${BASE}/api/user/projects`, { headers: authHeaders() });
+    // Degrading to the local cache is right for a flaky server, but a 401 is
+    // not flakiness — swallowing it left the sidebar looking signed in while
+    // every user-scoped page failed. Retire the session, then degrade.
+    if (!res.ok) {
+      endSessionIfUnauthorized(res);
+      return [];
+    }
+    const rows = await res.json();
+    return Array.isArray(rows) ? rows.map(fromApi) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Upsert a local-shaped project by its id. Returns the server copy (local-shaped) or null. */
+export async function upsertProjectRemote(local) {
+  if (!hasAuthToken() || !local?.id) return null;
+  try {
+    const res = await fetch(`${BASE}/api/user/projects/${encodeURIComponent(local.id)}`, {
+      method: "PUT",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(toApi(local)),
+    });
+    if (!res.ok) {
+      endSessionIfUnauthorized(res);
+      return null;
+    }
+    return fromApi(await res.json());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * POST a PROJECT_DRAFT event's fields to be merged on the server, under the
+ * same rules lib/projectDraft.js runs here, against what the server holds.
+ * Creates the project when its id is new. Returns the server copy or null.
+ */
+export async function postProjectDraftRemote(id, draft) {
+  if (!hasAuthToken() || !id || !draft?.fields) return null;
+  try {
+    const res = await fetch(`${BASE}/api/user/projects/${encodeURIComponent(id)}/draft`, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ fields: draft.fields }),
+    });
+    if (!res.ok) {
+      endSessionIfUnauthorized(res);
+      return null;
+    }
+    return fromApi(await res.json());
+  } catch {
+    return null;
+  }
+}
+
+/** PATCH the project's execution autonomy ("ask" | "assisted" | "auto").
+ * Owner-only on the server. Throws on failure so the settings UI can surface it. */
+export async function setProjectAutonomy(id, level) {
+  const res = await authedFetch(`/api/user/projects/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: { autonomy_level: level },
+  });
+  return fromApi(await res.json());
+}
+
+/** DELETE a project by id. Best-effort; never throws. */
+export async function deleteProjectRemote(id) {
+  if (!hasAuthToken() || !id) return;
+  try {
+    await fetch(`${BASE}/api/user/projects/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: authHeaders(),
+    });
+  } catch {
+    // best-effort
+  }
+}

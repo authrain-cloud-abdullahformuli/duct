@@ -1,0 +1,401 @@
+"""Which key a content run spends on images.
+
+Images are a *second* provider inside a content run: the conversation is on
+whichever provider the user brought a key for, every generated image is on
+whichever *image-capable* provider they brought a key for — Gemini, OpenAI or
+xAI, in that order of preference. The image tools used to read
+``cfg.gemini_api_key`` directly, which on the hosted deployment meant every
+image a customer generated was billed to Duct — the one path the provider-key
+gate did not cover. Then they read only a Gemini key, which sent a user on an
+OpenAI key to Google for something their own key already does.
+
+These pin the replacement: the run resolves an image provider + key once,
+stashes both on the session, and the tools spend that or decline. No network
+— no client is ever constructed, because a run with no key must not get that
+far.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from uuid import uuid4
+
+import pytest
+
+import routes.content as content_routes
+from agents import engines
+from agents.content.schema import make_session
+from agents.content.tools import build_content_tools_lc
+from agents.models import ImageModel, Provider
+
+
+async def _noop(_event: dict) -> None:
+    return None
+
+
+def _call(session, tool: str, args: dict) -> str:
+    """Invoke one tool as the agent would — through the bound LangChain tool.
+
+    Returns what the model would read — `_err` answers in prose inside its
+    JSON envelope, and the prose is the part under test here.
+    """
+    tools = {t.name: t for t in build_content_tools_lc(session.project_id, _noop, session)}
+    return asyncio.run(tools[tool].ainvoke(args))
+
+
+# --- the tools spend the session's key, never config's ----------------------
+
+
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        ("generate_image", {"prompt": "a duct"}),
+        ("edit_image", {"prompt": "brighter", "input_asset_id": str(uuid4())}),
+    ],
+)
+def test_an_image_tool_declines_when_the_run_has_no_key(tool, args):
+    """And says where to get one — naming every provider that would do,
+    not just Google. The old message — "isn't enabled for this workspace
+    yet" — described a Duct feature flag, which was never the problem: the
+    user needs to add their own key."""
+    session = make_session("t", uuid4(), "draft_post")
+    assert session.image_provider is None and session.image_api_key == ""
+
+    result = _call(session, tool, args)
+    assert "Providers" in result
+    for provider_name in ("Gemini", "OpenAI", "xAI"):
+        assert provider_name in result
+
+
+def test_the_tools_module_cannot_reach_config_at_all():
+    """The structural half of the same guarantee. A message can be reworded
+    back into existence; an import that is not there cannot spend anything.
+    `agents/content/tools.py` deliberately holds no route to `get_configs` —
+    if this fails, someone re-added the door rather than the bug."""
+    import agents.content.tools as tools
+
+    assert not hasattr(tools, "get_configs")
+
+
+# --- what the run resolves and stashes --------------------------------------
+
+
+def _patch_resolution(monkeypatch, *, stored=None, raises=False):
+    """Stand in for ``resolve_provider_key`` with the real precedence — header,
+    then saved, then env — minus the config read, so the order the image
+    resolver walks providers in is what is under test.
+
+    ``plan_ok`` is honoured rather than accepted and dropped: it is the whole
+    subject of two tests below, and a fake that ignored it would pass them
+    while the real resolver failed."""
+    from agents.core.codex import is_plan_credential
+    from agents.engines import ProviderKey, ProviderKeyRequired
+
+    monkeypatch.setattr(content_routes, "stored_keys_for", lambda _owner: stored or {})
+
+    def _resolve(provider, user_keys=None, *, stored_keys=None, duct_pays=False, plan_ok=True):
+        supplied = (user_keys or {}).get(provider)
+        plan = is_plan_credential(provider, supplied or "")
+        if supplied and (plan_ok or not plan):
+            return ProviderKey(supplied, provider, "subscription" if plan else "user")
+        saved = (stored_keys or {}).get(provider)
+        if saved:
+            return ProviderKey(saved, provider, "stored")
+        if raises:
+            raise ProviderKeyRequired(provider)
+        return ProviderKey("from-env", provider, "env")
+
+    monkeypatch.setattr(engines, "resolve_provider_key", _resolve)
+
+
+# Header + empty payload + a signature segment spelled so the secret scanner
+# can see it is not one. Only the shape is under test — see
+# tests/test_subscription_auth_routing.py, which uses the same string.
+PLAN_TOKEN = "eyJhbGciOiJSUzI1NiJ9.e30.EXAMPLE"
+
+
+def _session_under(monkeypatch):
+    session = make_session("sid", uuid4(), "draft_post")
+    monkeypatch.setattr(
+        "agents.core.session.get_session", lambda _sid: session, raising=False
+    )
+    return session
+
+
+def test_the_callers_gemini_key_reaches_the_image_tools(monkeypatch):
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+
+    content_routes._attach_image_run("sid", {Provider.GOOGLE_GENAI: "AIza-mine"})
+    assert session.image_provider is Provider.GOOGLE_GENAI
+    assert session.image_api_key == "AIza-mine"
+
+
+def test_an_openai_key_alone_draws_on_openai(monkeypatch):
+    """The whole point of the seam. Nothing about the run says Google."""
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+
+    content_routes._attach_image_run("sid", {Provider.OPENAI: "sk-mine"})
+    assert session.image_provider is Provider.OPENAI
+    assert session.image_api_key == "sk-mine"
+
+
+def test_an_xai_key_alone_draws_on_xai(monkeypatch):
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+
+    content_routes._attach_image_run("sid", {Provider.XAI: "xai-mine"})
+    assert session.image_provider is Provider.XAI
+    assert session.image_api_key == "xai-mine"
+
+
+def test_gemini_is_preferred_when_more_than_one_key_can_draw(monkeypatch):
+    """A preference, not a capability ranking — see IMAGE_PROVIDER_ORDER."""
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+
+    content_routes._attach_image_run(
+        "sid", {Provider.OPENAI: "sk-mine", Provider.GOOGLE_GENAI: "AIza-mine", Provider.XAI: "xai-mine"}
+    )
+    assert session.image_provider is Provider.GOOGLE_GENAI
+
+
+def test_a_chatgpt_plan_does_not_draw(monkeypatch):
+    """The credential that reads as an OpenAI key everywhere else and buys no
+    pictures anywhere. It authenticates ``chatgpt.com/backend-api/codex``;
+    ``service/openai/images.py`` calls ``api.openai.com``, which has never
+    heard of it. Before the guard, a desktop user signed in with ChatGPT and
+    holding no other key resolved OpenAI as their image provider and collected
+    a 401 per slide — with the settings page promising gpt-image on their plan
+    the whole time."""
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+
+    content_routes._attach_image_run("sid", {Provider.OPENAI: PLAN_TOKEN})
+    assert session.image_provider is None
+    assert session.image_api_key == ""
+
+
+def test_a_saved_openai_key_draws_when_the_plan_cannot(monkeypatch):
+    """A plan is not a veto, it is a value this call cannot spend. The header
+    still wins the *conversation*; images fall through to the saved key, which
+    is the one credential in the room that can buy one."""
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, stored={Provider.OPENAI: "sk-saved"}, raises=True)
+
+    content_routes._attach_image_run("sid", {Provider.OPENAI: PLAN_TOKEN})
+    assert session.image_provider is Provider.OPENAI
+    assert session.image_api_key == "sk-saved"
+
+
+def test_a_chat_only_key_does_not_draw(monkeypatch):
+    """An Anthropic key drives the conversation and nothing else: Claude has
+    no image model, so the run is left without one rather than handed a
+    provider that will 404."""
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+
+    content_routes._attach_image_run("sid", {Provider.ANTHROPIC: "sk-ant-mine"})
+    assert session.image_provider is None
+    assert session.image_api_key == ""
+
+
+def test_a_saved_key_serves_a_run_with_no_headers(monkeypatch):
+    """A content session started from a resumed conversation carries no
+    X-Provider header at all."""
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, stored={Provider.OPENAI: "sk-saved"}, raises=True)
+
+    content_routes._attach_image_run("sid", {})
+    assert session.image_provider is Provider.OPENAI
+    assert session.image_api_key == "sk-saved"
+
+
+def test_no_image_key_leaves_the_run_alive(monkeypatch):
+    """Fail-soft, deliberately. A content session is worth having without
+    images; it is not worth having on Duct's bill, and it is not worth killing
+    over an image tool the user may never call."""
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+
+    content_routes._attach_image_run("sid", {})  # must not raise
+    assert session.image_provider is None
+    assert session.image_api_key == ""
+
+
+# --- the web search key is its own question --------------------------------
+#
+# It used to ride on the image resolution, so a run whose images were on
+# OpenAI searched nothing even with the user's Gemini key in the request.
+
+
+def _hosted(monkeypatch, *, duct_key="AIza-duct"):
+    """A hosted instance: an env Gemini key exists and is not the user's."""
+    from types import SimpleNamespace
+
+    import config
+
+    monkeypatch.setattr(config, "allow_server_provider_keys", lambda: False)
+    monkeypatch.setattr(config, "get_configs", lambda: SimpleNamespace(gemini_api_key=duct_key))
+
+
+def _run(source):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(source=source)
+
+
+def test_search_uses_the_callers_gemini_key_whatever_draws_the_images(monkeypatch):
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+    _hosted(monkeypatch)
+    keys = {Provider.OPENAI: "sk-mine", Provider.GOOGLE_GENAI: "AIza-mine"}
+
+    content_routes._attach_image_run("sid", {Provider.OPENAI: "sk-mine"})
+    content_routes._attach_search_key("sid", _run("user"), keys)
+    assert session.image_provider is Provider.OPENAI
+    assert session.gemini_api_key == "AIza-mine"
+
+
+def test_a_saved_gemini_key_backs_search(monkeypatch):
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, stored={Provider.GOOGLE_GENAI: "AIza-saved"}, raises=True)
+    _hosted(monkeypatch)
+
+    content_routes._attach_search_key("sid", _run("user"), {Provider.OPENAI: "sk-mine"})
+    assert session.gemini_api_key == "AIza-saved"
+
+
+def test_no_gemini_key_means_no_search_on_ducts_key(monkeypatch):
+    """Grounded search is billed per query. A run on the user's key does not
+    get Duct's, and a ChatGPT plan is the user's too."""
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+    _hosted(monkeypatch)
+
+    content_routes._attach_search_key("sid", _run("user"), {Provider.OPENAI: "sk-mine"})
+    assert session.gemini_api_key == ""
+    content_routes._attach_search_key("sid", _run("subscription"), {Provider.OPENAI: PLAN_TOKEN})
+    assert session.gemini_api_key == ""
+
+
+def test_a_run_duct_pays_for_searches_on_ducts_key(monkeypatch):
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+    _hosted(monkeypatch)
+
+    content_routes._attach_search_key("sid", _run("cloud"), {})
+    assert session.gemini_api_key == "AIza-duct"
+
+
+# --- the model follows the provider ----------------------------------------
+
+
+def test_the_tool_schema_default_is_corrected_to_the_runs_provider():
+    """The agent's schema defaults to the Gemini model, so on any other
+    backend the request arrives naming a model the key cannot reach. The run
+    swaps it for the provider's own default rather than refusing — the agent
+    asked for an image, not a Google image."""
+    from agents.models import image_model_for
+
+    assert image_model_for(Provider.OPENAI, ImageModel.GEMINI_3_1_FLASH_IMAGE) is ImageModel.GPT_IMAGE_2_5_FLARE
+    assert image_model_for(Provider.XAI, "gemini-3.1-flash-image") is ImageModel.GROK_IMAGINE_IMAGE_2
+    # A model the provider does serve is kept as asked.
+    assert image_model_for(Provider.GOOGLE_GENAI, ImageModel.GEMINI_3_PRO_IMAGE) is ImageModel.GEMINI_3_PRO_IMAGE
+    assert image_model_for(Provider.OPENAI, None) is ImageModel.GPT_IMAGE_2_5_FLARE
+    # ...including the older and the slower rung of the same family, which a
+    # run may name precisely because the default is neither.
+    assert image_model_for(Provider.OPENAI, "gpt-image-2") is ImageModel.GPT_IMAGE_2
+    assert image_model_for(Provider.OPENAI, ImageModel.GPT_IMAGE_2_5_SUNBURST) is ImageModel.GPT_IMAGE_2_5_SUNBURST
+
+
+# ---------------------------------------------------------------------------
+# The saved pick
+#
+# `image_model` on user_model_settings names which model draws. It is a
+# preference and not an instruction, for the same reason the tier ladder steps
+# down rather than failing: the setting travels with the user, the keys do not,
+# and a content session is worth having without the exact model you asked for.
+# ---------------------------------------------------------------------------
+
+
+def _saved_pick(monkeypatch, model: str) -> None:
+    """Stand in for the user's row on user_model_settings."""
+    from service.model_settings import ModelSettings
+
+    monkeypatch.setattr(
+        content_routes,
+        "get_model_settings",
+        lambda _uid: ModelSettings(tiers={}, image_model=model),
+    )
+
+
+def test_the_saved_pick_wins_over_the_preference_order(monkeypatch):
+    """Gemini leads IMAGE_PROVIDER_ORDER, so a user who wants OpenAI's model
+    can only ever get it if the pick outranks the order."""
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+    _saved_pick(monkeypatch, ImageModel.GPT_IMAGE_2_5_FLARE.value)
+
+    content_routes._attach_image_run(
+        "sid", {Provider.OPENAI: "sk-mine", Provider.GOOGLE_GENAI: "AIza-mine"}
+    )
+    assert session.image_provider is Provider.OPENAI
+
+
+def test_a_pick_with_no_key_falls_through_instead_of_failing(monkeypatch):
+    """The setting is per user and the keys are per machine, so "the model I
+    chose on my laptop" routinely names a provider this run cannot pay. That
+    has to degrade to the ordinary order, not strand the run without images."""
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+    _saved_pick(monkeypatch, ImageModel.GPT_IMAGE_2_5_FLARE.value)
+
+    content_routes._attach_image_run("sid", {Provider.GOOGLE_GENAI: "AIza-mine"})
+    assert session.image_provider is Provider.GOOGLE_GENAI
+
+
+def test_a_pick_the_catalogue_no_longer_knows_is_ignored(monkeypatch):
+    """A model retired since it was saved, or a chat id pasted into the field.
+    Both mean "resolve normally" — never a 404 on a model nothing serves."""
+    session = _session_under(monkeypatch)
+    _patch_resolution(monkeypatch, raises=True)
+    _saved_pick(monkeypatch, "gemini-1.0-retired-image")
+
+    content_routes._attach_image_run("sid", {Provider.GOOGLE_GENAI: "AIza-mine"})
+    assert session.image_provider is Provider.GOOGLE_GENAI
+
+
+def _images_status(sources, preferred=""):
+    from agents.engines import preferred_image_model
+    from agents.models import DEFAULT_IMAGE_MODELS, IMAGE_PROVIDER_ORDER
+    from routes.providers import _media_status
+
+    return _media_status(
+        sources, preferred_image_model(preferred), IMAGE_PROVIDER_ORDER, DEFAULT_IMAGE_MODELS
+    )
+
+
+def test_the_settings_page_promises_what_the_run_will_do(monkeypatch):
+    """`/providers/status` and `resolve_image_run` take the same argument and
+    must answer the same way — the row a user reads is a promise about the run,
+    and an unreachable pick shown as the answer is the one lie it must not
+    tell."""
+    sources = {"google_genai": "user", "openai": "none"}
+    assert _images_status(sources, ImageModel.GEMINI_3_PRO_IMAGE.value)["model"] == (
+        ImageModel.GEMINI_3_PRO_IMAGE.value
+    )
+    # Picked OpenAI, no OpenAI key — the row names what will really draw.
+    assert _images_status(sources, ImageModel.GPT_IMAGE_2_5_FLARE.value)["provider"] == "google_genai"
+
+
+def test_the_images_row_does_not_offer_a_plan_it_cannot_spend():
+    """The tile is honest — OpenAI *is* reachable on a ChatGPT plan — and the
+    Images row still must not name it, because the run will not. The two facts
+    live in different fields for exactly this reason."""
+    assert _images_status({"openai": "none"}) == {
+        "provider": None, "model": None, "source": "none",
+    }
+    # ...and the saved key underneath the plan is what the row names instead.
+    assert _images_status({"openai": "stored"})["source"] == "stored"
