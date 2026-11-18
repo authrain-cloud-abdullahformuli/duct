@@ -19,7 +19,7 @@ packages = [
 ]
 
 [tool.poetry.dependencies]
-fastapi = "^0.162"
+fastapi = "^0.163"
 uvicorn = {version = "^0.54", extras = ["standard"]}
 # Starlette's form parser. FastAPI needs it at *import* time for any route
 # declaring Form()/File() — routes/content.py:/content/uploads does — so an
@@ -33,9 +33,9 @@ python-multipart = ">=0.0.33"
 # config keys, the same day Google sunset developer tokens. Access level now
 # follows the Cloud project that owns the OAuth client, so there is no token
 # left to send. Do not float back below this.
-google-ads = "^35.0"
+google-ads = "^35.1"
 google-analytics-data = "^0.23"
-google-api-python-client = "^2.201.0"
+google-api-python-client = "^2.202.0"
 google-genai = "^2.34"
 python-dotenv = "^1.2"
 pydantic = "^2.14"
@@ -60,12 +60,12 @@ httpx = "^0.28"
 mcp = "^2.3"
 # Cloudflare R2 image storage over the S3 API (service/storage.py). Only loaded
 # when the 'r2' storage backend is active.
-boto3 = "^1.43"
-sqlmodel = "^0.0.48"
+boto3 = "^1.44"
+sqlmodel = "^0.0.50"
 alembic = "^1.20"
 psycopg = {version = "^3.3", extras = ["binary"]}
 # Server analytics, request context, and automatic exception capture for FastAPI.
-posthog = ">=7.86.0"
+posthog = ">=7.91.1"
 dlt = "^1.32.0"
 selectolax = ">=1.0.2"
 extruct = ">=0.16"
@@ -123,12 +123,12 @@ langchain-ollama = "^1.1.0"
 # Python and no dependencies of its own; Word and PowerPoint need no library
 # because they are zip files of XML. Duct extracts text rather than handing
 # the model a PDF block because DeepSeek, among others, reads no PDF at all.
-pypdf = "^7.0.0"
+pypdf = "^7.1.0"
 feedparser = "^6.0.14"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9"
-pytest-asyncio = "^1.4"
+pytest-asyncio = "^1.5"
 ruff = "^0.17"
 pyinstaller = "^6.22"
 
